@@ -1,0 +1,34 @@
+{
+  "name": "chatgpt-codex-bridge",
+  "version": "0.1.0",
+  "description": "Connect a local Codex workspace with a user-bound GPT session through a local bridge and MCP tools.",
+  "author": {
+    "name": "CodexBridge",
+    "email": "support@example.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "chatgpt",
+    "bridge",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "CodexBridge",
+    "shortDescription": "Bridge Codex with a bound GPT session.",
+    "longDescription": "CodexBridge runs locally, exposes MCP tools to Codex, and uses a Chrome extension to send selected work to the user's own GPT session.",
+    "developerName": "CodexBridge",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "brandColor": "#10A37F",
+    "defaultPrompt": [
+      "把这个文件交给 GPT 分析",
+      "让 GPT 生成文件再交给 Codex",
+      "检查 Bridge 当前链路状态"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "chatgpt_codex_bridge": {
+      "command": "node",
+      "args": [
+        "./src/mcp-server.js"
+      ]
+    }
+  }
+}
