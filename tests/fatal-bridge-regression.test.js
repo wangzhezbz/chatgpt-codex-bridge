@@ -252,7 +252,7 @@ test("sync completion rejects interrupted ChatGPT text as still streaming", asyn
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:test"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
       })
     });
     const claimed = await claimResponse.json();
@@ -301,7 +301,7 @@ test("sync completion saves captured image artifacts into the bound project and 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:test"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
       })
     });
     const claimed = await claimResponse.json();
@@ -363,7 +363,7 @@ test("multi-step image batch saves every visible image artifact into the bound p
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:test"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
       })
     });
     const firstClaim = await firstClaimResponse.json();
@@ -390,7 +390,7 @@ test("multi-step image batch saves every visible image artifact into the bound p
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:test"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
       })
     });
     const secondClaim = await secondClaimResponse.json();

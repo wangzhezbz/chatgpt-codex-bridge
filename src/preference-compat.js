@@ -1,6 +1,7 @@
 const MODE_PREFERENCES = new Set(["fast", "balanced", "advanced", "high", "pro"]);
-const MODEL_PREFERENCES = new Set(["gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
+const MODEL_PREFERENCES = new Set(["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
 const MODEL_MODE_PREFERENCES = {
+  "gpt-5.6-sol": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.5": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.4": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.3": ["fast"],

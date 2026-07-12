@@ -2,7 +2,7 @@
 if (!BRIDGE_ORIGIN) {
   throw new Error("Codex GPT Bridge extension is missing bridge-config.js");
 }
-const WORKER_ID = "codex-chatgpt-project-extension-v20260711-router-v2-safety";
+const WORKER_ID = "codex-chatgpt-project-extension-v20260712-preference-verify";
 const POLL_MS = 1500;
 const RESPONSE_TIMEOUT_MS = 300000;
 const ACTIVE_JOB_CHECK_INTERVAL_MS = 3000;
@@ -21,6 +21,7 @@ let busy = false;
 let lastHeartbeatPreferenceKey = null;
 let failedHeartbeatPreferenceKey = null;
 let lastPreferenceStatus = null;
+let lastPreferenceAttemptDiagnostic = null;
 let fallbackClientId = null;
 
 function newBridgeClientId() {
@@ -607,15 +608,18 @@ function clearBridgeDraftIfPresent(composer, draft = "") {
 }
 
 function modeLabelsForPreference(preference = "", modelPreference = "") {
+  const model = String(modelPreference || "").trim();
   const labels = {
-    fast: ["\u6781\u901f"],
-    balanced: ["\u5747\u8861"],
-    advanced: ["\u9ad8\u7ea7"],
-    high: ["\u8d85\u9ad8"],
+    fast: model === "gpt-5.6-sol" ? ["极速 5.5", "\u6781\u901f"] : ["\u6781\u901f", "极速 5.5"],
+    balanced: ["中", "\u5747\u8861"],
+    advanced: ["高", "\u9ad8\u7ea7"],
+    high: ["极高", "\u8d85\u9ad8"],
     pro:
-      String(modelPreference || "").trim() === "gpt-5.4"
-        ? ["\u4e13\u4e1a", "Pro \u6269\u5c55"]
-        : ["Pro \u6269\u5c55", "\u4e13\u4e1a"]
+      model === "gpt-5.5"
+        ? ["Pro 深度模式", "Pro", "Pro \u6269\u5c55", "\u4e13\u4e1a"]
+        : model === "gpt-5.4"
+        ? ["Pro", "\u4e13\u4e1a", "Pro \u6269\u5c55"]
+        : ["Pro", "Pro \u6269\u5c55", "\u4e13\u4e1a"]
   };
   return labels[String(preference || "").trim()] || [];
 }
@@ -626,6 +630,7 @@ function modeLabelForPreference(preference = "", modelPreference = "") {
 
 function modePreferencesForModel(modelPreference) {
   const preferences = {
+    "gpt-5.6-sol": ["fast", "balanced", "advanced", "high", "pro"],
     "gpt-5.5": ["fast", "balanced", "advanced", "high", "pro"],
     "gpt-5.4": ["fast", "balanced", "advanced", "high", "pro"],
     "gpt-5.3": ["fast"],
@@ -646,14 +651,19 @@ function compatibleModePreference(modelPreference, modePreference) {
   return allowedModes.includes(mode) ? mode : allowedModes[0];
 }
 
-function modelLabelForPreference(preference = "") {
+function modelLabelsForPreference(preference = "") {
   const labels = {
-    "gpt-5.5": "GPT-5.5",
-    "gpt-5.4": "GPT-5.4",
-    "gpt-5.3": "GPT-5.3",
-    o3: "o3"
+    "gpt-5.6-sol": ["GPT-5.6 Sol", "5.6 Sol"],
+    "gpt-5.5": ["GPT-5.5", "5.5"],
+    "gpt-5.4": ["GPT-5.4", "5.4"],
+    "gpt-5.3": ["GPT-5.3", "5.3"],
+    o3: ["o3"]
   };
-  return labels[String(preference || "").trim()] || null;
+  return labels[String(preference || "").trim()] || [];
+}
+
+function modelLabelForPreference(preference = "") {
+  return modelLabelsForPreference(preference)[0] || null;
 }
 
 function modelSupportsModePreference(modelPreference) {
@@ -696,7 +706,7 @@ function knownModeLabels() {
 }
 
 function knownModelLabels() {
-  return ["gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"].map(modelLabelForPreference).filter(Boolean);
+  return ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"].flatMap(modelLabelsForPreference).filter(Boolean);
 }
 
 function looksLikeSpecificModeControl(element) {
@@ -750,13 +760,23 @@ function preferenceLabels(labelOrLabels) {
   return (Array.isArray(labelOrLabels) ? labelOrLabels : [labelOrLabels]).filter(Boolean);
 }
 
+function textContainsPreferenceLabel(text, label) {
+  if (!label) {
+    return false;
+  }
+  if (/^\p{Script=Han}$/u.test(label)) {
+    return new RegExp(`(^|[^\\p{Script=Han}])${escapeRegExp(label)}([^\\p{Script=Han}]|$)`, "u").test(text);
+  }
+  return text.includes(label);
+}
+
 function elementContainsAnyPreferenceLabel(element, labelOrLabels) {
   const labels = preferenceLabels(labelOrLabels);
   if (!labels.length) {
     return false;
   }
   const text = modelControlText(element);
-  return labels.some((label) => text.includes(label));
+  return labels.some((label) => textContainsPreferenceLabel(text, label));
 }
 
 function controlsContainPreference(controls, kind, labelOrLabels) {
@@ -765,7 +785,11 @@ function controlsContainPreference(controls, kind, labelOrLabels) {
   }
 
   if (kind === "mode") {
-    return controls.some(looksLikeSpecificModeControl);
+    return (
+      controls.some(looksLikeSpecificModeControl) ||
+      controls.some(looksLikeSpecificModelControl) ||
+      controls.some(looksLikeModelControlClean)
+    );
   }
 
   if (kind === "model") {
@@ -810,11 +834,40 @@ function findPreferenceControl(kind, labelOrLabels) {
   if (kind === "model") {
     return controls.find(looksLikeSpecificModeControl) || controls.find(looksLikeModelControlClean);
   }
+  if (kind === "mode") {
+    return controls.find(looksLikeSpecificModelControl) || controls.find(looksLikeModelControlClean);
+  }
   return null;
 }
 
 function findModelOption(labelOrLabels) {
   return bestMenuCandidate(labelOrLabels);
+}
+
+function preferenceElementDiagnostic(element) {
+  return {
+    text: modelControlText(element),
+    tagName: String(element?.tagName || "").toLowerCase() || null,
+    role: element?.getAttribute?.("role") || null,
+    testId: element?.getAttribute?.("data-testid") || null,
+    ariaLabel: element?.getAttribute?.("aria-label") || null
+  };
+}
+
+function visiblePreferenceOptionDiagnostics() {
+  const seen = new Set();
+  return menuCandidateElements()
+    .map(preferenceElementDiagnostic)
+    .filter((item) => item.text && item.text.length <= 120)
+    .filter((item) => {
+      const key = `${item.tagName}|${item.role}|${item.testId}|${item.text}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 40);
 }
 
 function menuCandidateElements() {
@@ -978,15 +1031,28 @@ async function chooseMenuPreferenceOnce(labelOrLabels, kind = "model") {
   const labels = preferenceLabels(labelOrLabels);
   const current = findPreferenceControl(kind, labels);
   if (!current) {
+    lastPreferenceAttemptDiagnostic = {
+      kind,
+      labels,
+      currentControl: null,
+      visibleOptions: visiblePreferenceOptionDiagnostics()
+    };
     return false;
   }
 
   openPreferenceTrigger(current);
   await sleep(300);
+  lastPreferenceAttemptDiagnostic = {
+    kind,
+    labels,
+    currentControl: preferenceElementDiagnostic(current),
+    visibleOptions: visiblePreferenceOptionDiagnostics()
+  };
   let option = findModelOption(labels);
   if (!option && typeof current.click === "function") {
     current.click();
     await sleep(300);
+    lastPreferenceAttemptDiagnostic.visibleOptions = visiblePreferenceOptionDiagnostics();
     option = findModelOption(labels);
   }
   if (!option && kind === "model" && await openModelSubmenu(labels[0])) {
@@ -996,6 +1062,8 @@ async function chooseMenuPreferenceOnce(labelOrLabels, kind = "model") {
     dismissOpenMenus();
     return false;
   }
+
+  lastPreferenceAttemptDiagnostic.selectedOption = preferenceElementDiagnostic(option);
 
   activatePreferenceOption(option);
   await sleep(300);
@@ -1023,6 +1091,7 @@ function preferenceCanConfirmSelection(kind, labelOrLabels) {
 
 async function selectMenuPreference(labelOrLabels, kind = "model") {
   const labels = preferenceLabels(labelOrLabels);
+  lastPreferenceAttemptDiagnostic = null;
   if (!labels.length) {
     return false;
   }
@@ -1049,7 +1118,7 @@ async function selectModePreference(job = {}) {
 }
 
 async function selectModelPreference(job = {}) {
-  return selectMenuPreference(modelLabelForPreference(job.modelPreference), "model");
+  return selectMenuPreference(modelLabelsForPreference(job.modelPreference), "model");
 }
 
 function findFileInput() {
@@ -4299,7 +4368,8 @@ function setPreferenceStatus(preferences = {}, result = {}) {
     updatedAt: preferences.updatedAt || null,
     modeSynced: Boolean(result.modeSynced),
     modelSynced: Boolean(result.modelSynced),
-    ...(result.error ? { error: result.error } : {})
+    ...(result.error ? { error: result.error } : {}),
+    ...(result.diagnostics ? { diagnostics: result.diagnostics } : {})
   };
 }
 
@@ -4326,7 +4396,7 @@ function preferencesAlreadyApplied(preferences = {}) {
 function visiblePreferenceSyncStatus(preferences = {}) {
   const normalizedPreferences = normalizeChatGptPreferences(preferences || {});
   const modelSynced = normalizedPreferences.modelPreference
-    ? preferenceApplied("model", modelLabelForPreference(normalizedPreferences.modelPreference))
+    ? preferenceApplied("model", modelLabelsForPreference(normalizedPreferences.modelPreference))
     : true;
   const modeSynced = normalizedPreferences.modePreference
     ? preferenceApplied("mode", modeLabelsForPreference(normalizedPreferences.modePreference, normalizedPreferences.modelPreference))
@@ -4391,7 +4461,8 @@ async function applyHeartbeatPreferences(preferences = null) {
       state: "failed",
       modeSynced,
       modelSynced,
-      error: preferenceStatusError(modeSynced, modelSynced, normalizedPreferences)
+      error: preferenceStatusError(modeSynced, modelSynced, normalizedPreferences),
+      diagnostics: lastPreferenceAttemptDiagnostic
     });
     return false;
   }

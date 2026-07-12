@@ -59,8 +59,8 @@ test("workspace binding keeps preference timestamp separate from metadata update
   const first = await updateWorkspaceBinding(storeRoot, {
     chatgptProjectUrl: "https://chatgpt.com/project/demo",
     targetRepo: "F:/game_code/demo",
-    modePreference: "advanced",
-    modelPreference: "gpt-5.5"
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol"
   });
   assert.ok(first.preferenceUpdatedAt);
 
@@ -68,8 +68,8 @@ test("workspace binding keeps preference timestamp separate from metadata update
     projectId: "project-demo"
   });
 
-  assert.equal(second.modePreference, "advanced");
-  assert.equal(second.modelPreference, "gpt-5.5");
+  assert.equal(second.modePreference, "high");
+  assert.equal(second.modelPreference, "gpt-5.6-sol");
   assert.equal(second.preferenceUpdatedAt, first.preferenceUpdatedAt);
 });
 

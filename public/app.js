@@ -1,6 +1,7 @@
 const MODE_PREFERENCES = new Set(["fast", "balanced", "advanced", "high", "pro"]);
-const MODEL_PREFERENCES = new Set(["gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
+const MODEL_PREFERENCES = new Set(["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
 const MODEL_MODE_PREFERENCES = {
+  "gpt-5.6-sol": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.5": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.4": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.3": ["fast"],
@@ -8,15 +9,17 @@ const MODEL_MODE_PREFERENCES = {
 };
 const DEFAULT_MODE_LABELS = {
   default: "默认",
-  fast: "极速",
-  balanced: "均衡",
-  advanced: "高级",
-  high: "超高",
-  pro: "Pro 扩展"
+  fast: "极速 5.5",
+  balanced: "中",
+  advanced: "高",
+  high: "极高",
+  pro: "Pro"
 };
 const MODE_LABELS_BY_MODEL = {
-  "gpt-5.5": { pro: "Pro 扩展" },
-  "gpt-5.4": { pro: "专业" }
+  "gpt-5.6-sol": { fast: "极速 5.5", pro: "Pro" },
+  "gpt-5.5": { fast: "极速", pro: "Pro 深度模式" },
+  "gpt-5.4": { fast: "极速", pro: "专业" },
+  "gpt-5.3": { fast: "极速" }
 };
 const ACCEPTANCE_MODE = new URLSearchParams(window.location.search).get("qa") === "1";
 const TEXT_PREVIEW_EXTENSIONS = new Set(["txt", "md", "json", "html", "css", "js", "ts", "py", "log", "xml", "yaml", "yml"]);
@@ -37,7 +40,7 @@ function storedModePreference() {
 }
 
 function storedModelPreference() {
-  return storedPreference("bridge-model-preference", MODEL_PREFERENCES, "gpt-5.5");
+  return storedPreference("bridge-model-preference", MODEL_PREFERENCES, "gpt-5.6-sol");
 }
 
 function modelSupportsModePreference(modelPreference) {
@@ -84,6 +87,7 @@ const els = {
   onboardingGuide: document.querySelector("#onboardingGuide"),
   projectList: document.querySelector("#projectList"),
   newProjectForm: document.querySelector("#newProjectForm"),
+  newProjectSubmitButton: document.querySelector("#newProjectSubmitButton"),
   projectNameInput: document.querySelector("#projectNameInput"),
   projectUrlInput: document.querySelector("#projectUrlInput"),
   targetRepoInput: document.querySelector("#targetRepoInput"),
@@ -180,6 +184,7 @@ const state = {
   acceptanceStatus: null,
   acceptanceRecordText: "",
   gptPreflight: null,
+  currentCodexThreadId: null,
   modePreference: storedModePreference(),
   modelPreference: storedModelPreference(),
   theme: window.localStorage.getItem("bridge-theme") || "dark",
@@ -307,7 +312,13 @@ async function api(path, options = {}) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(friendlyErrorMessage(text || `请求失败：${response.status}`));
+    let message = text;
+    try {
+      message = JSON.parse(text)?.error || text;
+    } catch {
+      // Keep the server's plain-text response.
+    }
+    throw new Error(friendlyErrorMessage(message || `请求失败：${response.status}`));
   }
 
   return response.json();
@@ -449,7 +460,7 @@ function selectedModePreference() {
 }
 
 function selectedModelPreference() {
-  return MODEL_PREFERENCES.has(els.modelSelect?.value) ? els.modelSelect.value : state.modelPreference || "gpt-5.5";
+  return MODEL_PREFERENCES.has(els.modelSelect?.value) ? els.modelSelect.value : state.modelPreference || "gpt-5.6-sol";
 }
 
 function setModePreference(value) {
@@ -487,7 +498,7 @@ function syncPreferenceControls() {
 }
 
 function setModelPreference(value) {
-  state.modelPreference = MODEL_PREFERENCES.has(value) ? value : "gpt-5.5";
+  state.modelPreference = MODEL_PREFERENCES.has(value) ? value : "gpt-5.6-sol";
   window.localStorage.setItem("bridge-model-preference", state.modelPreference);
   if (els.modelSelect && els.modelSelect.value !== state.modelPreference) {
     els.modelSelect.value = state.modelPreference;
@@ -768,6 +779,9 @@ function showProjects() {
   els.backToProjectsButton.classList.add("is-hidden");
   els.settingsButton.disabled = true;
   els.activeProjectTitle.textContent = "选择项目";
+  if (els.newProjectSubmitButton) {
+    els.newProjectSubmitButton.textContent = state.currentCodexThreadId ? "绑定当前会话并进入" : "创建项目并进入";
+  }
 }
 
 function showChat() {
@@ -3673,22 +3687,38 @@ els.acceptanceRecordButton?.addEventListener("click", async () => {
 
 els.newProjectForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const bound = await api("/api/projects/current-session", {
-    method: "POST",
-    body: JSON.stringify({
-      name: els.projectNameInput.value,
-      chatgptProjectUrl: els.projectUrlInput.value,
-      targetRepo: els.targetRepoInput.value
-    })
-  });
-  els.newProjectForm.reset();
-  state.activeProjectId = bound.activeProjectId;
-  state.activeProject = bound.project;
-  await loadProjects({ autoEnter: false });
-  state.activeProjectId = bound.activeProjectId;
-  state.activeProject = bound.project;
-  showChat();
-  await refreshWorkspaceSurface({ scrollToBottom: true });
+  els.newProjectSubmitButton.disabled = true;
+  try {
+    const projectPath = state.currentCodexThreadId ? "/api/projects/current-session" : "/api/projects";
+    const created = await api(projectPath, {
+      method: "POST",
+      body: JSON.stringify({
+        name: els.projectNameInput.value,
+        chatgptProjectUrl: els.projectUrlInput.value,
+        targetRepo: els.targetRepoInput.value
+      })
+    });
+    const project = created.project;
+    const bound = state.currentCodexThreadId
+      ? created
+      : await api(`/api/projects/${encodeURIComponent(project.id)}/select`, {
+          method: "POST",
+          body: JSON.stringify({})
+        });
+    els.newProjectForm.reset();
+    state.activeProjectId = created.activeProjectId || project.id;
+    state.activeProject = project;
+    await loadProjects({ autoEnter: false });
+    state.activeProjectId = created.activeProjectId || project.id;
+    state.activeProject = project;
+    showChat();
+    await refreshWorkspaceSurface({ scrollToBottom: true });
+    showToast(state.currentCodexThreadId ? "已绑定当前会话" : "项目已创建");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    els.newProjectSubmitButton.disabled = false;
+  }
 });
 
 els.bindingForm.addEventListener("submit", async (event) => {
@@ -3816,10 +3846,15 @@ setTheme(state.theme);
 setModePreference(state.modePreference);
 setModelPreference(state.modelPreference);
 syncComposerSendControl();
-loadProjects({ autoEnter: true }).catch((error) => {
-  showProjects();
-  showToast(error.message);
-});
+api("/api/config")
+  .then((config) => {
+    state.currentCodexThreadId = config.currentCodexThreadId || null;
+    return loadProjects({ autoEnter: true });
+  })
+  .catch((error) => {
+    showProjects();
+    showToast(error.message);
+  });
 
 window.setInterval(() => {
   if (!els.chatView.classList.contains("is-hidden")) {

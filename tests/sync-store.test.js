@@ -48,19 +48,19 @@ test("createSyncJob persists a pending ChatGPT project sync job", async () => {
     projectUrl: "https://chatgpt.com/project/demo",
     payloadText: "请分析这个任务。",
     sourceMessageId: "msg_1",
-    modePreference: "balanced",
-    modelPreference: "gpt-5.5"
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol"
   });
 
   assert.match(job.id, /^sync_\d{8}T\d{6}_/);
   assert.equal(job.kind, "user_request");
   assert.equal(job.status, "pending");
-  assert.equal(job.modePreference, "balanced");
-  assert.equal(job.modelPreference, "gpt-5.5");
+  assert.equal(job.modePreference, "high");
+  assert.equal(job.modelPreference, "gpt-5.6-sol");
 
   const saved = await getSyncJob(storeRoot, job.id);
-  assert.equal(saved.modePreference, "balanced");
-  assert.equal(saved.modelPreference, "gpt-5.5");
+  assert.equal(saved.modePreference, "high");
+  assert.equal(saved.modelPreference, "gpt-5.6-sol");
   assert.equal(saved.payloadText, "请分析这个任务。");
 });
 

@@ -24,7 +24,8 @@ test("workbench can manage projects and conversations without page-length drift"
   assert.match(js, /button\.setAttribute\("aria-label", "删除这条消息"\)/);
   assert.doesNotMatch(js, /button\.textContent = "删除"/);
 
-  assert.match(css, /\.project-view\s*\{[\s\S]*overflow: hidden;/);
+  assert.match(css, /\.project-view\s*\{[\s\S]*overflow-y: auto;/);
+  assert.doesNotMatch(css, /\.project-view\s*\{[^}]*overflow: hidden;/);
   assert.match(css, /\.project-list\s*\{[\s\S]*overflow: auto;/);
   assert.match(css, /\.project-list\s*\{[\s\S]*min-height: 0;/);
   assert.match(css, /\.project-card-actions/);
@@ -32,6 +33,19 @@ test("workbench can manage projects and conversations without page-length drift"
   assert.match(css, /\.message-header-actions/);
   assert.match(css, /\.message-delete-button/);
   assert.match(css, /\.message-delete-button\s*\{[\s\S]*place-items: center;/);
+});
+
+test("project binding form works both inside and outside a scoped Codex task", async () => {
+  const html = await readFile("public/index.html", "utf8");
+  const js = await readFile("public/app.js", "utf8");
+
+  assert.doesNotMatch(html, /F:\/game_code\/project/i);
+  assert.match(html, /placeholder="请选择或粘贴本地项目目录"/);
+  assert.match(js, /api\("\/api\/config"\)/);
+  assert.match(js, /currentCodexThreadId/);
+  assert.match(js, /state\.currentCodexThreadId\s*\?\s*"\/api\/projects\/current-session"\s*:\s*"\/api\/projects"/);
+  assert.match(js, /\/api\/projects\/\$\{encodeURIComponent\(project\.id\)\}\/select/);
+  assert.match(js, /els\.newProjectForm\.addEventListener\("submit", async \(event\) => \{[\s\S]*try\s*\{[\s\S]*catch \(error\)[\s\S]*showToast\(error\.message\)/);
 });
 
 test("expanded long text state survives polling refreshes and manual scroll", async () => {

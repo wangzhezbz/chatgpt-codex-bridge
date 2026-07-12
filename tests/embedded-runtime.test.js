@@ -73,7 +73,7 @@ test("HTTP service exposes minimal health, version, and configured extension met
       service: "chatgpt-codex-bridge",
       version: "0.1.0",
       protocolVersion: 1,
-      extensionProtocolVersion: "v20260711-router-v2-safety"
+      extensionProtocolVersion: "v20260712-preference-verify"
     });
 
     const configResponse = await fetch(`${baseUrl}/api/config`);

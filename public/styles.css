@@ -328,7 +328,9 @@ label {
   margin: 0 auto;
   padding: 56px 0;
   height: 100%;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 24px;

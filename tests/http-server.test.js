@@ -666,8 +666,8 @@ test("current Codex completion can optionally sync the result back to GPT", asyn
         body: JSON.stringify({
           chatgptProjectUrl: "https://chatgpt.com/project/demo",
           targetRepo: "F:/game_code/demo",
-          modePreference: "advanced",
-          modelPreference: "gpt-5.5"
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol"
         })
       });
 
@@ -699,8 +699,8 @@ test("current Codex completion can optionally sync the result back to GPT", asyn
         body: JSON.stringify({
           resultText: "Codex checked the login page and did not find a blocker. npm test passed.",
           syncToChatGpt: true,
-          modePreference: "balanced",
-          modelPreference: "gpt-5.5"
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol"
         })
       });
       assert.equal(completeResponse.status, 200);
@@ -713,8 +713,8 @@ test("current Codex completion can optionally sync the result back to GPT", asyn
       assert.equal(completed.syncJob.status, "pending");
       assert.equal(completed.syncJob.sourceMessageId, completed.message.id);
       assert.equal(completed.syncJob.projectUrl, "https://chatgpt.com/project/demo");
-      assert.equal(completed.syncJob.modePreference, "balanced");
-      assert.equal(completed.syncJob.modelPreference, "gpt-5.5");
+      assert.equal(completed.syncJob.modePreference, "high");
+      assert.equal(completed.syncJob.modelPreference, "gpt-5.6-sol");
       assert.match(completed.syncJob.payloadText, /Codex checked the login page/);
       assert.match(completed.syncJob.payloadText, /npm test passed/);
     }
@@ -746,16 +746,16 @@ test("room API can send one user message to both GPT and current Codex", async (
         body: JSON.stringify({
           text: "Create and check b.txt",
           to: ["gpt", "codex"],
-          modePreference: "balanced",
-          modelPreference: "gpt-5.5"
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol"
         })
       });
       assert.equal(response.status, 201);
       const created = await response.json();
 
       assert.equal(created.syncJob.status, "pending");
-      assert.equal(created.syncJob.modePreference, "balanced");
-      assert.equal(created.syncJob.modelPreference, "gpt-5.5");
+      assert.equal(created.syncJob.modePreference, "high");
+      assert.equal(created.syncJob.modelPreference, "gpt-5.6-sol");
       assert.equal(created.codexTask.status, "pending");
       assert.equal(created.codexTask.currentThreadId, "thread_current");
 
@@ -801,16 +801,16 @@ test("POST /api/preferences/sync stores preferences without queuing a ChatGPT me
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        modePreference: "advanced",
-        modelPreference: "gpt-5.4"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
     assert.equal(response.status, 201);
     const created = await response.json();
 
     assert.equal(created.syncJob, null);
-    assert.equal(created.workspace.modePreference, "advanced");
-    assert.equal(created.workspace.modelPreference, "gpt-5.4");
+    assert.equal(created.workspace.modePreference, "high");
+    assert.equal(created.workspace.modelPreference, "gpt-5.6-sol");
 
     const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
       method: "POST",
@@ -829,15 +829,15 @@ test("POST /api/preferences/sync stores preferences without queuing a ChatGPT me
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/project/demo/c/abc",
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
     assert.equal(heartbeatResponse.status, 200);
     const heartbeat = await heartbeatResponse.json();
     assert.deepEqual(heartbeat.preferences, {
       projectUrl: "https://chatgpt.com/project/demo",
-      modePreference: "advanced",
-      modelPreference: "gpt-5.4",
+      modePreference: "high",
+      modelPreference: "gpt-5.6-sol",
       updatedAt: created.workspace.updatedAt
     });
 
@@ -864,8 +864,8 @@ test("extension heartbeat preference timestamp ignores unrelated workspace updat
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        modePreference: "advanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
     const created = await response.json();
@@ -883,7 +883,7 @@ test("extension heartbeat preference timestamp ignores unrelated workspace updat
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
     const heartbeat = await heartbeatResponse.json();
@@ -910,8 +910,8 @@ test("extension heartbeat does not resend already applied preferences", async ()
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        modePreference: "advanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
     const created = await response.json();
@@ -921,11 +921,11 @@ test("extension heartbeat does not resend already applied preferences", async ()
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         preferenceStatus: {
           state: "applied",
-          modePreference: "advanced",
-          modelPreference: "gpt-5.5",
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol",
           updatedAt: created.workspace.preferenceUpdatedAt,
           modeSynced: true,
           modelSynced: true
@@ -956,8 +956,8 @@ test("extension heartbeat resends failed preferences so the page can recheck vis
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        modePreference: "advanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
     const created = await response.json();
@@ -967,11 +967,11 @@ test("extension heartbeat resends failed preferences so the page can recheck vis
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         preferenceStatus: {
           state: "failed",
-          modePreference: "advanced",
-          modelPreference: "gpt-5.5",
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol",
           updatedAt: created.workspace.preferenceUpdatedAt,
           modeSynced: true,
           modelSynced: false,
@@ -984,8 +984,8 @@ test("extension heartbeat resends failed preferences so the page can recheck vis
     assert.equal(heartbeat.controlsCurrentPage, true);
     assert.deepEqual(heartbeat.preferences, {
       projectUrl: "https://chatgpt.com/project/demo",
-      modePreference: "advanced",
-      modelPreference: "gpt-5.5",
+      modePreference: "high",
+      modelPreference: "gpt-5.6-sol",
       updatedAt: created.workspace.preferenceUpdatedAt
     });
   });
@@ -1008,12 +1008,12 @@ test("extension heartbeat preserves applied preferences across extension reloads
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        modePreference: "advanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
     const created = await response.json();
-    const workerId = "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:stable-tab";
+    const workerId = "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:stable-tab";
 
     await fetch(`${baseUrl}/api/extension/heartbeat`, {
       method: "POST",
@@ -1023,8 +1023,8 @@ test("extension heartbeat preserves applied preferences across extension reloads
         workerId,
         preferenceStatus: {
           state: "applied",
-          modePreference: "advanced",
-          modelPreference: "gpt-5.5",
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol",
           updatedAt: created.workspace.preferenceUpdatedAt,
           modeSynced: true,
           modelSynced: true
@@ -1080,7 +1080,7 @@ test("POST /api/preferences/sync drops retired ChatGPT models that are no longer
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
     const heartbeat = await heartbeatResponse.json();
@@ -1126,7 +1126,7 @@ test("POST /api/preferences/sync coerces unsupported mode preferences for limite
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
     const heartbeat = await heartbeatResponse.json();
@@ -1150,8 +1150,8 @@ test("extension heartbeat only sends preferences to the current extension versio
       body: JSON.stringify({
         chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
         targetRepo: "F:/game_code/demo",
-        modePreference: "advanced",
-        modelPreference: "gpt-5.4"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
 
@@ -1174,12 +1174,12 @@ test("extension heartbeat only sends preferences to the current extension versio
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
     const currentHeartbeat = await currentResponse.json();
-    assert.equal(currentHeartbeat.preferences.modePreference, "advanced");
-    assert.equal(currentHeartbeat.preferences.modelPreference, "gpt-5.4");
+    assert.equal(currentHeartbeat.preferences.modePreference, "high");
+    assert.equal(currentHeartbeat.preferences.modelPreference, "gpt-5.6-sol");
   });
 });
 
@@ -1207,7 +1207,7 @@ test("extension heartbeat asks stale extension versions to reload themselves", a
     assert.equal(response.status, 200);
     const heartbeat = await response.json();
     assert.equal(heartbeat.reloadExtension, true);
-    assert.equal(heartbeat.expectedExtensionVersion, "v20260711-router-v2-safety");
+    assert.equal(heartbeat.expectedExtensionVersion, "v20260712-preference-verify");
     assert.equal(heartbeat.controlsCurrentPage, false);
     assert.equal(heartbeat.preferences, null);
     assert.equal(heartbeat.recovery, null);
@@ -1235,7 +1235,7 @@ test("extension heartbeat stores preference application status for diagnostics",
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         preferenceStatus: {
           state: "failed",
           modePreference: "balanced",
@@ -1280,7 +1280,7 @@ test("extension heartbeat does not navigate wrong ChatGPT pages when no job is a
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
 
@@ -1310,8 +1310,8 @@ test("extension heartbeat only sends control instructions to the bound ChatGPT p
       body: JSON.stringify({
         chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
         targetRepo: "F:/game_code/demo",
-        modePreference: "advanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
 
@@ -1330,14 +1330,14 @@ test("extension heartbeat only sends control instructions to the bound ChatGPT p
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/bound-chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
       })
     });
     await fetch(`${baseUrl}/api/sync/jobs/${created.syncJob.id}/sent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
       })
     });
 
@@ -1353,7 +1353,7 @@ test("extension heartbeat only sends control instructions to the bound ChatGPT p
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_other"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_other"
       })
     });
     const wrongPageHeartbeat = await wrongPageResponse.json();
@@ -1366,11 +1366,11 @@ test("extension heartbeat only sends control instructions to the bound ChatGPT p
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
       })
     });
     const boundPageHeartbeat = await boundPageResponse.json();
-    assert.equal(boundPageHeartbeat.preferences.modelPreference, "gpt-5.5");
+    assert.equal(boundPageHeartbeat.preferences.modelPreference, "gpt-5.6-sol");
     assert.equal(boundPageHeartbeat.recovery.action, "reload");
     assert.equal(boundPageHeartbeat.recovery.job.id, created.syncJob.id);
   });
@@ -1395,7 +1395,7 @@ test("diagnostics prefers the bound ChatGPT heartbeat when other ChatGPT tabs ar
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
       })
     });
     await fetch(`${baseUrl}/api/extension/heartbeat`, {
@@ -1404,7 +1404,7 @@ test("diagnostics prefers the bound ChatGPT heartbeat when other ChatGPT tabs ar
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_other"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_other"
       })
     });
 
@@ -1445,7 +1445,7 @@ test("diagnostics scopes active sync jobs to the current workspace", async () =>
       body: JSON.stringify({
         href: "https://chatgpt.com/c/current-chat",
         title: "Current chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_current"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_current"
       })
     });
 
@@ -1471,8 +1471,8 @@ test("diagnostics reports actionable workflow status for stale extensions and cu
       body: JSON.stringify({
         chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
         targetRepo: "F:/game_code/demo",
-        modePreference: "advanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
     const workspace = await workspaceResponse.json();
@@ -1508,11 +1508,11 @@ test("diagnostics reports actionable workflow status for stale extensions and cu
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         preferenceStatus: {
           state: "failed",
-          modePreference: "advanced",
-          modelPreference: "gpt-5.5",
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol",
           updatedAt: workspace.updatedAt,
           modeSynced: true,
           modelSynced: false,
@@ -1680,7 +1680,7 @@ test("diagnostics treats unrelated busy GPT page state as ready when no Bridge j
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "working",
           code: "active_generation",
@@ -1728,7 +1728,7 @@ test("diagnostics connection checks use product Chinese copy", async () => {
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -1774,7 +1774,7 @@ test("sync progress uses GPT wording instead of ChatGPT wording", async () => {
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -1835,7 +1835,7 @@ test("diagnostics ignores legacy preference sync jobs when reporting latest user
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
 
@@ -1844,7 +1844,7 @@ test("diagnostics ignores legacy preference sync jobs when reporting latest user
     assert.equal(status.latestSyncJob.id, visible.id);
     assert.notEqual(status.latestSyncJob.id, legacyPreference.id);
     assert.equal(status.activeSyncJob.id, visible.id);
-    assert.equal(status.extension.version, "v20260711-router-v2-safety");
+    assert.equal(status.extension.version, "v20260712-preference-verify");
     assert.equal(status.extension.needsReload, false);
   });
 });
@@ -1868,7 +1868,7 @@ test("diagnostics prefers a current extension heartbeat over a newer old tab hea
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Current tab",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
     await fetch(`${baseUrl}/api/extension/heartbeat`, {
@@ -1883,7 +1883,7 @@ test("diagnostics prefers a current extension heartbeat over a newer old tab hea
 
     const statusResponse = await fetch(`${baseUrl}/api/diagnostics/status`);
     const status = await statusResponse.json();
-    assert.equal(status.extension.version, "v20260711-router-v2-safety");
+    assert.equal(status.extension.version, "v20260712-preference-verify");
     assert.equal(status.extension.needsReload, false);
     assert.equal(status.extension.title, "Current tab");
   });
@@ -1915,7 +1915,7 @@ test("diagnostics does not treat a historical failed sync as the active job", as
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
 
@@ -1960,7 +1960,7 @@ test("diagnostics does not block on a structured failed job after the ChatGPT pa
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -1998,7 +1998,7 @@ test("diagnostics does not treat unrelated page generation as an active Bridge t
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "working",
           code: "active_generation",
@@ -2039,7 +2039,7 @@ test("diagnostics marks a stale sent sync as retryable instead of active process
       payloadText: "Ask GPT to generate a poster."
     });
     await markSyncJobSent(storeRoot, job.id, {
-      workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${job.id}.json`);
@@ -2054,7 +2054,7 @@ test("diagnostics marks a stale sent sync as retryable instead of active process
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2096,7 +2096,7 @@ test("diagnostics short-circuits a sent sync when the GPT page is already ready"
       payloadText: "Ask GPT to create a tiny txt file."
     });
     await markSyncJobSent(storeRoot, job.id, {
-      workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${job.id}.json`);
@@ -2112,7 +2112,7 @@ test("diagnostics short-circuits a sent sync when the GPT page is already ready"
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2156,7 +2156,7 @@ test("ready-page stale sent sync jobs are retryable from the room timeline", asy
     const created = await createResponse.json();
 
     await markSyncJobSent(storeRoot, created.syncJob.id, {
-      workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
@@ -2172,7 +2172,7 @@ test("ready-page stale sent sync jobs are retryable from the room timeline", asy
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2219,7 +2219,7 @@ test("diagnostics keeps image generation running when the GPT page becomes ready
       payloadText: "Generate 3 separate downloadable images about a futuristic AI workspace."
     });
     await markSyncJobSent(storeRoot, job.id, {
-      workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${job.id}.json`);
@@ -2235,7 +2235,7 @@ test("diagnostics keeps image generation running when the GPT page becomes ready
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2274,7 +2274,7 @@ test("diagnostics explains when the bound ChatGPT page heartbeat is stale", asyn
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
       })
     });
 
@@ -2283,7 +2283,7 @@ test("diagnostics explains when the bound ChatGPT page heartbeat is stale", asyn
         {
           href: "https://chatgpt.com/c/bound-chat",
           title: "Bound chat",
-          workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+          workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
           updatedAt: new Date(Date.now() - 45000).toISOString()
         }
       ]
@@ -2328,7 +2328,7 @@ test("diagnostics surfaces blocker state reported by the bound ChatGPT page hear
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         pageStatus: {
           state: "blocked",
           code: "human_verification",
@@ -2366,7 +2366,7 @@ test("diagnostics names client-side GPT blocking instead of generic action requi
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         pageStatus: {
           state: "blocked",
           code: "client_blocked",
@@ -2404,7 +2404,7 @@ test("GPT preflight blocks sending when the active ChatGPT page is not the bound
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_other"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_other"
       })
     });
 
@@ -2537,8 +2537,8 @@ test("GPT preflight allows sending when only ChatGPT preference sync failed", as
       body: JSON.stringify({
         chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
         targetRepo: "F:/game_code/demo",
-        modePreference: "advanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
 
@@ -2548,7 +2548,7 @@ test("GPT preflight allows sending when only ChatGPT preference sync failed", as
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2556,8 +2556,8 @@ test("GPT preflight allows sending when only ChatGPT preference sync failed", as
         },
         preferenceStatus: {
           state: "failed",
-          modePreference: "advanced",
-          modelPreference: "gpt-5.5",
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol",
           modeSynced: false,
           modelSynced: true,
           updatedAt: (await (await fetch(`${baseUrl}/api/workspace`)).json()).updatedAt,
@@ -3046,7 +3046,7 @@ test("sync API lets the user cancel a stuck ChatGPT job", async () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3116,7 +3116,7 @@ test("extension heartbeat stops GPT generation after cancelling an unclaimed Bri
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3182,7 +3182,7 @@ test("extension heartbeat stops a manually cancelled GPT generation before a que
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3200,7 +3200,7 @@ test("extension heartbeat stops a manually cancelled GPT generation before a que
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3263,7 +3263,7 @@ test("extension heartbeat can stop orphan GPT generation after a failed Bridge j
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3306,7 +3306,7 @@ test("extension heartbeat stops orphan generation after missing download capture
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/project/demo",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
       })
     });
     const claimed = await claimResponse.json();
@@ -3336,7 +3336,7 @@ test("extension heartbeat stops orphan generation after missing download capture
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3647,7 +3647,7 @@ test("diagnostics reports extension heartbeat and project page mismatch", async 
     assert.equal(status.extension.connected, true);
     assert.equal(status.extension.href, "https://chatgpt.com/c/other-chat");
     assert.equal(status.extension.version, "v20260625-clean-capture-6");
-    assert.equal(status.extension.expectedVersion, "v20260711-router-v2-safety");
+    assert.equal(status.extension.expectedVersion, "v20260712-preference-verify");
     assert.equal(status.extension.needsReload, true);
     assert.match(status.extension.sourceDir, /chrome-extension$/);
     assert.match(status.status.reason, /\u4e0d\u662f\u7ed1\u5b9a\u4f1a\u8bdd/);
@@ -3702,7 +3702,7 @@ test("extension heartbeat asks ChatGPT page to reload when a sent sync is stale"
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat"
       })
@@ -3756,7 +3756,7 @@ test("extension heartbeat asks ChatGPT page to reload when a claimed sync was ne
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat"
       })
@@ -3816,7 +3816,7 @@ test("extension heartbeat does not repeatedly reload the same stale sync", async
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat"
       })
@@ -3828,7 +3828,7 @@ test("extension heartbeat does not repeatedly reload the same stale sync", async
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat"
       })
@@ -4317,7 +4317,7 @@ test("sync claim resumes a stale sent sync for the current extension without res
     });
     const created = await response.json();
 
-    const currentWorkerId = "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok:tab_current";
+    const currentWorkerId = "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_current";
     await fetch(`${baseUrl}/api/sync/jobs/claim`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4705,8 +4705,8 @@ test("sync API can retry a failed ChatGPT room message", async () => {
       body: JSON.stringify({
         text: "Generate a downloadable image.",
         to: ["gpt"],
-        modePreference: "balanced",
-        modelPreference: "gpt-5.5"
+        modePreference: "high",
+        modelPreference: "gpt-5.6-sol"
       })
     });
     const created = await createResponse.json();
@@ -4741,8 +4741,8 @@ test("sync API can retry a failed ChatGPT room message", async () => {
     assert.equal(retried.message.metadata.retryOfSyncJobId, claimed.job.id);
     assert.equal(retried.syncJob.status, "pending");
     assert.equal(retried.syncJob.payloadText, claimed.job.payloadText);
-    assert.equal(retried.syncJob.modePreference, "balanced");
-    assert.equal(retried.syncJob.modelPreference, "gpt-5.5");
+    assert.equal(retried.syncJob.modePreference, "high");
+    assert.equal(retried.syncJob.modelPreference, "gpt-5.6-sol");
     assert.equal(retried.syncJob.sourceMessageId, retried.message.id);
 
     const roomResponse = await fetch(`${baseUrl}/api/room/messages`);
@@ -5284,7 +5284,7 @@ test("product artifact APIs expose diagnostics, preview, save and Codex analysis
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           projectUrl: "https://chatgpt.com/project/demo/c/abc",
-          workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+          workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
         })
       });
       const claimed = await claimResponse.json();
@@ -5293,7 +5293,7 @@ test("product artifact APIs expose diagnostics, preview, save and Codex analysis
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+          workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
         })
       });
 
@@ -5367,8 +5367,8 @@ test("product artifact APIs expose diagnostics, preview, save and Codex analysis
       assert.equal(status.workspace.targetRepo, projectRoot);
       assert.equal(status.latestSyncJob.id, claimed.job.id);
       assert.equal(status.latestSyncJob.status, "succeeded");
-      assert.equal(status.extension.workerId, "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok");
-      assert.equal(status.extension.version, "v20260711-router-v2-safety");
+      assert.equal(status.extension.workerId, "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok");
+      assert.equal(status.extension.version, "v20260712-preference-verify");
       assert.equal(status.artifactCount, 1);
     }
   );
@@ -8114,7 +8114,7 @@ test("acceptance API summarizes captured GPT data scenarios for the active room"
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
         title: "Current extension",
-        workerId: "codex-chatgpt-project-extension-v20260711-router-v2-safety:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
       })
     });
 

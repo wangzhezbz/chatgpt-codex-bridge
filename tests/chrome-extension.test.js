@@ -1358,14 +1358,30 @@ test("content script does not treat the normal ChatGPT footer disclaimer as a ge
 test("content script maps Bridge mode and model preferences separately", async () => {
   const context = await loadContentScriptContext();
 
-  assert.equal(context.modeLabelForPreference("balanced"), "\u5747\u8861");
-  assert.equal(context.modeLabelForPreference("fast"), "\u6781\u901f");
+  assert.equal(context.modeLabelForPreference("balanced"), "中");
+  assert.equal(context.modeLabelForPreference("fast", "gpt-5.6-sol"), "极速 5.5");
   assert.equal(context.modeLabelForPreference("gpt-5.5"), null);
+  assert.equal(context.modelLabelForPreference("gpt-5.6-sol"), "GPT-5.6 Sol");
   assert.equal(context.modelLabelForPreference("gpt-5.5"), "GPT-5.5");
   assert.equal(context.modelLabelForPreference("o3"), "o3");
   assert.equal(context.modelLabelForPreference("gpt-4.5"), null);
   assert.equal(context.modelLabelForPreference("balanced"), null);
   assert.equal(context.modelLabelForPreference("unknown-model"), null);
+});
+
+test("content script keeps the actual mode set for every supported model", async () => {
+  const context = await loadContentScriptContext();
+
+  assert.deepEqual(Array.from(context.modePreferencesForModel("gpt-5.6-sol")), ["fast", "balanced", "advanced", "high", "pro"]);
+  assert.deepEqual(Array.from(context.modePreferencesForModel("gpt-5.5")), ["fast", "balanced", "advanced", "high", "pro"]);
+  assert.deepEqual(Array.from(context.modePreferencesForModel("gpt-5.4")), ["fast", "balanced", "advanced", "high", "pro"]);
+  assert.deepEqual(Array.from(context.modePreferencesForModel("gpt-5.3")), ["fast"]);
+  assert.equal(context.modeLabelForPreference("fast", "gpt-5.5"), "极速");
+  assert.equal(context.modeLabelForPreference("pro", "gpt-5.5"), "Pro 深度模式");
+  assert.equal(context.modeLabelForPreference("fast", "gpt-5.6-sol"), "极速 5.5");
+  assert.equal(context.modeLabelForPreference("pro", "gpt-5.6-sol"), "Pro");
+  assert.deepEqual(Array.from(context.modelLabelsForPreference("gpt-5.5")), ["GPT-5.5", "5.5"]);
+  assert.deepEqual(Array.from(context.modelLabelsForPreference("gpt-5.6-sol")), ["GPT-5.6 Sol", "5.6 Sol"]);
 });
 
 test("content script chooses the model menu instead of the mode menu", async () => {
@@ -1538,6 +1554,145 @@ test("content script opens ChatGPT preference menus with pointer events", async 
   assert.equal(await context.selectModePreference({ modePreference: "advanced" }), true);
   assert.ok(clicked.includes("pointerdown"));
   assert.ok(clicked.includes("mode-option"));
+});
+
+test("content script switches mode through ChatGPT combined model and mode control", async () => {
+  const context = await loadContentScriptContext();
+  const clicked = [];
+  let menuOpen = false;
+  const combinedButton = {
+    tagName: "BUTTON",
+    textContent: "5.5 Pro",
+    innerText: "5.5 Pro",
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 100, height: 32 }];
+    },
+    dispatchEvent(event) {
+      if (event.type === "pointerdown") {
+        menuOpen = true;
+      }
+      return true;
+    },
+    click() {
+      clicked.push("combined");
+      menuOpen = true;
+    }
+  };
+  const fastOption = {
+    tagName: "BUTTON",
+    textContent: "极速",
+    innerText: "极速",
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return menuOpen ? [{ width: 100, height: 32 }] : [];
+    },
+    dispatchEvent() {
+      return true;
+    },
+    click() {
+      clicked.push("fast-option");
+      combinedButton.textContent = "5.5 极速";
+      combinedButton.innerText = "5.5 极速";
+    }
+  };
+
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "button,[role='button']") return [combinedButton];
+    if (selector === "[role='menuitem'],[role='option'],button,div") return [combinedButton, fastOption];
+    return [];
+  };
+  context.sleep = async () => {};
+
+  assert.equal(
+    await context.selectModePreference({ modePreference: "fast", modelPreference: "gpt-5.5" }),
+    true
+  );
+  assert.deepEqual(clicked, ["combined", "fast-option"]);
+});
+
+test("content script prefers the composer combined control over the sidebar Pro account", async () => {
+  const context = await loadContentScriptContext();
+  const clicked = [];
+  let menuOpen = false;
+  const accountButton = {
+    tagName: "BUTTON",
+    textContent: "wangzhe Pro",
+    innerText: "wangzhe Pro",
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 180, height: 56 }];
+    },
+    click() {
+      clicked.push("account");
+    }
+  };
+  const combinedButton = {
+    tagName: "BUTTON",
+    textContent: "5.5 Pro",
+    innerText: "5.5 Pro",
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 100, height: 32 }];
+    },
+    click() {
+      clicked.push("combined");
+      menuOpen = true;
+    }
+  };
+  const highOption = {
+    tagName: "BUTTON",
+    textContent: "高",
+    innerText: "高",
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return menuOpen ? [{ width: 100, height: 32 }] : [];
+    },
+    dispatchEvent() {
+      return true;
+    },
+    click() {
+      clicked.push("high-option");
+      combinedButton.textContent = "5.5高";
+      combinedButton.innerText = "5.5高";
+    }
+  };
+  const composerScope = {
+    querySelectorAll(selector) {
+      return selector === "button,[role='button']" ? [combinedButton] : [];
+    }
+  };
+  const composer = {
+    closest(selector) {
+      return selector === '[data-testid*="composer"]' ? composerScope : null;
+    },
+    parentElement: null
+  };
+
+  context.document.querySelector = (selector) => selector === "#prompt-textarea" ? composer : null;
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "button,[role='button']") return [accountButton, combinedButton];
+    if (selector === "[role='menuitem'],[role='option'],button,div") return [accountButton, combinedButton, highOption];
+    return [];
+  };
+  context.sleep = async () => {};
+
+  assert.equal(
+    await context.selectModePreference({ modePreference: "advanced", modelPreference: "gpt-5.5" }),
+    true
+  );
+  assert.deepEqual(clicked, ["combined", "high-option"]);
+  assert.equal(context.textContainsPreferenceLabel("极高", "高"), false);
 });
 
 test("content script chooses the actual menu item instead of a wrapper div", async () => {
@@ -1789,7 +1944,7 @@ test("content script uses a stable per-tab worker id so ChatGPT tabs do not over
   const second = context.currentWorkerId();
 
   assert.equal(first, second);
-  assert.match(first, /v20260711-router-v2-safety:runtime-missing:tab_/);
+  assert.match(first, /v20260712-preference-verify:runtime-missing:tab_/);
   assert.equal(storage.size, 1);
 });
 
@@ -1827,17 +1982,17 @@ test("content script reloads the current ChatGPT page once after extension reloa
 
   assert.equal(context.maybeReloadExtensionFromHeartbeat({
     reloadExtension: true,
-    expectedExtensionVersion: "v20260711-router-v2-safety"
+    expectedExtensionVersion: "v20260712-preference-verify"
   }), true);
   assert.equal(context.maybeReloadExtensionFromHeartbeat({
     reloadExtension: true,
-    expectedExtensionVersion: "v20260711-router-v2-safety"
+    expectedExtensionVersion: "v20260712-preference-verify"
   }), true);
 
   assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), [
     {
       type: "bridge:reloadExtension",
-      expectedVersion: "v20260711-router-v2-safety"
+      expectedVersion: "v20260712-preference-verify"
     }
   ]);
   assert.equal(scheduled.length, 1);
@@ -8268,7 +8423,7 @@ test("content script skips per-message preference sync when heartbeat already ap
   context.setPreferenceStatus(
     {
       modePreference: "advanced",
-      modelPreference: "gpt-5.5",
+      modelPreference: "gpt-5.6-sol",
       updatedAt: "2026-06-30T13:47:33.475Z"
     },
     {
@@ -8307,7 +8462,7 @@ test("content script skips per-message preference sync when heartbeat already ap
     projectUrl: "https://chatgpt.com/c/demo",
     payloadText: "fresh prompt",
     modePreference: "advanced",
-    modelPreference: "gpt-5.5"
+    modelPreference: "gpt-5.6-sol"
   });
 
   assert.equal(modelSyncCalls, 0);
@@ -8490,8 +8645,8 @@ test("content script applies heartbeat preferences without claiming a chat job",
       return {
         preferences: {
           projectUrl: "https://chatgpt.com/project/demo",
-          modePreference: "advanced",
-          modelPreference: "gpt-5.4",
+          modePreference: "high",
+          modelPreference: "gpt-5.6-sol",
           updatedAt: "2026-06-28T00:00:00.000Z"
         }
       };
@@ -8502,8 +8657,8 @@ test("content script applies heartbeat preferences without claiming a chat job",
   await context.poll();
 
   assert.deepEqual(bridgeCalls.map((call) => call.path), ["/api/extension/heartbeat"]);
-  assert.equal(selectedModeJob.modePreference, "advanced");
-  assert.equal(selectedModelJob.modelPreference, "gpt-5.4");
+  assert.equal(selectedModeJob.modePreference, "high");
+  assert.equal(selectedModelJob.modelPreference, "gpt-5.6-sol");
 });
 
 test("content script applies linked model preferences before mode preferences", async () => {
@@ -8511,8 +8666,8 @@ test("content script applies linked model preferences before mode preferences", 
   const order = [];
   const preferences = {
     projectUrl: "https://chatgpt.com/project/demo",
-    modePreference: "fast",
-    modelPreference: "gpt-5.3",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z"
   };
 
@@ -8545,7 +8700,7 @@ test("content script applies linked model preferences before mode preferences", 
   };
 
   assert.equal(await context.applyHeartbeatPreferences(preferences), true);
-  assert.deepEqual(order, ["model:gpt-5.3", "mode:fast"]);
+  assert.deepEqual(order, ["model:gpt-5.6-sol", "mode:high"]);
 });
 
 test("content script coerces unsupported GPT-5.3 modes before syncing preferences", async () => {
@@ -8644,8 +8799,8 @@ test("content script retries heartbeat preferences after the preference timestam
   let modelAttempts = 0;
   const preferences = {
     projectUrl: "https://chatgpt.com/project/demo",
-    modePreference: "advanced",
-    modelPreference: "gpt-5.3",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z"
   };
   const changedPreferences = {
@@ -8692,8 +8847,8 @@ test("content script reports heartbeat preference selection failures", async () 
   const bridgeCalls = [];
   const preferences = {
     projectUrl: "https://chatgpt.com/project/demo",
-    modePreference: "balanced",
-    modelPreference: "gpt-5.4",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z"
   };
 
@@ -8729,13 +8884,76 @@ test("content script reports heartbeat preference selection failures", async () 
 
   assert.deepEqual(bridgeCalls[0].body.preferenceStatus, {
     state: "failed",
-    modePreference: "balanced",
-    modelPreference: "gpt-5.4",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z",
     modeSynced: true,
     modelSynced: false,
     error: "model preference was not applied"
   });
+});
+
+test("content script reports the controls seen during a failed mode selection", async () => {
+  const context = await loadContentScriptContext();
+  const bridgeCalls = [];
+  const combinedButton = {
+    tagName: "BUTTON",
+    textContent: "5.5 Pro",
+    innerText: "5.5 Pro",
+    title: "",
+    getAttribute(name) {
+      if (name === "role") return "button";
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 100, height: 32 }];
+    },
+    click() {}
+  };
+  const composerScope = {
+    querySelectorAll(selector) {
+      return selector === "button,[role='button']" ? [combinedButton] : [];
+    }
+  };
+  const composer = {
+    tagName: "TEXTAREA",
+    value: "",
+    focus() {},
+    dispatchEvent() {},
+    closest(selector) {
+      return selector === '[data-testid*="composer"]' ? composerScope : null;
+    },
+    parentElement: null
+  };
+
+  context.location = { hostname: "chatgpt.com", href: "https://chatgpt.com/project/demo/c/abc" };
+  context.document.title = "Demo chat";
+  context.document.body = { innerText: "", textContent: "" };
+  context.document.querySelector = (selector) => selector === "#prompt-textarea" ? composer : null;
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "button,[role='button']") return [combinedButton];
+    if (selector === "[role='menuitem'],[role='option'],button,div") return [combinedButton];
+    return [];
+  };
+  context.sleep = async () => {};
+  context.bridgeApi = async (path, options = {}) => {
+    bridgeCalls.push({ path, body: options.body ? JSON.parse(options.body) : null });
+    return {};
+  };
+
+  assert.equal(await context.applyHeartbeatPreferences({
+    projectUrl: "https://chatgpt.com/project/demo",
+    modePreference: "advanced",
+    modelPreference: "gpt-5.5",
+    updatedAt: "2026-07-12T00:00:00.000Z"
+  }), false);
+  await context.sendHeartbeat();
+
+  const diagnostic = bridgeCalls[0].body.preferenceStatus.diagnostics;
+  assert.equal(diagnostic.kind, "mode");
+  assert.deepEqual(diagnostic.labels, ["高", "高级"]);
+  assert.equal(diagnostic.currentControl.text, "5.5 Pro");
+  assert.deepEqual(diagnostic.visibleOptions.map((item) => item.text), ["5.5 Pro"]);
 });
 
 test("content script does not repeatedly retry the same failed heartbeat preferences", async () => {
@@ -8744,8 +8962,8 @@ test("content script does not repeatedly retry the same failed heartbeat prefere
   let modelAttempts = 0;
   const preferences = {
     projectUrl: "https://chatgpt.com/project/demo",
-    modePreference: "balanced",
-    modelPreference: "gpt-5.3",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z"
   };
 
@@ -8797,8 +9015,8 @@ test("content script does not retry the same failed heartbeat preferences on a t
   let modelAttempts = 0;
   const preferences = {
     projectUrl: "https://chatgpt.com/project/demo",
-    modePreference: "balanced",
-    modelPreference: "gpt-5.3",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z"
   };
 
@@ -8844,8 +9062,8 @@ test("content script clears a failed heartbeat preference when the page already 
   const bridgeCalls = [];
   const preferences = {
     projectUrl: "https://chatgpt.com/project/demo",
-    modePreference: "advanced",
-    modelPreference: "gpt-5.5",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z"
   };
   const composer = {
@@ -8859,8 +9077,8 @@ test("content script clears a failed heartbeat preference when the page already 
   };
   let modelButtonLabel = "Wrong model";
   const modeButton = {
-    textContent: context.modeLabelForPreference("advanced"),
-    innerText: context.modeLabelForPreference("advanced"),
+    textContent: context.modeLabelForPreference("high"),
+    innerText: context.modeLabelForPreference("high"),
     getAttribute() {
       return null;
     },
@@ -8908,14 +9126,14 @@ test("content script clears a failed heartbeat preference when the page already 
   };
 
   assert.equal(await context.applyHeartbeatPreferences(preferences), false);
-  modelButtonLabel = context.modelLabelForPreference("gpt-5.5");
+  modelButtonLabel = context.modelLabelForPreference("gpt-5.6-sol");
   assert.equal(await context.applyHeartbeatPreferences(preferences), true);
   await context.sendHeartbeat();
 
   assert.deepEqual(bridgeCalls.at(-1).body.preferenceStatus, {
     state: "applied",
-    modePreference: "advanced",
-    modelPreference: "gpt-5.5",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z",
     modeSynced: true,
     modelSynced: true
