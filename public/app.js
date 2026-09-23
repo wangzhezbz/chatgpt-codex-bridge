@@ -1,5 +1,7 @@
 import {
   createNewProjectForScope,
+  projectsForPage,
+  pageUrlForSavedProject,
   createProjectRefreshCoordinator,
   displayProjectConversationUrl,
   projectIdFromPageUrl,
@@ -888,7 +890,7 @@ function renderOnboardingGuide() {
 
 async function loadProjects({ autoEnter = false, preferredProjectId = null } = {}) {
   const payload = await api("/api/projects");
-  state.projects = payload.projects || [];
+  state.projects = projectsForPage(payload, Boolean(PAGE_SCOPE_TOKEN));
   state.otherProjects = payload.otherProjects || [];
   const preferredProject = state.projects.find((project) => project.id === preferredProjectId);
   state.activeProjectId = preferredProject?.id || payload.activeProjectId || state.projects[0]?.id || null;
@@ -897,6 +899,10 @@ async function loadProjects({ autoEnter = false, preferredProjectId = null } = {
 
   const canAutoEnter = autoEnter && state.activeProject && (!preferredProjectId || preferredProject);
   if (canAutoEnter) {
+    if (!PAGE_SCOPE_TOKEN && state.activeProject.currentCodexThreadId) {
+      window.location.assign(await pageUrlForSavedProject({ api, project: state.activeProject, pageUrl: window.location.href }));
+      return;
+    }
     showChat();
     await refreshWorkspaceSurface({ scrollToBottom: true });
   } else {
@@ -906,6 +912,15 @@ async function loadProjects({ autoEnter = false, preferredProjectId = null } = {
 
 async function selectProject(projectId) {
   try {
+    if (!PAGE_SCOPE_TOKEN) {
+      const project = state.projects.find(item => item.id === projectId);
+      const pageUrl = await pageUrlForSavedProject({ api, project, pageUrl: window.location.href });
+      if (pageUrl) {
+        window.location.assign(pageUrl);
+        return;
+      }
+      throw new Error("项目已保存，Codex 任务尚未关联。请在该项目的 Codex 对话中继续。");
+    }
     const payload = await selectProjectForScope({
       api,
       projectId,
@@ -3721,6 +3736,13 @@ els.selfCheckButton.addEventListener("click", runSelfCheck);
 els.clearMessagesButton.addEventListener("click", clearRoomConversation);
 
 els.backToProjectsButton.addEventListener("click", () => {
+  if (PAGE_SCOPE_TOKEN) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("scope");
+    url.searchParams.delete("project");
+    window.location.assign(url.toString());
+    return;
+  }
   showProjects();
   renderProjectList();
 });

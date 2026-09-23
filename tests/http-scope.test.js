@@ -7,6 +7,33 @@ import test from "node:test";
 import { createHttpServer } from "../src/http-server.js";
 import * as bindingClient from "../public/project-binding-client.js";
 
+test("home opens a saved project from another task without rebinding or losing it on refresh", async () => {
+  await withServer(async baseUrl => {
+    const api = async (route, options = {}) => {
+      const response = await fetch(baseUrl + route, {...options, headers:{'Content-Type':'application/json'}});
+      assert.ok(response.ok);
+      return response.json();
+    };
+    const {project} = await api('/api/projects', {method:'POST',body:JSON.stringify({
+      name:'Novel',currentCodexThreadId:'novel-thread',chatgptProjectUrl:'https://chatgpt.com/c/novel'
+    })});
+    const before = await api('/api/projects');
+    assert.equal(before.projects.length, 0);
+    assert.equal(typeof bindingClient.projectsForPage, 'function');
+    assert.equal(typeof bindingClient.pageUrlForSavedProject, 'function');
+    assert.deepEqual(bindingClient.projectsForPage(before, false).map(p=>p.id), [project.id]);
+    assert.deepEqual(bindingClient.projectsForPage(before, true), []);
+    const url = new URL(await bindingClient.pageUrlForSavedProject({api,project,pageUrl:baseUrl+'/'}));
+    assert.equal(url.searchParams.get('project'),project.id);
+    const scopedHeaders = scopeHeaders(url.searchParams.get('scope'));
+    const config = await (await fetch(baseUrl+'/api/config',{headers:scopedHeaders})).json();
+    assert.equal(config.currentCodexThreadId, 'novel-thread');
+    const reopened = await (await fetch(baseUrl+'/api/projects',{headers:scopedHeaders})).json();
+    assert.deepEqual(reopened.projects, [project]);
+    assert.deepEqual(await api('/api/projects'), before, 'entering must not mutate owner, conversation, or selection');
+  });
+});
+
 test("new-project form creates a separate conversation instead of replacing the process thread project", async () => {
   await withServer(async (baseUrl) => {
     const api = async (route, options = {}) => {

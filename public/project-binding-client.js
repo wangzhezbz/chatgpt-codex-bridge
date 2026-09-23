@@ -7,6 +7,29 @@ function requireApi(api) {
 
 const REAL_CONVERSATION_HOST = "chatgpt.com";
 
+export function projectsForPage(payload, hasPageScope) {
+  const projects = payload.projects || [];
+  if (hasPageScope) return projects;
+  return [...new Map([...projects, ...(payload.otherProjects || [])].map(p => [p.id, p])).values()];
+}
+
+export async function pageUrlForSavedProject({ api, project, pageUrl }) {
+  if (!project?.currentCodexThreadId) return null;
+  const scope = await requireApi(api)("/api/scopes", {
+    method: "POST",
+    body: JSON.stringify({
+      projectId: project.id,
+      conversationId: project.conversationId,
+      currentCodexThreadId: project.currentCodexThreadId
+    })
+  });
+  if (!scope.scopeToken) throw new Error("未能打开项目，请重试。");
+  const url = new URL(pageUrl);
+  url.searchParams.set("scope", scope.scopeToken);
+  url.searchParams.set("project", project.id);
+  return url.toString();
+}
+
 export function displayProjectConversationUrl(value = "") {
   return String(value || "");
 }
