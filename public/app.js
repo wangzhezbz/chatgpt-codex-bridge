@@ -15,7 +15,7 @@ import {
   installVisibleBrandingGuard,
   maskVisibleBrandName
 } from "./visible-branding.js";
-import { createBridgeApiClient } from "./bridge-api-client.js";
+import { artifactResourceUrl, createBridgeApiClient } from "./bridge-api-client.js";
 import { applyModelAvailability } from "./model-availability.js";
 
 installVisibleBrandingGuard();
@@ -679,12 +679,12 @@ function artifactInitial(artifact = {}) {
 
 function artifactDownloadUrl(artifactOrId) {
   const id = typeof artifactOrId === "string" ? artifactOrId : artifactOrId.id;
-  return `/api/artifacts/${encodeURIComponent(id)}/download`;
+  return artifactResourceUrl(id, { action: "download", scopeToken: PAGE_SCOPE_TOKEN, projectId: state.activeProjectId });
 }
 
 function artifactViewUrl(artifactOrId) {
   const id = typeof artifactOrId === "string" ? artifactOrId : artifactOrId.id;
-  return `/api/artifacts/${encodeURIComponent(id)}/view`;
+  return artifactResourceUrl(id, { action: "view", scopeToken: PAGE_SCOPE_TOKEN, projectId: state.activeProjectId });
 }
 
 function artifactDownloadFilename(artifactOrId) {

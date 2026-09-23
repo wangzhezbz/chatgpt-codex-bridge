@@ -6,6 +6,38 @@ import test from "node:test";
 
 import { createHttpServer } from "../src/http-server.js";
 import * as bindingClient from "../public/project-binding-client.js";
+import * as apiClient from "../public/bridge-api-client.js";
+
+test("image, preview and download URLs preserve the page project without custom request headers", async () => {
+  await withServer(async baseUrl => {
+    const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRZkAAAAASUVORK5CYII=", "base64");
+    const post = async (route, body, headers) => {
+      const response = await fetch(baseUrl + route, {method:"POST", headers:{"Content-Type":"application/json", ...headers}, body:JSON.stringify(body)});
+      assert.ok(response.ok, await response.clone().text());
+      return response.json();
+    };
+    const {project: owned} = await post("/api/projects", {name:"Owned", currentCodexThreadId:"image-task", chatgptProjectUrl:"https://chatgpt.com/c/image"});
+    const {scopeToken} = await mintScope(baseUrl, {currentCodexThreadId:"image-task", projectId:owned.id, conversationId:owned.conversationId});
+    const standaloneHeaders = {"X-Bridge-Context":"standalone"};
+    const {project: unowned} = await post("/api/projects", {name:"Standalone", chatgptProjectUrl:"https://chatgpt.com/c/standalone"}, standaloneHeaders);
+    assert.equal(typeof apiClient.artifactResourceUrl, "function");
+    for (const [project, token, headers] of [[owned, scopeToken, scopeHeaders(scopeToken)], [unowned, "", standaloneHeaders]]) {
+      const {artifact} = await post(`/api/artifacts/import?projectId=${project.id}`, {filename:"poster.png", contentType:"image/png", base64Data:bytes.toString("base64")}, headers);
+      for (const action of ["raw", "view", "download"]) {
+        const url = apiClient.artifactResourceUrl(artifact.id, {action, scopeToken:token, projectId:project.id});
+        const response = await fetch(baseUrl + url);
+        assert.equal(response.status, 200, `${action} must work without fetch headers`);
+        assert.equal(response.headers.get("content-type"), "image/png");
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+      }
+      const wrongProject = project === owned ? unowned : owned;
+      const wrongUrl = apiClient.artifactResourceUrl(artifact.id, {action:"raw", projectId:wrongProject.id});
+      assert.equal((await fetch(baseUrl + wrongUrl)).status, 409, "must not expose another project's files");
+    }
+    const missingProject = await fetch(baseUrl + "/api/artifacts/missing/raw?context=standalone");
+    assert.notEqual(missingProject.status, 200);
+  });
+});
 
 test("home opens a saved project from another task without rebinding or losing it on refresh", async () => {
   await withServer(async baseUrl => {

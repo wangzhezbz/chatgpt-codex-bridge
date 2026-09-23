@@ -280,7 +280,13 @@ test("local workbench frontend supports projects, themes and rich GPT-like messa
   assert.doesNotMatch(js, /function artifactSaveAsUrl/);
   assert.doesNotMatch(js, /function handleArtifactDownload/);
   assert.doesNotMatch(js, /\/save-as/);
-  assert.match(js, /\/view/);
+  for (const [helper, action] of [["artifactViewUrl", "view"], ["artifactDownloadUrl", "download"]]) {
+    const body = functionBody(js, helper);
+    assert.match(body, /artifactResourceUrl\(id,/);
+    assert.match(body, new RegExp(`action: "${action}"`));
+    assert.match(body, /scopeToken: PAGE_SCOPE_TOKEN/);
+    assert.match(body, /projectId: state\.activeProjectId/);
+  }
   assert.match(functionBody(js, "downloadArtifactToDevice"), /link\.href = artifactDownloadUrl\(artifactOrId\)/);
   assert.doesNotMatch(functionBody(js, "downloadArtifactToDevice"), /response\.blob\(\)/);
   assert.match(js, /link\.download = filename/);

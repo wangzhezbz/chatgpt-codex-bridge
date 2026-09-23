@@ -6100,12 +6100,18 @@ export function createHttpServer(options = {}) {
         return;
       }
       if (requestUrl.pathname.startsWith("/api/")) {
+        // Native media/download requests have no custom headers. Match the
+        // standalone API client only for explicitly project-scoped binary reads.
+        const standaloneArtifactRead = request.method === "GET" &&
+          /^\/api\/artifacts\/[^/]+\/(raw|view|download)$/.test(requestUrl.pathname) &&
+          requestUrl.searchParams.get("context") === "standalone" &&
+          Boolean(requestUrl.searchParams.get("projectId"));
         await handleApi(request, response, {
           storeRoot,
           runnerMode,
           currentCodexThreadId:
             resolvedScope.value?.currentCodexThreadId ||
-            (request.headers["x-bridge-context"] === "standalone" ? null : currentCodexThreadId),
+            (request.headers["x-bridge-context"] === "standalone" || standaloneArtifactRead ? null : currentCodexThreadId),
           requestScope: resolvedScope.value,
           extensionSourceDir,
           apiToken,

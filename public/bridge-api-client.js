@@ -1,3 +1,14 @@
+// Browser media elements and download links cannot send the API client's headers.
+// Only construct local artifact routes; never append page credentials to remote URLs.
+export function artifactResourceUrl(id, { action = "raw", scopeToken = "", projectId = "" } = {}) {
+  if (!["raw", "view", "download"].includes(action)) throw new Error("Invalid artifact resource action");
+  const query = new URLSearchParams();
+  if (scopeToken) query.set("scope", scopeToken);
+  else query.set("context", "standalone");
+  if (projectId) query.set("projectId", projectId);
+  return `/api/artifacts/${encodeURIComponent(id)}/${action}?${query}`;
+}
+
 export function createBridgeApiClient(options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   const configPath = options.configPath || "/api/config";
