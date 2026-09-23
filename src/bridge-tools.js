@@ -38,7 +38,7 @@ import { completeRoomCodexTaskWithMessage } from "./room-codex-completion.js";
 import { decideRoomRoute } from "./room-routing-policy.js";
 import { createRouterOrchestrator } from "./router-orchestrator.js";
 import { createRouterRunStore } from "./router-run-store.js";
-import { bindCurrentSessionProject, getProject, listProjects } from "./project-store.js";
+import { bindCurrentSessionProject, claimUnboundProject, getProject, listProjects } from "./project-store.js";
 import {
   createTask,
   getTask,
@@ -206,7 +206,7 @@ function workspaceFromProject(project, fallback = {}) {
     chatgptProjectUrl: project.chatgptProjectUrl,
     targetRepo: project.targetRepo,
     conversationId: project.conversationId,
-    currentCodexThreadId: project.currentCodexThreadId || fallback.currentCodexThreadId || null,
+    currentCodexThreadId: project.currentCodexThreadId || null,
     modePreference: fallback.modePreference || null,
     modelPreference: fallback.modelPreference || null,
     preferenceUpdatedAt: fallback.preferenceUpdatedAt || null
@@ -1002,6 +1002,15 @@ export function createBridgeTools(options = {}) {
   }
 
   async function delegateCurrentRequestV2(input = {}) {
+    if (input.projectId && input.conversationId && currentCodexThreadId) {
+      const project = await getProject(storeRoot, input.projectId);
+      if (!project.currentCodexThreadId) {
+        await claimUnboundProject(storeRoot, {
+          projectId: input.projectId, conversationId: input.conversationId,
+          currentCodexThreadId, cwd: options.cwd || process.cwd()
+        });
+      }
+    }
     if (
       semanticRouterEnabled &&
       input.routingProposal &&

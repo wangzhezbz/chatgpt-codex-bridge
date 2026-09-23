@@ -20,7 +20,7 @@ export function createBridgeApiClient(options = {}) {
       tokenPromise = fetchImpl(configPath, {
         headers: {
           "Content-Type": "application/json",
-          ...(scopeToken ? { "X-Bridge-Scope": scopeToken } : {})
+          ...(scopeToken ? { "X-Bridge-Scope": scopeToken } : { "X-Bridge-Context": "standalone" })
         },
         cache: "no-store"
       })
@@ -50,7 +50,7 @@ export function createBridgeApiClient(options = {}) {
           ...requestOptions,
           headers: {
             ...(requestOptions.headers || {}),
-            ...(scopeToken ? { "X-Bridge-Scope": scopeToken } : {}),
+            ...(scopeToken ? { "X-Bridge-Scope": scopeToken } : { "X-Bridge-Context": "standalone" }),
             ...(token ? { "X-Bridge-Token": token } : {})
           }
         });

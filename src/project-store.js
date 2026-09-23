@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 
 import { getWorkspaceBinding, updateWorkspaceBinding } from "./conversation-store.js";
@@ -302,7 +303,7 @@ async function ensureProjectForWorkspaceLocked(storeRoot, workspace = {}, option
       chatgptProjectUrl: workspace.chatgptProjectUrl,
       targetRepo: workspace.targetRepo,
       conversationId: workspace.conversationId,
-      currentCodexThreadId: currentCodexThreadId || existing?.currentCodexThreadId || null,
+      currentCodexThreadId: existing ? existing.currentCodexThreadId : currentCodexThreadId,
       modePreference: workspace.modePreference,
       modelPreference: workspace.modelPreference
     },
@@ -354,6 +355,27 @@ async function selectProjectLocked(storeRoot, projectId) {
 // Lock order is projects -> workspace; workspace mutations never acquire the
 // projects lock. Hold through nested binding updates to prevent selection races.
 export function createProject(storeRoot,input={}) { return withJsonStateLock(projectsPath(storeRoot),()=>createProjectLocked(storeRoot,input)); }
+export function claimUnboundProject(storeRoot, input) {
+  return withJsonStateLock(projectsPath(storeRoot), async () => {
+    const state = await readProjectState(storeRoot);
+    const project = state.projects.find(p => p.id === input.projectId && !p.deletedAt);
+    if (!project || project.conversationId !== input.conversationId) throw new Error("Project scope mismatch");
+    if (!input.currentCodexThreadId) throw new Error("Current Codex thread is required");
+    if (project.currentCodexThreadId) {
+      if (project.currentCodexThreadId !== input.currentCodexThreadId) throw new Error("Project belongs to another Codex thread");
+      return project;
+    }
+    if (!project.targetRepo || !input.cwd) throw new Error("Project directory is required for first-use binding");
+    const [target, caller] = await Promise.all([realpath(project.targetRepo), realpath(input.cwd)]);
+    const key = value => process.platform === "win32" ? value.toLowerCase() : value;
+    if (key(target) !== key(caller)) throw new Error("Current Codex directory does not match the bound project");
+    const bound = {...project, currentCodexThreadId: input.currentCodexThreadId, updatedAt: nowIso()};
+    state.projects = state.projects.map(p => p.id === bound.id ? bound : p);
+    await writeProjectState(storeRoot, state);
+    return bound;
+  });
+}
+
 export function bindCurrentSessionProject(storeRoot,input={},options={}) { return withJsonStateLock(projectsPath(storeRoot),()=>bindCurrentSessionProjectLocked(storeRoot,input,options)); }
 export function updateProject(storeRoot,projectId,input={}) { return withJsonStateLock(projectsPath(storeRoot),()=>updateProjectLocked(storeRoot,projectId,input)); }
 export function deleteProject(storeRoot,projectId) { return withJsonStateLock(projectsPath(storeRoot),()=>deleteProjectLocked(storeRoot,projectId)); }

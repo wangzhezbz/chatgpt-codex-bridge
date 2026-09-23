@@ -6104,7 +6104,8 @@ export function createHttpServer(options = {}) {
           storeRoot,
           runnerMode,
           currentCodexThreadId:
-            resolvedScope.value?.currentCodexThreadId || currentCodexThreadId,
+            resolvedScope.value?.currentCodexThreadId ||
+            (request.headers["x-bridge-context"] === "standalone" ? null : currentCodexThreadId),
           requestScope: resolvedScope.value,
           extensionSourceDir,
           apiToken,

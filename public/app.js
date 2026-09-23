@@ -919,12 +919,13 @@ async function selectProject(projectId) {
         window.location.assign(pageUrl);
         return;
       }
-      throw new Error("项目已保存，Codex 任务尚未关联。请在该项目的 Codex 对话中继续。");
+      // Standalone projects remain usable while their first Codex request
+      // establishes the task association from the actual project directory.
     }
     const payload = await selectProjectForScope({
       api,
       projectId,
-      currentCodexThreadId: state.currentCodexThreadId
+      currentCodexThreadId: PAGE_SCOPE_TOKEN ? state.currentCodexThreadId : null
     });
     projectRefreshCoordinator.invalidate();
     state.workspace = null;
