@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,6 +7,48 @@ import test from "node:test";
 import { createHttpServer } from "../src/http-server.js";
 import * as bindingClient from "../public/project-binding-client.js";
 import * as apiClient from "../public/bridge-api-client.js";
+import { createProject, selectProject, getProject } from "../src/project-store.js";
+import { getWorkspaceBinding } from "../src/conversation-store.js";
+import { appendRoomMessage } from "../src/room-store.js";
+
+test("clearing an inactive project's chat keeps its actual rule status and never changes global binding", async () => {
+  await withServer(async (baseUrl, storeRoot) => {
+    const a = await createProject(storeRoot, { name: "A", targetRepo: await mkdtemp(path.join(tmpdir(), "bridge-rules-a-")), chatgptProjectUrl: "https://chatgpt.com/c/a", currentCodexThreadId: "task-a" });
+    const b = await createProject(storeRoot, { name: "B", targetRepo: await mkdtemp(path.join(tmpdir(), "bridge-rules-b-")), chatgptProjectUrl: "https://chatgpt.com/c/b", currentCodexThreadId: "task-b" });
+    await selectProject(storeRoot, a.id);
+    await selectProject(storeRoot, b.id);
+    await appendRoomMessage(storeRoot, { conversationId: a.conversationId, from: "user", to: ["gpt"], text: "Clear only this room" });
+    const beforeGlobal = await getWorkspaceBinding(storeRoot);
+    const beforeProject = await getProject(storeRoot, a.id);
+    const files = ["BRIDGE.md", "AGENTS.md"];
+    const beforeFiles = await Promise.all(files.map(name => readFile(path.join(a.targetRepo, name), "utf8")));
+    const { scopeToken } = await mintScope(baseUrl, { currentCodexThreadId: "task-a", projectId: a.id, conversationId: a.conversationId });
+    const headers = scopeHeaders(scopeToken);
+    const get = async route => {
+      const response = await fetch(baseUrl + route, { headers });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    for (const afterClear of [false, true]) {
+      if (afterClear) assert.equal((await fetch(baseUrl + "/api/room/messages", { method: "DELETE", headers })).status, 200);
+      const workspace = await get("/api/workspace");
+      assert.equal(workspace.bridgeRulesPath, path.join(a.targetRepo, "BRIDGE.md"));
+      assert.equal(workspace.codexDelegationPath, path.join(a.targetRepo, "AGENTS.md"));
+      assert.equal((await get("/api/diagnostics/status")).workspace.bridgeRulesPath, workspace.bridgeRulesPath);
+    }
+    assert.deepEqual((await get("/api/room/messages")).messages, []);
+    assert.deepEqual(await getWorkspaceBinding(storeRoot), beforeGlobal);
+    assert.deepEqual(await getProject(storeRoot, a.id), beforeProject);
+    assert.deepEqual(await Promise.all(files.map(name => readFile(path.join(a.targetRepo, name), "utf8"))), beforeFiles);
+    await writeFile(path.join(a.targetRepo, "BRIDGE.md"), "# User document, not generated rules\n");
+    assert.equal((await get("/api/workspace")).bridgeRulesPath, null, "must not report a file as ready merely because its path exists");
+    await writeFile(path.join(a.targetRepo, "BRIDGE.md"), beforeFiles[0].replace(a.conversationId, "conv_stale"));
+    assert.equal((await get("/api/workspace")).bridgeRulesPath, null, "stale bindings are not ready");
+    assert.match(await readFile(path.join(a.targetRepo, "BRIDGE.md"), "utf8"), /conv_stale/, "status GET must not rewrite rules");
+    await writeFile(path.join(a.targetRepo, "AGENTS.md"), beforeFiles[1].replaceAll(a.id, "project_stale"));
+    assert.equal((await get("/api/workspace")).codexDelegationPath, null, "delegation status must match this project, not just its directory");
+  });
+});
 
 test("image, preview and download URLs preserve the page project without custom request headers", async () => {
   await withServer(async baseUrl => {
@@ -107,7 +149,7 @@ async function withServer(fn) {
   const { port } = server.address();
   const baseUrl = `http://127.0.0.1:${port}`;
   try {
-    await fn(baseUrl);
+    await fn(baseUrl, storeRoot);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

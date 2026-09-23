@@ -26,6 +26,43 @@ export function hasCodexDelegationMarker(text = "") {
   return text.includes(CODEX_DELEGATION_BEGIN) && text.includes(CODEX_DELEGATION_END);
 }
 
+function managedBlock(text, begin, end) {
+  const start = text.indexOf(begin);
+  const finish = text.indexOf(end, start);
+  return start >= 0 && finish >= start ? text.slice(start, finish + end.length).replace(/\r\n/g, "\n") : null;
+}
+
+// Read actual per-project files, not the metadata of whichever room was last
+// selected globally. Status polling must never rewrite a binding or rule file.
+export async function readProjectRoutingRuleStatus(input = {}) {
+  const status = { bridgeRulesPath: null, codexDelegationPath: null };
+  if (!input.targetRepo) return status;
+  async function readManaged(file, begin, end) {
+    try { return managedBlock(await readFile(file, "utf8"), begin, end); }
+    catch (error) {
+      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) return null;
+      throw error;
+    }
+  }
+  const rulesPath = bridgeRulesPathForTarget(input.targetRepo);
+  const agentsPath = codexDelegationPathForTarget(input.targetRepo);
+  const [rules, agents] = await Promise.all([
+    readManaged(rulesPath, BRIDGE_RULES_BEGIN, BRIDGE_RULES_END),
+    readManaged(agentsPath, CODEX_DELEGATION_BEGIN, CODEX_DELEGATION_END)
+  ]);
+  if (rules === buildBridgeRoutingRules(input)) status.bridgeRulesPath = rulesPath;
+  const projectId = input.projectId || input.id;
+  const required = [
+    `- Version: ${CODEX_DELEGATION_VERSION}`,
+    projectId && `- Bridge project: ${projectId}`,
+    input.conversationId && `- Bridge conversation: ${input.conversationId}`,
+    input.chatgptProjectUrl && `- Bound GPT session: ${input.chatgptProjectUrl}`,
+    `- Bound local project root: ${path.resolve(input.targetRepo)}`
+  ].filter(Boolean);
+  if (agents && required.every(line => agents.split("\n").includes(line))) status.codexDelegationPath = agentsPath;
+  return status;
+}
+
 function replaceMarkedBlock(existing, beginMarker, endMarker, block) {
   const beginIndex = existing.indexOf(beginMarker);
   const endIndex = existing.indexOf(endMarker, beginIndex);
@@ -196,13 +233,7 @@ export async function ensureBridgeRoutingRules(input = {}) {
   try {
     const existing = await readFile(rulesPath, "utf8");
     if (hasBridgeRoutingMarker(existing)) {
-      if (
-        markedBlockNeedsRefresh(existing, [
-          BRIDGE_RULES_VERSION,
-          "Codex 默认只做整理、落地和低成本验收",
-          "不要编造 GPT 结果"
-        ])
-      ) {
+      if (managedBlock(existing, BRIDGE_RULES_BEGIN, BRIDGE_RULES_END) !== block) {
         const refreshed = replaceMarkedBlock(existing, BRIDGE_RULES_BEGIN, BRIDGE_RULES_END, block);
         await writeFile(rulesPath, refreshed, "utf8");
         return {

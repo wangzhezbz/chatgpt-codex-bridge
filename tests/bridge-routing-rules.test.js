@@ -15,6 +15,22 @@ async function tempDir() {
   return mkdtemp(path.join(tmpdir(), "bridge-routing-rules-"));
 }
 
+test("routing rules refresh changed binding even when the policy version is unchanged", async () => {
+  const targetRepo = await tempDir();
+  const file = path.join(targetRepo, "BRIDGE.md");
+  await ensureBridgeRoutingRules({ targetRepo, chatgptProjectUrl: "https://chatgpt.com/c/old", conversationId: "conv_old" });
+  await writeFile(file, `User instructions before\n${await readFile(file, "utf8")}\nUser instructions after\n`);
+  const result = await ensureBridgeRoutingRules({ targetRepo, chatgptProjectUrl: "https://chatgpt.com/c/new", conversationId: "conv_new" });
+  assert.equal(result.updated, true);
+  const text = await readFile(file, "utf8");
+  assert.ok(text.startsWith("User instructions before\n"));
+  assert.ok(text.endsWith("\nUser instructions after\n"));
+  assert.match(text, /Bridge conversation: conv_new/);
+  assert.match(text, /https:\/\/chatgpt.com\/c\/new/);
+  assert.doesNotMatch(text, /conv_old|\/c\/old/);
+  assert.equal((await ensureBridgeRoutingRules({ targetRepo, chatgptProjectUrl: "https://chatgpt.com/c/new", conversationId: "conv_new" })).updated, false);
+});
+
 test("web workspace binding writes its project identity into generated delegation rules", async () => {
   const storeRoot = await tempDir();
   const targetRepo = await tempDir();

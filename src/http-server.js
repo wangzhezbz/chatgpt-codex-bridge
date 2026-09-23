@@ -89,6 +89,7 @@ import {
   waitForSyncJobResult
 } from "./gpt-file-analysis.js";
 import { createBridgeTools } from "./bridge-tools.js";
+import { readProjectRoutingRuleStatus } from "./bridge-routing-rules.js";
 import {
   getExtensionHeartbeat,
   listExtensionHeartbeats,
@@ -2420,14 +2421,16 @@ async function getScopedWorkspaceBinding(storeRoot, currentCodexThreadId = null,
         modePreference: project.modePreference || null,
         modelPreference: project.modelPreference || null,
         preferenceUpdatedAt: project.preferenceUpdatedAt || project.updatedAt || null,
-        updatedAt: project.updatedAt || null
+        updatedAt: project.updatedAt || null,
+        ...await readProjectRoutingRuleStatus(project)
       },
       scopedOut: false,
       outOfScopeProjectId: null
     };
   }
 
-  const workspace = await getWorkspaceBinding(storeRoot);
+  const storedWorkspace = await getWorkspaceBinding(storeRoot);
+  const workspace = { ...storedWorkspace, ...await readProjectRoutingRuleStatus(storedWorkspace) };
   if (!currentCodexThreadId || !workspace.projectId) {
     return { workspace, scopedOut: false, outOfScopeProjectId: null };
   }
