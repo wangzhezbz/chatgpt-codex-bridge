@@ -946,11 +946,22 @@ async function selectProject(projectId) {
   }
 }
 
+function confirmAction(message) {
+  const dialog = document.getElementById("confirmActionDialog");
+  if (dialog.open) return Promise.resolve(false);
+  document.getElementById("confirmActionMessage").textContent = message;
+  dialog.returnValue = "cancel";
+  return new Promise(resolve => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true });
+    dialog.showModal();
+  });
+}
+
 async function deleteProject(projectId) {
   const project = state.projects.find((item) => item.id === projectId);
   if (!projectId) return;
   const name = project?.name || "这个项目";
-  const confirmed = window.confirm(`删除“${name}”？只会从 Bridge 项目列表隐藏，不会删除本地文件。`);
+  const confirmed = await confirmAction(`删除“${name}”？只会从 Bridge 项目列表隐藏，不会删除本地文件。`);
   if (!confirmed) return;
 
   try {
@@ -2740,7 +2751,7 @@ function renderSyncActions(message) {
 
 async function deleteRoomMessage(messageId) {
   if (!messageId) return;
-  const confirmed = window.confirm("删除这条消息？只会从当前 Bridge 房间隐藏。");
+  const confirmed = await confirmAction("删除这条消息？只会从当前 Bridge 房间隐藏。");
   if (!confirmed) return;
   try {
     await api(`/api/room/messages/${encodeURIComponent(messageId)}`, {
@@ -2754,7 +2765,7 @@ async function deleteRoomMessage(messageId) {
 }
 
 async function clearRoomConversation() {
-  const confirmed = window.confirm("清空当前对话？只会清空 Bridge 当前房间视图，不会删除本地文件。");
+  const confirmed = await confirmAction("清空当前对话？只会清空 Bridge 当前房间视图，不会删除本地文件。");
   if (!confirmed) return;
   try {
     await api(scopedProjectPath("/api/room/messages"), {
