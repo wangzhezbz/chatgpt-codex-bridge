@@ -175,7 +175,6 @@ codex mcp get chatgpt-codex-bridge --json
 4. 点击“绑定当前会话并进入”。
 5. 确认顶部状态为：**GPT 已绑定 / 连接就绪 / 规则已写入**。
 
-<img width="491" height="88" alt="image" src="https://github.com/user-attachments/assets/fea39218-59a3-4e94-a83e-8ae7d6eea6ea" />
 
 
 ## 使用
