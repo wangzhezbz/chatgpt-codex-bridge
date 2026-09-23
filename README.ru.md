@@ -9,8 +9,12 @@
 
 <table align="center">
   <tr>
-    <td width="50%" align="center"><strong>▣ Windows</strong><br /><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">Скачать</a></td>
-    <td width="50%" align="center"><strong>◇ macOS</strong><br /><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">Скачать</a></td>
+    <th width="160" align="center">Windows</th>
+    <th width="160" align="center">macOS</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">Скачать</a></td>
+    <td align="center"><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">Скачать</a></td>
   </tr>
 </table>
 
