@@ -136,6 +136,14 @@ Keep the data directory outside the application directory so updates, rollback, 
 
 ## Usage
 
+### Everyday workflow: bind on the right, ask on the left
+
+1. Open the project you want to work on in Codex on the left.
+2. In Bridge on the right, enter the project name, GPT conversation URL, and local project directory, then bind.
+3. Once the rules are written and the connection is ready, return to Codex and ask normally: `Have GPT analyze this file, then update the project using the result.`
+
+Binding automatically creates or updates the Bridge sections in `AGENTS.md` and `BRIDGE.md` in your project directory, preserving existing project instructions. Use **Enter** for an existing binding. Use each project's own directory and GPT conversation. Task IDs, project IDs, and scope are internal parameters, not fields users need to fill in manually.
+
 - Send ordinary requests from the workbench; the router selects Codex or GPT.
 - Ask GPT to analyze a local file: `Send this PDF to GPT and list the key issues.`
 - Ask GPT to generate a real file: `Create an Excel workbook from this data and return the file.`
