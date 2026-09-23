@@ -7,10 +7,10 @@
   A local, project-isolated bridge for Codex and GPT with file transfer and failure recovery.
 </p>
 
-<table>
+<table align="center">
   <tr>
     <td width="50%" align="center"><strong>▣ Windows</strong><br /><sub>Validated in a real environment</sub></td>
-    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>Source-compatible · full validation pending</sub></td>
+    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>Validated in a real environment</sub></td>
   </tr>
 </table>
 
@@ -67,18 +67,23 @@ The system has four local components: the HTTP workbench on `127.0.0.1:4317`, a 
 
 ### Requirements
 
-- Windows 10/11, or macOS for source-based use
+- Windows 10/11 or macOS, both validated in real environments
 - Node.js 20 or newer
 - Codex Desktop or Codex CLI
 - Chrome or another Chromium browser
 - A signed-in ChatGPT web session
 
-### Release package (recommended on Windows)
+### Give the release package to Codex (recommended)
 
 1. Open [Releases](https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/latest) and download `CodexBridge-User-Package-v0.1.95-*.zip`.
-2. Extract it to a permanent directory such as `D:\Apps\CodexBridge`.
-3. Read `INSTALL-CodexBridge.md` and run `Start-CodexBridge.cmd`.
-4. Open `http://127.0.0.1:4317/`.
+2. Attach the downloaded ZIP directly to Codex.
+3. Send this instruction with the file:
+
+   ```text
+   Install this chatgpt_codex_bridge user package. Extract it to a permanent directory, keep the data directory outside the installation directory, start the local service, configure and reload the Codex MCP server, then verify that the HTTP, MCP, and extension versions match. Do not delete or overwrite my existing Bridge data.
+   ```
+
+4. Let Codex complete extraction, startup, and MCP configuration. You only need to load the Chrome extension as described below.
 
 ### Source installation
 
@@ -97,7 +102,10 @@ npm start
 4. Select the package's `chrome-extension` directory.
 5. Keep the GPT conversation you want to bind open.
 
-### Configure Codex MCP
+<details>
+<summary><strong>Advanced: expand for manual MCP configuration</strong></summary>
+
+### Configure Codex MCP manually
 
 Add the following to `~/.codex/config.toml` and replace the example paths:
 
@@ -115,6 +123,8 @@ BRIDGE_GPT_TRANSPORT = "web-sync"
 ```
 
 Keep the data directory outside the application directory so updates, rollback, or uninstall do not remove projects and messages. Reload `chatgpt-codex-bridge` in Codex after saving the configuration.
+
+</details>
 
 ### First binding
 

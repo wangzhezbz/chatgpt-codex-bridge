@@ -7,10 +7,10 @@
   프로젝트 격리, 파일 전달, 실패 복구를 지원하는 로컬 협업 브리지입니다.
 </p>
 
-<table>
+<table align="center">
   <tr>
     <td width="50%" align="center"><strong>▣ Windows</strong><br /><sub>실제 환경 검증 완료</sub></td>
-    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>소스 실행 가능 · 전체 검증 예정</sub></td>
+    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>실제 환경 검증 완료</sub></td>
   </tr>
 </table>
 
@@ -67,18 +67,23 @@ flowchart LR
 
 ### 요구 사항
 
-- Windows 10/11 또는 소스 실행용 macOS
+- Windows 10/11 또는 macOS, 두 플랫폼 모두 실제 환경 검증 완료
 - Node.js 20 이상
 - Codex Desktop 또는 Codex CLI
 - Chrome 또는 Chromium 브라우저
 - 로그인된 ChatGPT 웹 세션
 
-### Windows 릴리스 패키지
+### 릴리스 패키지를 Codex에 전달하기 — 권장 방식
 
 1. [Releases](https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/latest)에서 `CodexBridge-User-Package-v0.1.95-*.zip`을 다운로드합니다.
-2. `D:\Apps\CodexBridge` 같은 고정 폴더에 압축을 풉니다.
-3. `INSTALL-CodexBridge.md`를 읽고 `Start-CodexBridge.cmd`를 실행합니다.
-4. `http://127.0.0.1:4317/`을 엽니다.
+2. 다운로드한 ZIP을 그대로 Codex 작업에 첨부합니다.
+3. 파일과 함께 다음 지시문을 보냅니다.
+
+   ```text
+   이 chatgpt_codex_bridge 사용자 패키지를 설치해 주세요. 고정 폴더에 압축을 풀고 데이터 폴더는 설치 폴더 밖에 두며, 로컬 서비스를 시작하고 Codex MCP를 설정한 뒤 다시 로드해 주세요. 마지막으로 HTTP, MCP, 확장 버전이 일치하는지 확인해 주세요. 기존 Bridge 데이터는 삭제하거나 덮어쓰지 마세요.
+   ```
+
+4. 압축 해제, 서비스 시작, MCP 설정은 Codex가 처리합니다. 사용자는 아래 절차에 따라 Chrome 확장만 로드하면 됩니다.
 
 ### 소스에서 실행
 
@@ -96,7 +101,10 @@ npm start
 3. `chrome-extension` 폴더를 지정합니다.
 4. 바인딩할 GPT 대화를 열린 상태로 유지합니다.
 
-### Codex MCP 설정
+<details>
+<summary><strong>고급: MCP를 수동으로 설정할 때 펼치기</strong></summary>
+
+### Codex MCP 수동 설정
 
 `~/.codex/config.toml`에 다음 내용을 추가하고 경로를 실제 설치 경로로 바꿉니다.
 
@@ -114,6 +122,8 @@ BRIDGE_GPT_TRANSPORT = "web-sync"
 ```
 
 업데이트나 롤백 시 기록을 보호하도록 데이터 폴더는 애플리케이션 폴더 밖에 두십시오. 저장 후 Codex에서 `chatgpt-codex-bridge` MCP를 다시 로드합니다.
+
+</details>
 
 ### 첫 바인딩
 

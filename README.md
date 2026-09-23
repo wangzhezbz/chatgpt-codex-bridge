@@ -6,6 +6,7 @@
   <a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/wangzhezbz/chatgpt-codex-bridge?style=flat-square&color=111827" /></a>
   <img alt="Node.js 20+" src="https://img.shields.io/badge/Node.js-20%2B-339933?style=flat-square&logo=node.js&logoColor=white" />
   <img alt="Windows verified" src="https://img.shields.io/badge/Windows-verified-2563EB?style=flat-square&logo=windows11&logoColor=white" />
+  <img alt="macOS verified" src="https://img.shields.io/badge/macOS-verified-111827?style=flat-square&logo=apple&logoColor=white" />
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-111827?style=flat-square" /></a>
 </p>
 
@@ -14,10 +15,10 @@
   一个本地运行、按项目隔离、支持文件与失败恢复的 Codex × GPT 协作桥。
 </p>
 
-<table>
+<table align="center">
   <tr>
     <td width="50%" align="center"><strong>▣ Windows</strong><br /><sub>已完成真实环境验收</sub></td>
-    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>源码可运行 · 尚未完整验收</sub></td>
+    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>已完成真实环境验收</sub></td>
   </tr>
 </table>
 
@@ -91,22 +92,23 @@ chatgpt_codex_bridge 由四部分组成：
 
 ### 环境要求
 
-- Windows 10/11（当前完整验收平台）
+- Windows 10/11 或 macOS（均已完成真实环境验收）
 - [Node.js](https://nodejs.org/) 20 或更新版本
 - Codex 桌面版或 Codex CLI
 - Chrome / Edge Chromium 浏览器
 - 已登录的 ChatGPT 网页会话
 
-### 方式一：下载用户包（推荐）
+### 方式一：把用户包交给 Codex（推荐）
 
 1. 打开 [Releases](https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/latest)，下载 `CodexBridge-User-Package-v0.1.95-*.zip`。
-2. 解压到固定目录，例如 `D:\Apps\CodexBridge`。更新时不要把数据目录放进安装目录。
-3. 先阅读包内的 `INSTALL-CodexBridge.md`；发布前验收依据见 `ACCEPTANCE-CHECKLIST.md` 和 `REAL-BROWSER-ACCEPTANCE.md`。
-4. 双击 `Start-CodexBridge.cmd`。首次运行会安装依赖，完成后访问：
+2. 把下载好的 ZIP 直接发送给 Codex。
+3. 把下面这段话一起发给 Codex：
 
    ```text
-   http://127.0.0.1:4317/
+   请安装这个 chatgpt_codex_bridge 用户包：解压到固定目录，把数据目录放在安装目录之外，启动本地服务，配置并重载 Codex MCP，然后检查 HTTP、MCP 和扩展版本是否一致。不要删除或覆盖我现有的 Bridge 数据。
    ```
+
+4. 等 Codex 完成解压、启动和 MCP 配置。随后只需按下一节加载 Chrome 扩展。
 
 ### 方式二：从源码安装
 
@@ -129,9 +131,14 @@ npm start
 
 扩展卡片应显示 `Codex GPT Bridge 0.1.95`。更新后，在扩展页面点击一次“重新加载”。
 
-### 配置 Codex MCP
+<details>
+<summary><strong>高级：需要手动配置 MCP 时展开</strong></summary>
+
+### 手动配置 Codex MCP
 
 用户包内提供 `codex-mcp-config.toml`、`.mcp.json` 和 `Start-CodexBridge-MCP.cmd`。
+
+完整人工安装说明见 `INSTALL-CodexBridge.md`，本地启动入口为 `Start-CodexBridge.cmd`；发布验收资料见 `ACCEPTANCE-CHECKLIST.md` 和 `REAL-BROWSER-ACCEPTANCE.md`。
 
 配置模板中的入口写作 `<CodexBridge 安装目录>/src/mcp-server.js`；下面以 `D:/Apps/CodexBridge` 为例。
 
@@ -157,6 +164,8 @@ BRIDGE_GPT_TRANSPORT = "web-sync"
 ```powershell
 codex mcp get chatgpt-codex-bridge --json
 ```
+
+</details>
 
 ### 建立第一个绑定
 
@@ -277,17 +286,6 @@ src/                HTTP、MCP、Router 与持久化
 scripts/            打包和产品冒烟
 tests/              自动化回归
 ```
-
-## 路线图
-
-- [x] 项目 / GPT 会话 / Codex 线程隔离
-- [x] 自动路由与多阶段 Router
-- [x] 图片、Office、PDF、ZIP 和文本产物
-- [x] 多附件、缺失附件补收与短暂断线恢复
-- [x] 便携用户包、升级、回滚和卸载验收
-- [ ] macOS 完整验收
-- [ ] Chrome Web Store 或签名安装器
-- [ ] 更稳定的官方 ChatGPT 集成接口（如未来开放）
 
 ## 贡献
 

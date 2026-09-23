@@ -7,10 +7,10 @@
   プロジェクト分離、ファイル転送、障害復旧に対応したローカル連携ブリッジです。
 </p>
 
-<table>
+<table align="center">
   <tr>
     <td width="50%" align="center"><strong>▣ Windows</strong><br /><sub>実環境で検証済み</sub></td>
-    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>ソース実行対応 · 完全検証は今後実施</sub></td>
+    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>実環境で検証済み</sub></td>
   </tr>
 </table>
 
@@ -67,18 +67,23 @@ flowchart LR
 
 ### 必要環境
 
-- Windows 10/11、またはソース実行用 macOS
+- Windows 10/11 または macOS（いずれも実環境で検証済み）
 - Node.js 20 以降
 - Codex Desktop または Codex CLI
 - Chrome などの Chromium ブラウザー
 - ログイン済みの ChatGPT Web セッション
 
-### Windows 向けリリースパッケージ
+### リリースパッケージを Codex に渡す（推奨）
 
 1. [Releases](https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/latest) から `CodexBridge-User-Package-v0.1.95-*.zip` をダウンロードします。
-2. `D:\Apps\CodexBridge` など固定フォルダーに展開します。
-3. `INSTALL-CodexBridge.md` を読み、`Start-CodexBridge.cmd` を実行します。
-4. `http://127.0.0.1:4317/` を開きます。
+2. ダウンロードした ZIP をそのまま Codex に添付します。
+3. ファイルと一緒に次の指示を送ります。
+
+   ```text
+   この chatgpt_codex_bridge ユーザーパッケージをインストールしてください。固定フォルダーへ展開し、データフォルダーはインストール先の外に置き、ローカルサービスを起動し、Codex MCP を設定して再読み込みしてください。最後に HTTP、MCP、拡張のバージョン一致を確認してください。既存の Bridge データは削除も上書きもしないでください。
+   ```
+
+4. 展開、起動、MCP 設定は Codex に任せます。ユーザーが行うのは、次の手順で Chrome 拡張を読み込むことだけです。
 
 ### ソースから実行
 
@@ -96,7 +101,10 @@ npm start
 3. `chrome-extension` フォルダーを指定します。
 4. バインドする GPT 会話を開いたままにします。
 
-### Codex MCP の設定
+<details>
+<summary><strong>上級者向け：MCP を手動設定する場合</strong></summary>
+
+### Codex MCP の手動設定
 
 `~/.codex/config.toml` に追加し、パスを実際のものへ変更します。
 
@@ -114,6 +122,8 @@ BRIDGE_GPT_TRANSPORT = "web-sync"
 ```
 
 更新やロールバックで履歴を失わないよう、データフォルダーはアプリ本体の外に置いてください。保存後、Codex で `chatgpt-codex-bridge` MCP を再読み込みします。
+
+</details>
 
 ### 初回バインド
 
