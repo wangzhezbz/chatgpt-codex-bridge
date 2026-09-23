@@ -40,6 +40,8 @@
   <a href="#开发与验证">开发</a>
 </p>
 
+https://github.com/user-attachments/assets/d207198f-c973-4fd4-963e-a656291068cc
+
 ## 为什么需要 chatgpt_codex_bridge
 
 Codex 擅长读取项目、修改代码、运行命令和验证结果；GPT 更适合长文、策划、视觉判断、图片与 Office 文件生成。问题在于它们通常分处两个会话：上下文要手动复制，附件要反复上传，失败后也难以确认任务究竟有没有发送。
