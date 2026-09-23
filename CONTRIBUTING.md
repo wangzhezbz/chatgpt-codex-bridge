@@ -1,6 +1,6 @@
-# Contributing to CodexBridge
+# Contributing to chatgpt_codex_bridge
 
-感谢你帮助改进 CodexBridge。
+感谢你帮助改进 chatgpt_codex_bridge。
 
 ## 开发环境
 
@@ -33,4 +33,4 @@ npm start
 
 ## 报告兼容问题
 
-请提供 CodexBridge 版本、浏览器版本、ChatGPT 页面语言、Bridge 可见错误和任务类型。请先删除账号、项目和附件中的敏感内容。
+请提供 chatgpt_codex_bridge 版本、浏览器版本、ChatGPT 页面语言、Bridge 可见错误和任务类型。请先删除账号、项目和附件中的敏感内容。

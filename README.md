@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/codexbridge-hero.svg" alt="CodexBridge — Codex + GPT. One workflow." width="100%" />
+  <img src="assets/codexbridge-hero.svg" alt="chatgpt_codex_bridge — Codex + GPT. One workflow." width="100%" />
 </p>
 
 <p align="center">
@@ -14,8 +14,23 @@
   一个本地运行、按项目隔离、支持文件与失败恢复的 Codex × GPT 协作桥。
 </p>
 
+<table>
+  <tr>
+    <td width="50%" align="center"><strong>▣ Windows</strong><br /><sub>已完成真实环境验收</sub></td>
+    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>源码可运行 · 尚未完整验收</sub></td>
+  </tr>
+</table>
+
 <p align="center">
-  <a href="#为什么需要-codexbridge">为什么</a> ·
+  <a href="README.en.md">English</a> ·
+  <strong>简体中文</strong> ·
+  <a href="README.ru.md">Русский</a> ·
+  <a href="README.ja.md">日本語</a> ·
+  <a href="README.ko.md">한국어</a>
+</p>
+
+<p align="center">
+  <a href="#为什么需要-chatgpt_codex_bridge">为什么</a> ·
   <a href="#核心能力">核心能力</a> ·
   <a href="#工作原理">工作原理</a> ·
   <a href="#安装">安装</a> ·
@@ -24,21 +39,9 @@
   <a href="#开发与验证">开发</a>
 </p>
 
-<table>
-  <tr>
-    <td width="33%" align="center"><strong>▣ Windows</strong><br /><sub>已完成真实环境验收</sub></td>
-    <td width="33%" align="center"><strong>◇ macOS</strong><br /><sub>源码可运行 · 尚未完整验收</sub></td>
-    <td width="33%" align="center"><strong>⌁ Linux</strong><br /><sub>源码可运行 · 尚未完整验收</sub></td>
-  </tr>
-</table>
-
-> 当前版本：**0.1.95**。这是早期版本，ChatGPT 网页结构变化可能影响自动同步；Bridge 会在版本不匹配时停止领取任务，避免误发。
-
-## 为什么需要 CodexBridge
+## 为什么需要 chatgpt_codex_bridge
 
 Codex 擅长读取项目、修改代码、运行命令和验证结果；GPT 更适合长文、策划、视觉判断、图片与 Office 文件生成。问题在于它们通常分处两个会话：上下文要手动复制，附件要反复上传，失败后也难以确认任务究竟有没有发送。
-
-CodexBridge 在本机建立一条明确的协作链路：
 
 - **Codex 优先处理本地工作**：代码、文件、终端、测试、部署。
 - **GPT 处理高成本内容任务**：长文、设计、图片、Office/PDF、复杂附件理解。
@@ -75,14 +78,14 @@ flowchart LR
     A --> C
 ```
 
-CodexBridge 由四部分组成：
+chatgpt_codex_bridge 由四部分组成：
 
 1. **本地服务**：默认监听 `127.0.0.1:4317`，保存项目、消息、任务和文件。
 2. **Chrome 扩展**：只在绑定的 `chatgpt.com` 会话中发送任务、等待回复并收取产物。
 3. **MCP 服务**：让当前 Codex 任务调用 Bridge，并强制携带项目、GPT 会话和 Codex 线程作用域。
 4. **Bridge 工作台**：查看三方消息、连接状态、产物和恢复操作。
 
-所有组件都在本机运行。CodexBridge 不要求导出 ChatGPT Cookie，也不会把本地项目上传到第三方 Bridge 服务器。
+所有组件都在本机运行。chatgpt_codex_bridge 不要求导出 ChatGPT Cookie，也不会把本地项目上传到第三方 Bridge 服务器。
 
 ## 安装
 
@@ -282,16 +285,16 @@ tests/              自动化回归
 - [x] 图片、Office、PDF、ZIP 和文本产物
 - [x] 多附件、缺失附件补收与短暂断线恢复
 - [x] 便携用户包、升级、回滚和卸载验收
-- [ ] macOS / Linux 完整验收
+- [ ] macOS 完整验收
 - [ ] Chrome Web Store 或签名安装器
 - [ ] 更稳定的官方 ChatGPT 集成接口（如未来开放）
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request。报告网页兼容问题时，请提供 CodexBridge 版本、浏览器版本、ChatGPT 页面语言、Bridge 错误提示，以及任务是否涉及文字、图片或文件。
+欢迎提交 Issue 和 Pull Request。报告网页兼容问题时，请提供 chatgpt_codex_bridge 版本、浏览器版本、ChatGPT 页面语言、Bridge 错误提示，以及任务是否涉及文字、图片或文件。
 
 请勿提交账号 Cookie、API Token、私有项目文件或完整聊天记录。
 
 ## License
 
-[MIT](LICENSE) © 2026 CodexBridge contributors
+[MIT](LICENSE) © 2026 chatgpt_codex_bridge contributors
