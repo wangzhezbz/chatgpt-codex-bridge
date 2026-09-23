@@ -179,6 +179,10 @@ codex mcp get chatgpt-codex-bridge --json
      <img src="assets/chatgpt-conversation-url.png" alt="复制 ChatGPT 会话链接" width="720" />
    </p>
 
+   <p align="center">
+     <img src="assets/bridge-project-binding.png" alt="在右侧 Bridge 填写项目名称、GPT 会话链接和本地项目目录" width="960" />
+   </p>
+
 4. 点击“绑定当前会话并进入”。
 5. 确认顶部状态为：**GPT 已绑定 / 连接就绪 / 规则已写入**。
 
