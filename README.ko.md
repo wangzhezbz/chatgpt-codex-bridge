@@ -9,8 +9,8 @@
 
 <table align="center">
   <tr>
-    <td width="50%" align="center"><strong>▣ Windows</strong><br /><sub>실제 환경 검증 완료</sub></td>
-    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>실제 환경 검증 완료</sub></td>
+    <td width="50%" align="center"><strong>▣ Windows</strong><br /><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">Windows용 다운로드 (ZIP)</a></td>
+    <td width="50%" align="center"><strong>◇ macOS</strong><br /><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">macOS용 다운로드 (ZIP)</a></td>
   </tr>
 </table>
 

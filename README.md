@@ -17,8 +17,8 @@
 
 <table align="center">
   <tr>
-    <td width="50%" align="center"><strong>▣ Windows</strong><br /><sub>已完成真实环境验收</sub></td>
-    <td width="50%" align="center"><strong>◇ macOS</strong><br /><sub>已完成真实环境验收</sub></td>
+    <td width="50%" align="center"><strong>▣ Windows</strong><br /><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">下载 Windows 用户包（ZIP）</a></td>
+    <td width="50%" align="center"><strong>◇ macOS</strong><br /><a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/download/v0.1.95/CodexBridge-User-Package-v0.1.95-20260923-134443.zip">下载 macOS 用户包（ZIP）</a></td>
   </tr>
 </table>
 
