@@ -39,7 +39,8 @@ test("Router-aware delegation instructions require both explicit scope ids", () 
 
   assert.match(instructions, /projectId: "project-router-scope"/);
   assert.match(instructions, /conversationId: "conversation-router-scope"/);
-  assert.match(instructions, /currentCodexThreadId: "thread-router-scope"/);
+  assert.match(instructions, /CODEX_THREAD_ID as currentCodexThreadId/);
+  assert.doesNotMatch(instructions, /currentCodexThreadId: "thread-router-scope"/);
   assert.match(instructions, /projectId.*conversationId.*currentCodexThreadId/i);
   assert.match(instructions, /routingProposal/);
   assert.match(instructions, /same Codex inference/i);
@@ -314,7 +315,8 @@ test("Codex delegation bootstrap refreshes a same-version block missing project 
   assert.equal(result.updated, true);
   assert.match(agents, /Bridge project: project-refresh/);
   assert.match(agents, /projectId: "project-refresh"/);
-  assert.match(agents, /currentCodexThreadId: "thread-project-refresh"/);
+  assert.match(agents, /CODEX_THREAD_ID as currentCodexThreadId/);
+  assert.doesNotMatch(agents, /currentCodexThreadId: "thread-project-refresh"/);
 });
 
 test("Codex delegation bootstrap refreshes same-version stale Router wording", async () => {

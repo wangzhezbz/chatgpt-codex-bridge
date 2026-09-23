@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { observeRouterRecovery } from "./router-recovery.js";
 import path from "node:path";
 import { resolveBridgeDataDir } from "./runtime-config.js";
@@ -299,14 +299,26 @@ export function createBridgeTools(options = {}) {
     return attachRoutingRules(await updateWorkspaceBinding(storeRoot, {}));
   }
 
-  function assertWorkspaceThreadScope(workspace = {}) {
+  async function resolveWorkspaceThreadScope(workspace = {}) {
     const boundThreadId = normalizeOptionalText(workspace.currentCodexThreadId);
     if (!boundThreadId || !currentCodexThreadId) {
-      return;
+      return workspace;
     }
     if (boundThreadId !== currentCodexThreadId) {
-      throw new Error(BRIDGE_THREAD_SCOPE_ERROR);
+      let caller, target;
+      try {
+        if (!workspace.targetRepo) throw new Error("Missing project directory");
+        [caller, target] = await Promise.all([
+          realpath(options.cwd || process.cwd()), realpath(workspace.targetRepo)
+        ]);
+      } catch { throw new Error(BRIDGE_THREAD_SCOPE_ERROR); }
+      const key = value => platform === "win32" ? value.toLowerCase() : value;
+      if (key(caller) !== key(target)) throw new Error(BRIDGE_THREAD_SCOPE_ERROR);
+      // The project binding is reusable in its own directory. Each Router run
+      // still belongs to its actual caller; opening another task is not a rebind.
+      return { ...workspace, currentCodexThreadId };
     }
+    return workspace;
   }
 
   async function resolveWorkspaceForInput(input = {}) {
@@ -316,7 +328,7 @@ export function createBridgeTools(options = {}) {
 
     if (projectId) {
       workspace = workspaceFromProject(await getProject(storeRoot, projectId), await getWorkspaceBinding(storeRoot));
-      assertWorkspaceThreadScope(workspace);
+      workspace = await resolveWorkspaceThreadScope(workspace);
       return attachRoutingRules(workspace);
     }
 
@@ -325,7 +337,7 @@ export function createBridgeTools(options = {}) {
       if (activeWorkspace.conversationId === conversationId) {
         if (activeWorkspace.projectId) {
           workspace = workspaceFromProject(await getProject(storeRoot, activeWorkspace.projectId), activeWorkspace);
-          assertWorkspaceThreadScope(workspace);
+          workspace = await resolveWorkspaceThreadScope(workspace);
           return attachRoutingRules(workspace);
         }
         return attachRoutingRules(activeWorkspace);
@@ -337,7 +349,7 @@ export function createBridgeTools(options = {}) {
         throw new Error(`Bridge conversation not found: ${conversationId}`);
       }
       workspace = workspaceFromProject(project, activeWorkspace);
-      assertWorkspaceThreadScope(workspace);
+      workspace = await resolveWorkspaceThreadScope(workspace);
       return attachRoutingRules(workspace);
     }
 

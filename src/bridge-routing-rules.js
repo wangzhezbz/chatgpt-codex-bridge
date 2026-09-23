@@ -8,7 +8,7 @@ export const BRIDGE_RULES_VERSION = "2026-07-01-auto-delegate-v3";
 export const CODEX_DELEGATION_FILE = "AGENTS.md";
 export const CODEX_DELEGATION_BEGIN = "<!-- BEGIN CODEXBRIDGE CODEX DELEGATION -->";
 export const CODEX_DELEGATION_END = "<!-- END CODEXBRIDGE CODEX DELEGATION -->";
-export const CODEX_DELEGATION_VERSION = "2026-08-02-per-call-thread-v3";
+export const CODEX_DELEGATION_VERSION = "2026-09-23-project-task-context-v4";
 
 export function bridgeRulesPathForTarget(targetRepo) {
   return path.join(path.resolve(targetRepo), BRIDGE_RULES_FILE);
@@ -85,13 +85,10 @@ export function buildCodexDelegationInstructions({
   const bridgeProjectLine = projectId ? `- Bridge project: ${projectId}` : null;
   const projectLine = chatgptProjectUrl ? `- Bound GPT session: ${chatgptProjectUrl}` : null;
   const conversationLine = conversationId ? `- Bridge conversation: ${conversationId}` : null;
-  const threadLine = currentCodexThreadId
-    ? `- Bound Codex thread: ${currentCodexThreadId}`
-    : null;
   const targetLine = targetRepo ? `- Bound local project root: ${path.resolve(targetRepo)}` : null;
   const hasExactRouterScope = Boolean(projectId && conversationId && currentCodexThreadId);
   const scopeLine = hasExactRouterScope
-    ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and \`currentCodexThreadId: "${currentCodexThreadId}"\` in every Router call.`
+    ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and the calling task's real CODEX_THREAD_ID as currentCodexThreadId. Never copy a thread ID from another task or from the HTTP service.`
     : projectId && conversationId
       ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and the calling task's real CODEX_THREAD_ID as currentCodexThreadId. Never substitute the HTTP service's startup thread ID.`
     : conversationId
@@ -100,7 +97,7 @@ export function buildCodexDelegationInstructions({
   const scopeCallText = hasExactRouterScope
     ? "the exact `projectId`, `conversationId`, and `currentCodexThreadId`"
     : "the exact bound scope (`projectId`, `conversationId`, and `currentCodexThreadId` are required by Router V2)";
-  const contextLines = [bridgeProjectLine, projectLine, conversationLine, threadLine, targetLine].filter(Boolean);
+  const contextLines = [bridgeProjectLine, projectLine, conversationLine, targetLine].filter(Boolean);
 
   return [
     CODEX_DELEGATION_BEGIN,
@@ -112,6 +109,7 @@ export function buildCodexDelegationInstructions({
     "",
     ...(contextLines.length > 0 ? ["### Binding", "", ...contextLines, scopeLine, ""] : []),
     "### Activation scope",
+    "- The project binding can be reused by different Codex tasks working in this same local project directory. Always send your own CODEX_THREAD_ID; do not ask the user to rebind merely because the task changed. Router runs keep their original caller identity.",
     "- These rules apply only inside this bound local project and the bound Bridge conversation above.",
     "- Do not use Bridge from any other Codex project or conversation, even if another Bridge room is active globally.",
     "- Never route an unrelated project through the active Bridge room. If the current Codex project is not this bound project, ignore this block and handle normally in Codex.",
@@ -299,12 +297,7 @@ export async function ensureCodexDelegationInstructions(input = {}) {
     requiredDelegationSnippets.push(`Bridge conversation: ${input.conversationId}`);
     requiredDelegationSnippets.push(`conversationId: "${input.conversationId}"`);
   }
-  if (input.currentCodexThreadId) {
-    requiredDelegationSnippets.push(`Bound Codex thread: ${input.currentCodexThreadId}`);
-    requiredDelegationSnippets.push(
-      `currentCodexThreadId: "${input.currentCodexThreadId}"`
-    );
-  }
+  requiredDelegationSnippets.push("Always send your own CODEX_THREAD_ID");
   if (input.targetRepo) {
     requiredDelegationSnippets.push(`Bound local project root: ${path.resolve(input.targetRepo)}`);
   }
