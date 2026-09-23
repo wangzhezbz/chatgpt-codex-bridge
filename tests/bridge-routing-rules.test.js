@@ -15,6 +15,19 @@ async function tempDir() {
   return mkdtemp(path.join(tmpdir(), "bridge-routing-rules-"));
 }
 
+test("web workspace binding writes its project identity into generated delegation rules", async () => {
+  const storeRoot = await tempDir();
+  const targetRepo = await tempDir();
+  await updateWorkspaceBinding(storeRoot, {
+    projectId: "project_web_bound", conversationId: "conv_web_bound",
+    targetRepo, chatgptProjectUrl: "https://chatgpt.com/c/web-bound"
+  });
+  const rules = await readFile(path.join(targetRepo, "AGENTS.md"), "utf8");
+  assert.match(rules, /Bridge project: project_web_bound/);
+  assert.match(rules, /projectId: "project_web_bound"/);
+  assert.match(rules, /conversationId: "conv_web_bound"/);
+});
+
 test("Router-aware delegation instructions require both explicit scope ids", () => {
   const instructions = buildCodexDelegationInstructions({
     projectId: "project-router-scope",

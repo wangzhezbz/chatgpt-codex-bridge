@@ -92,6 +92,8 @@ export function buildCodexDelegationInstructions({
   const hasExactRouterScope = Boolean(projectId && conversationId && currentCodexThreadId);
   const scopeLine = hasExactRouterScope
     ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and \`currentCodexThreadId: "${currentCodexThreadId}"\` in every Router call.`
+    : projectId && conversationId
+      ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and the calling task's real CODEX_THREAD_ID as currentCodexThreadId. Never substitute the HTTP service's startup thread ID.`
     : conversationId
       ? `- Required MCP scope: include \`conversationId: "${conversationId}"\` in every legacy Bridge MCP call for this project; Router V2 additionally requires the bound projectId and currentCodexThreadId.`
       : "- Required MCP scope: use the exact bound project, conversation, and Codex thread; Router V2 requires `projectId`, `conversationId`, and `currentCodexThreadId`.";

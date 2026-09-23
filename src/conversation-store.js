@@ -166,6 +166,7 @@ async function updateWorkspaceBindingLocked(storeRoot, input = {}) {
       conversationId: updated.conversationId
     });
     const delegation = await ensureCodexDelegationInstructions({
+      projectId: updated.projectId,
       targetRepo: updated.targetRepo,
       chatgptProjectUrl: updated.chatgptProjectUrl,
       conversationId: updated.conversationId
