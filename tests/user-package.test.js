@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  assertPortableUserPackageText,
   buildUserPackagePlan,
   renderAcceptanceChecklist,
   renderInstallGuide,
@@ -16,7 +17,7 @@ import {
 test("CodexBridge exposes a plugin manifest with MCP server metadata", async () => {
   const plugin = JSON.parse(await readFile(".codex-plugin/plugin.json", "utf8"));
   assert.equal(plugin.name, "chatgpt-codex-bridge");
-  assert.equal(plugin.version, "0.1.0");
+  assert.equal(plugin.version, "0.1.95");
   assert.match(plugin.description, /GPT/);
   assert.equal(plugin.mcpServers, "./.mcp.json");
   assert.equal(plugin.interface.displayName, "CodexBridge");
@@ -29,7 +30,12 @@ test("CodexBridge exposes a plugin manifest with MCP server metadata", async () 
 });
 
 test("user package plan includes service, extension, MCP, and user-facing docs", async () => {
-  const plan = buildUserPackagePlan({ version: "0.1.0", packageName: "CodexBridge-Test" });
+  const sourcePackage = JSON.parse(await readFile("package.json", "utf8"));
+  const plan = buildUserPackagePlan({
+    version: "0.1.0",
+    packageName: "CodexBridge-Test",
+    packageJson: sourcePackage
+  });
   const entries = new Set(plan.entries.map((entry) => entry.from || entry.generatedPath));
   assert.equal(plan.archiveName, "CodexBridge-Test.zip");
 
@@ -40,7 +46,8 @@ test("user package plan includes service, extension, MCP, and user-facing docs",
     "src",
     "public",
     "chrome-extension",
-    "scripts",
+    "scripts/acceptance-contract.js",
+    "scripts/product-smoke.js",
     ".codex-plugin/plugin.json",
     ".mcp.json",
     "INSTALL-CodexBridge.md",
@@ -57,6 +64,42 @@ test("user package plan includes service, extension, MCP, and user-facing docs",
   for (const forbidden of [".bridge", "node_modules", ".git", "output"]) {
     assert.equal(entries.has(forbidden), false, `should not package ${forbidden}`);
   }
+  for (const internal of ["docs", "scripts", "scripts/cleanup-known-test-temp.ps1"]) {
+    assert.equal(entries.has(internal), false, `should not package internal path ${internal}`);
+  }
+
+  const packageEntry = plan.entries.find((entry) => entry.to === "package.json");
+  const packaged = JSON.parse(packageEntry.content);
+  assert.deepEqual(Object.keys(packaged.scripts).sort(), ["acceptance:contract", "mcp", "smoke:product", "start"]);
+});
+
+test("portable package audit rejects machine-only paths and identifiers", () => {
+  assert.doesNotThrow(() => assertPortableUserPackageText("README.md", "D:/Projects/my-project"));
+  for (const text of [
+    "X:/Users/buildbot/private/verification/data",
+    "C:/Users/example-user/AppData/Local/Temp/file.txt",
+    "task 01900000-1111-4222-8333-444444444444",
+    "root 8ed7a63b731f8a8c501ec13382a76b33e7e6b1d412d1cb9dfb1a09868fa7d69d"
+  ]) {
+    assert.throws(() => assertPortableUserPackageText("internal.md", text), /machine-specific/i);
+  }
+});
+
+test("repository MCP template is portable and delegates local state to ignored project config", async () => {
+  const mcp = JSON.parse(await readFile(".mcp.json", "utf8"));
+  assert.deepEqual(mcp.mcpServers.chatgpt_codex_bridge, {
+    command: "node",
+    args: ["./src/mcp-server.js"]
+  });
+});
+
+test("user package generates a portable MCP config instead of copying local acceptance settings", () => {
+  const entry = buildUserPackagePlan().entries.find(item => item.to === ".mcp.json");
+  assert.equal(typeof entry.content, "string");
+  const config = JSON.parse(entry.content).mcpServers.chatgpt_codex_bridge;
+  assert.equal(config.command, "node");
+  assert.deepEqual(config.args, ["./src/mcp-server.js"]);
+  assert.equal(config.env, undefined);
 });
 
 test("product readiness report maps the full 20-step goal to evidence", () => {

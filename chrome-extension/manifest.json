@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Codex GPT Bridge",
-  "version": "0.1.0",
+  "version": "0.1.95",
+  "version_name": "0.1.95 - 20260923",
   "description": "Sync Codex workbench messages with a bound GPT session.",
   "permissions": [
     "downloads",
     "debugger",
     "scripting",
+    "storage",
     "tabs"
   ],
   "host_permissions": [

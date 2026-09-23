@@ -9,7 +9,7 @@ const EMBEDDED_COPY_ENTRIES = [
 ];
 
 export function buildEmbeddedPackagePlan(options = {}) {
-  const version = options.version || "0.1.0";
+  const version = options.version || "0.1.95";
   const packageName = options.packageName || `ChatGPT-Codex-Bridge-Embedded-v${version}`;
   return {
     packageName,

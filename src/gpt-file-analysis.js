@@ -1,21 +1,93 @@
+import path from "node:path";
+
 import { appendRoomMessage } from "./room-store.js";
 import { createSyncJob, failSyncJob, getSyncJob, listSyncJobs } from "./sync-store.js";
 
-const DEFAULT_WAIT_TIMEOUT_MS = 180000;
+export const DEFAULT_WAIT_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_WAIT_POLL_MS = 1000;
-const DEFAULT_TIMEOUT_GRACE_MS = 30000;
+export const DEFAULT_TIMEOUT_GRACE_MS = 2 * 60_000;
 
 function normalizeMessageSender(value, fallback = "user") {
   const sender = String(value || fallback || "user").trim().toLowerCase();
   return ["user", "codex"].includes(sender) ? sender : fallback;
 }
 
+function normalizeScopeText(value) {
+  return String(value || "").trim();
+}
+
+function normalizeScopeRepo(value, platform = process.platform) {
+  const text = normalizeScopeText(value);
+  if (!text) {
+    return "";
+  }
+  const resolved = path.resolve(text);
+  return platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function normalizeScopeProjectUrl(value) {
+  const text = normalizeScopeText(value);
+  if (!text) {
+    return "";
+  }
+  try {
+    const url = new URL(text);
+    url.search = "";
+    url.hash = "";
+    return url.href.replace(/\/+$/, "");
+  } catch {
+    return text.replace(/[?#].*$/, "").replace(/\/+$/, "");
+  }
+}
+
+function authoritativeWorkspaceMetadata(workspace = {}) {
+  return {
+    projectId: workspace.projectId || null,
+    conversationId: workspace.conversationId || null,
+    currentCodexThreadId: workspace.currentCodexThreadId || null,
+    targetRepo: workspace.targetRepo || null,
+    chatgptProjectUrl: workspace.chatgptProjectUrl || null
+  };
+}
+
 function attachmentGroundingInstruction() {
   return "请只根据附件本身判断；不要把问题或补充要求里的描述当成已经观察到的事实。看不清或不确定时请明确说明。";
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function throwIfAborted(signal) {
+  if (!signal?.aborted) {
+    return;
+  }
+  const error = signal.reason instanceof Error
+    ? signal.reason
+    : new Error("GPT transport wait aborted");
+  if (error.name === "Error") {
+    error.name = "AbortError";
+  }
+  error.code ||= "ABORT_ERR";
+  throw error;
+}
+
+function sleep(ms, signal) {
+  throwIfAborted(signal);
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      try {
+        throwIfAborted(signal);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function positiveNumber(value, fallback) {
@@ -49,6 +121,7 @@ function stripChatGptReplyWrapper(text = "") {
 
 function looksLikeInterruptedChatGptReply(text = "") {
   const concise = String(text || "").replace(/\s+/g, " ").trim();
+  if (/^(?:消息流中的错误|error in message stream)[。.!！]?(?:\s*(?:重试|重新生成|retry|try again)[。.!！]?)?$/i.test(concise)) return true;
   return concise.length <= 220 &&
     /连接.{0,8}(?:中断|断开)|(?:等待|正在等待).{0,12}(?:完整回复|完整答复|完整响应)|connection.{0,16}(?:interrupted|lost|disconnected)|waiting.{0,16}(?:complete|full).{0,12}(?:reply|response)/i.test(
       concise
@@ -147,6 +220,7 @@ export async function waitForSyncJobResult(storeRoot, syncJobId, options = {}) {
 
   async function pollUntil(deadlineMs) {
     while (Date.now() <= deadlineMs) {
+      throwIfAborted(options.signal);
       try {
         latestJob = await getSyncJob(storeRoot, syncJobId);
         latestReadError = null;
@@ -158,6 +232,9 @@ export async function waitForSyncJobResult(storeRoot, syncJobId, options = {}) {
           };
         }
       } catch (error) {
+        if (options.signal?.aborted) {
+          throwIfAborted(options.signal);
+        }
         latestReadError = error;
       }
 
@@ -165,7 +242,7 @@ export async function waitForSyncJobResult(storeRoot, syncJobId, options = {}) {
       if (remainingMs <= 0) {
         break;
       }
-      await sleep(Math.min(pollMs, remainingMs));
+      await sleep(Math.min(pollMs, remainingMs), options.signal);
     }
     return null;
   }
@@ -186,23 +263,41 @@ export async function waitForSyncJobResult(storeRoot, syncJobId, options = {}) {
     throw latestReadError;
   }
 
-  const finalJob = latestJob || (await getSyncJob(storeRoot, syncJobId));
+  // The job may finish during the last sleep. Never report the pre-sleep
+  // snapshot as current, especially before an explicit timeout mutation.
+  throwIfAborted(options.signal);
+  const finalJob = await getSyncJob(storeRoot, syncJobId);
+  throwIfAborted(options.signal);
+  if (finalJob.status === "succeeded" || finalJob.status === "failed") {
+    return {
+      finalJob,
+      timedOut: false,
+      observationTimedOut: false,
+      stillRunning: false,
+      replyText: sanitizeGptFileAnalysisReply(finalJob.replyText)
+    };
+  }
   if (options.failOnTimeout) {
     const failedJob = await failSyncJob(storeRoot, syncJobId, {
       error: options.timeoutMessage || "Timed out waiting for GPT reply.",
       errorCode: "reply_timeout",
       recoveryAction: "retry_after_refresh"
     });
+    // A completion or cancellation may have won the store lock after our last
+    // read. failSyncJob preserves that winner; the response must preserve it too.
+    const timedOut = failedJob.status === "failed" && failedJob.errorCode === "reply_timeout";
     return {
       finalJob: failedJob,
-      timedOut: true,
-      replyText: null
+      timedOut,
+      replyText: timedOut ? null : sanitizeGptFileAnalysisReply(failedJob.replyText)
     };
   }
 
   return {
     finalJob,
-    timedOut: true,
+    timedOut: false,
+    observationTimedOut: true,
+    stillRunning: ["pending", "running"].includes(finalJob.status),
     replyText: null
   };
 }
@@ -221,9 +316,23 @@ export async function queueArtifactForGptAnalysis(
     modelPreference,
     from,
     source,
-    metadata = {}
+    metadata = {},
+    scopePlatform = process.platform
   }
 ) {
+  for (const [metadataField, workspaceField, label, normalize] of [
+    ["projectId", "projectId", "projectId", normalizeScopeText],
+    ["conversationId", "conversationId", "conversationId", normalizeScopeText],
+    ["currentCodexThreadId", "currentCodexThreadId", "codexThreadId", normalizeScopeText],
+    ["targetRepo", "targetRepo", "targetRepo", normalizeScopeRepo],
+    ["chatgptProjectUrl", "chatgptProjectUrl", "chatgptProjectUrl", normalizeScopeProjectUrl]
+  ]) {
+    const metadataValue = normalize(metadata[metadataField], scopePlatform);
+    const workspaceValue = normalize(workspace?.[workspaceField], scopePlatform);
+    if (metadataValue && workspaceValue && metadataValue !== workspaceValue) {
+      throw new Error(`GPT file analysis Router scope mismatch: ${label}`);
+    }
+  }
   const analysisArtifacts = (Array.isArray(artifacts) ? artifacts : [artifact]).filter(Boolean);
   if (analysisArtifacts.length === 0) {
     throw new Error("GPT file analysis requires at least one artifact");
@@ -251,13 +360,14 @@ export async function queueArtifactForGptAnalysis(
       to: [sender],
       text: sanitizeGptFileAnalysisReply(reusableJob.replyText),
       metadata: {
+        ...metadata,
         artifactId: primaryArtifact.id,
         inputArtifactIds: [primaryArtifact.id],
         source: "gpt_analysis_cache",
         cached: true,
         reusedSyncJobId: reusableJob.id,
         initiatedBy: sender,
-        ...metadata
+        ...authoritativeWorkspaceMetadata(workspace)
       }
     });
 
@@ -305,6 +415,8 @@ export async function queueArtifactForGptAnalysis(
     projectUrl: workspace.chatgptProjectUrl,
     targetRepo: workspace.targetRepo,
     conversationId: workspace.conversationId,
+    projectId: workspace.projectId || null,
+    codexThreadId: workspace.currentCodexThreadId || null,
     userText: explicitPayloadText || messageText,
     payloadText: explicitPayloadText || [
       "请分析我上传的文件。",
@@ -316,6 +428,8 @@ export async function queueArtifactForGptAnalysis(
     resultCacheKey,
     modePreference,
     modelPreference,
+    routerTerminalSignalRequired: Boolean(metadata.routerRunId),
+    routerRunId: metadata.routerRunId || null,
     inputArtifacts
   };
   if (requestId) {
@@ -344,11 +458,12 @@ export async function queueArtifactForGptAnalysis(
     to: ["gpt"],
     text: messageText,
     metadata: {
+      ...metadata,
       artifactId: primaryArtifact.id,
       inputArtifactIds: analysisArtifacts.map((item) => item.id),
       source: source || "local_file",
       initiatedBy: sender,
-      ...metadata
+      ...authoritativeWorkspaceMetadata(workspace)
     }
   });
   const syncJob = await createSyncJob(storeRoot, {

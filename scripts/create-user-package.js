@@ -1,9 +1,9 @@
-import { cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { buildUserPackagePlan } from "../src/user-package.js";
+import { assertPortableUserPackageText, buildUserPackagePlan } from "../src/user-package.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,9 +20,25 @@ async function fileExists(filePath) {
   }
 }
 
-async function readPackageVersion() {
-  const pkg = JSON.parse(await readFile("package.json", "utf8"));
-  return pkg.version || "0.1.0";
+async function readPackageMetadata() {
+  const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+  return { packageJson, version: packageJson.version || "0.1.95" };
+}
+
+const TEXT_PACKAGE_EXTENSIONS = new Set([".cmd", ".css", ".html", ".js", ".json", ".md", ".mjs", ".ps1", ".toml"]);
+
+async function auditPortablePackageTree(rootDir, currentDir = rootDir) {
+  for (const entry of await readdir(currentDir, { withFileTypes: true })) {
+    const fullPath = path.join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      await auditPortablePackageTree(rootDir, fullPath);
+      continue;
+    }
+    if (!TEXT_PACKAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+    const info = await stat(fullPath);
+    if (info.size > 2 * 1024 * 1024) continue;
+    assertPortableUserPackageText(path.relative(rootDir, fullPath), await readFile(fullPath, "utf8"));
+  }
 }
 
 async function copyEntry(entry, outputDir) {
@@ -60,7 +76,7 @@ async function createZipArchive(outputDir, archivePath) {
 }
 
 async function main() {
-  const version = await readPackageVersion();
+  const { packageJson, version } = await readPackageMetadata();
   const outputRoot = process.argv[2] || "release";
   const packageDirName = `CodexBridge-User-Package-v${version}-${timestamp()}`;
   const outputDir = path.resolve(outputRoot, packageDirName);
@@ -71,13 +87,15 @@ async function main() {
   const plan = buildUserPackagePlan({
     version,
     packageName: packageDirName,
-    packageDir: "<CodexBridge 安装目录>"
+    packageDir: "<CodexBridge 安装目录>",
+    packageJson
   });
 
   await mkdir(outputDir, { recursive: true });
   for (const entry of plan.entries) {
     await copyEntry(entry, outputDir);
   }
+  await auditPortablePackageTree(outputDir);
   await writeFile(
     path.join(outputDir, "PACKAGE_MANIFEST.json"),
     JSON.stringify(

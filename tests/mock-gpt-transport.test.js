@@ -137,8 +137,14 @@ test("mock GPT transport cancels a queued request and keeps it cancelled", async
 test("mock GPT transport rejects unknown request ids", async () => {
   const transport = createTransport({});
 
-  await assert.rejects(() => transport.wait("missing"), /not found/i);
-  await assert.rejects(() => transport.cancel("missing"), /not found/i);
+  await assert.rejects(
+    () => transport.wait("missing"),
+    (error) => error?.code === "ENOENT"
+  );
+  await assert.rejects(
+    () => transport.cancel("missing"),
+    (error) => error?.code === "ENOENT"
+  );
 });
 
 test("mock GPT transport reuses a caller-provided request id without duplicate submission", async () => {

@@ -63,7 +63,7 @@ test("HTTP service exposes minimal health, version, and configured extension met
       ok: true,
       service: "chatgpt-codex-bridge",
       status: "ready",
-      version: "0.1.0",
+      version: "0.1.95",
       protocolVersion: 1
     });
 
@@ -71,9 +71,9 @@ test("HTTP service exposes minimal health, version, and configured extension met
     assert.equal(versionResponse.status, 200);
     assert.deepEqual(await versionResponse.json(), {
       service: "chatgpt-codex-bridge",
-      version: "0.1.0",
+      version: "0.1.95",
       protocolVersion: 1,
-      extensionProtocolVersion: "v20260712-preference-verify"
+      extensionProtocolVersion: "v20260923-missing-recovery"
     });
 
     const configResponse = await fetch(`${baseUrl}/api/config`);

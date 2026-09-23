@@ -1,12 +1,14 @@
 import { randomBytes } from "node:crypto";
+import { routerRecovery } from "./router-recovery.js";
 import { mkdir, open, readFile, readdir, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveBridgeDataDir } from "./runtime-config.js";
+import { acquireRouterLockGuard } from "./router-lock-guard.js";
 
 const ROUTER_RUNS_DIR = "router-runs";
 const RUN_STATUSES = new Set(["pending", "queued", "running", "succeeded", "failed", "cancelled"]);
 const STAGE_STATUSES = new Set(["pending", "queued", "running", "succeeded", "failed", "cancelled"]);
-const SUBMISSION_STATES = new Set(["prepared", "submitted"]);
+const SUBMISSION_STATES = new Set(["prepared", "submitting", "submitted"]);
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
 const SCOPE_FIELDS = ["projectId", "conversationId", "codexThreadId"];
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -14,14 +16,104 @@ const FILE_LOCKS = new Map();
 const RUN_LOCK_STALE_MS = 30_000;
 const RUN_LOCK_TIMEOUT_MS = 35_000;
 const RUN_LOCK_HEARTBEAT_MS = 5_000;
+const RUN_LOCK_ACCESS_RETRY_MS = 2_000;
+const TRANSIENT_LOCK_CLEANUP_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function abortError(signal) {
+  const reason = signal?.reason;
+  const error = new Error(
+    reason instanceof Error && reason.message ? reason.message : "Router run store operation aborted"
+  );
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  if (reason instanceof Error) {
+    error.cause = reason;
+  }
+  return error;
 }
 
-function lockOwnerPid(value = "") {
-  const match = String(value).match(/^(\d+)-[a-f0-9]+\s/i);
-  return match ? Number(match[1]) : null;
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw abortError(signal);
+  }
+}
+
+function commitPointReached(option) {
+  return typeof option === "function" ? option() === true : option === true;
+}
+
+function attachCleanupErrors(error, cleanupErrors, message) {
+  if (!error || cleanupErrors.length === 0) {
+    return error;
+  }
+  error.cleanupErrors = cleanupErrors;
+  if (!error.cause) {
+    error.cause = cleanupErrors.length === 1
+      ? cleanupErrors[0]
+      : new AggregateError(cleanupErrors, message);
+  }
+  return error;
+}
+
+async function awaitWithAbort(value, signal) {
+  throwIfAborted(signal);
+  if (!signal) {
+    return value;
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(value).then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+function sleep(ms, signal) {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  return awaitWithAbort(new Promise((resolve) => setTimeout(resolve, ms)), signal);
+}
+
+async function unlinkLockWithRetry(filePath, unlinkFile) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await unlinkFile(filePath);
+      return;
+    } catch (error) {
+      if (
+        error.code === "ENOENT" ||
+        !TRANSIENT_LOCK_CLEANUP_CODES.has(error.code) ||
+        attempt >= 2
+      ) {
+        throw error;
+      }
+      await sleep(10 * (attempt + 1));
+    }
+  }
+}
+
+async function readLockMetadataWithRetry(operation) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (process.platform !== "win32" || !TRANSIENT_LOCK_CLEANUP_CODES.has(error.code) || attempt >= 2) throw error;
+      await sleep(10 * (attempt + 1));
+    }
+  }
+}
+
+function sameLockFile(first, second) {
+  return Boolean(first && second && first.ino && second.ino && first.dev === second.dev && first.ino === second.ino);
 }
 
 function processIsAlive(pid) {
@@ -41,7 +133,9 @@ function processIsAlive(pid) {
 
 async function reclaimStaleLock(lockPath) {
   let ownerText = "";
+  let identity;
   try {
+    identity = await stat(lockPath, {bigint:true});
     ownerText = await readFile(lockPath, "utf8");
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -49,30 +143,38 @@ async function reclaimStaleLock(lockPath) {
     }
     throw error;
   }
-  if (processIsAlive(lockOwnerPid(ownerText))) {
+  const owner = /^([1-9]\d*)-([a-f0-9]{16}) (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)( kernel-v1)?\n(?:released ([1-9]\d*-[a-f0-9]{16})\n)?$/.exec(ownerText);
+  if (!owner || owner[0] !== ownerText) return false;
+  const pid = Number(owner[1]), timestamp = Date.parse(owner[3]);
+  if (!Number.isSafeInteger(pid) || pid > 0x7fffffff || !Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== owner[3]) return false;
+  const currentProtocol = Boolean(owner[4]);
+  if (owner[5] && (!currentProtocol || owner[5] !== `${owner[1]}-${owner[2]}`)) return false;
+  const released = Boolean(owner[5]);
+  if (processIsAlive(pid) && !released) {
     return false;
   }
-
-  const quarantine = `${lockPath}.stale.${process.pid}.${randomBytes(6).toString("hex")}`;
+  if (!currentProtocol && Date.now() - Number(identity.mtimeMs) <= RUN_LOCK_STALE_MS) return false;
+  // The caller owns the OS guard throughout this check and removal. All
+  // upgraded acquirers/reclaimers are excluded, not merely checked twice.
   try {
-    await rename(lockPath, quarantine);
+    if (!sameLockFile(identity, await stat(lockPath, {bigint:true}))) return false;
+    await unlink(lockPath);
   } catch (error) {
     if (error.code === "ENOENT") {
       return true;
     }
     throw error;
   }
-  try {
-    await unlink(quarantine);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  }
   return true;
 }
 
-async function withFileLock(lockPath, operation) {
+async function withFileLock(lockPath, operation, options = {}) {
+  const signal = options.signal;
+  const lockOpen = options.lockOperations?.open || open;
+  const lockReadFile = options.lockOperations?.readFile || readFile;
+  const lockUnlink = options.lockOperations?.unlink || unlink;
+  const lockStat = options.lockOperations?.stat || stat;
+  throwIfAborted(signal);
   const canonicalLockPath = path.resolve(lockPath);
   const previous = FILE_LOCKS.get(canonicalLockPath) || Promise.resolve();
   let release;
@@ -80,33 +182,55 @@ async function withFileLock(lockPath, operation) {
     release = resolve;
   });
   FILE_LOCKS.set(canonicalLockPath, current);
-  await previous.catch(() => {});
   let handle = null;
+  let releaseGuard = null;
   let heartbeat = null;
+  let acquiredFile = null;
+  let ownerWritten = false;
+  let ownerRecord = "";
+  let accessRetryStartedAt = null;
+  const retryTransientAccess = async (error) => {
+    if (handle || process.platform !== "win32" || !TRANSIENT_LOCK_CLEANUP_CODES.has(error.code)) return false;
+    accessRetryStartedAt ??= Date.now();
+    const remaining = RUN_LOCK_ACCESS_RETRY_MS - (Date.now() - accessRetryStartedAt);
+    if (remaining <= 0) return false;
+    await sleep(Math.min(20, remaining), signal);
+    return true;
+  };
   const ownerToken = `${process.pid}-${randomBytes(8).toString("hex")}`;
   const startedAt = Date.now();
+  let result;
+  let primaryError = null;
   try {
+    await awaitWithAbort(previous.catch(() => {}), signal);
+    throwIfAborted(signal);
+    releaseGuard = await acquireRouterLockGuard(canonicalLockPath, {signal, timeoutMs:RUN_LOCK_TIMEOUT_MS});
     while (!handle) {
+      throwIfAborted(signal);
       try {
-        handle = await open(canonicalLockPath, "wx");
-        await handle.writeFile(`${ownerToken} ${new Date().toISOString()}\n`, "utf8");
+        handle = await lockOpen(canonicalLockPath, "wx");
+        ownerRecord = `${ownerToken} ${new Date().toISOString()} kernel-v1\n`;
+        acquiredFile = handle.stat ? await readLockMetadataWithRetry(() => handle.stat({ bigint: true })) : null;
+        await handle.writeFile(ownerRecord, "utf8");
+        ownerWritten = true;
+        throwIfAborted(signal);
         heartbeat = setInterval(() => {
           const heartbeatAt = new Date();
           void utimes(canonicalLockPath, heartbeatAt, heartbeatAt).catch(() => {});
         }, RUN_LOCK_HEARTBEAT_MS);
         heartbeat.unref?.();
       } catch (error) {
+        if (await retryTransientAccess(error)) continue;
+        if (handle) throw error;
         if (error.code !== "EEXIST") {
           throw error;
         }
         try {
-          const lockStat = await stat(canonicalLockPath);
-          if (Date.now() - lockStat.mtimeMs > RUN_LOCK_STALE_MS) {
-            if (await reclaimStaleLock(canonicalLockPath)) {
-              continue;
-            }
+          if (await reclaimStaleLock(canonicalLockPath)) {
+            continue;
           }
         } catch (lockError) {
+          if (await retryTransientAccess(lockError)) continue;
           if (lockError.code !== "ENOENT") {
             throw lockError;
           }
@@ -117,56 +241,91 @@ async function withFileLock(lockPath, operation) {
             `Timed out waiting for Router run lock: ${path.basename(canonicalLockPath)}`
           );
         }
-        await sleep(20);
+        await sleep(20, signal);
       }
     }
-    return await operation();
-  } finally {
-    let cleanupError = null;
+    throwIfAborted(signal);
+    result = await operation();
+    if (!commitPointReached(options.commitOnOperationReturn)) {
+      throwIfAborted(signal);
+    }
+  } catch (error) {
+    primaryError = error;
+  }
+  const cleanupErrors = [];
+  try {
     if (heartbeat) {
       clearInterval(heartbeat);
     }
     if (handle) {
+      // The operation is settled, but keep the OS guard until every cleanup
+      // attempt ends. A following process can then verify this release even
+      // if this process remains alive and path cleanup was denied.
+      if (ownerWritten) {
+        try {
+          await handle.writeFile(`released ${ownerToken}\n`, "utf8");
+        } catch (error) { cleanupErrors.push(error); }
+      }
       try {
         await handle.close();
       } catch (error) {
-        cleanupError = error;
+        cleanupErrors.push(error);
       }
       try {
-        const lockOwner = await readFile(canonicalLockPath, "utf8");
-        if (lockOwner.startsWith(`${ownerToken} `)) {
-          await unlink(canonicalLockPath);
+        const lockOwner = await readLockMetadataWithRetry(() => lockReadFile(canonicalLockPath, "utf8"));
+        let owned = lockOwner.startsWith(`${ownerToken} `);
+        if (acquiredFile && (owned || (!ownerWritten && ownerRecord.startsWith(lockOwner)))) {
+          const currentFile = await readLockMetadataWithRetry(() => lockStat(canonicalLockPath, { bigint: true }));
+          owned = sameLockFile(acquiredFile, currentFile);
+        }
+        if (owned) {
+          await unlinkLockWithRetry(canonicalLockPath, lockUnlink);
         }
       } catch (error) {
         if (error.code !== "ENOENT") {
-          cleanupError ||= error;
+          cleanupErrors.push(error);
         }
       }
+    }
+  } finally {
+    if (releaseGuard) {
+      try { await releaseGuard(); } catch (error) { cleanupErrors.push(error); }
     }
     release();
     if (FILE_LOCKS.get(canonicalLockPath) === current) {
       FILE_LOCKS.delete(canonicalLockPath);
     }
-    if (cleanupError) {
-      throw cleanupError;
-    }
   }
+  if (primaryError) {
+    throw attachCleanupErrors(
+      primaryError,
+      cleanupErrors,
+      "Router run lock cleanup failed"
+    );
+  }
+  if (cleanupErrors.length === 1) {
+    throw cleanupErrors[0];
+  }
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "Router run lock cleanup failed");
+  }
+  return result;
 }
 
-function withRunFileLock(runPath, operation) {
-  return withFileLock(`${path.resolve(runPath)}.lock`, operation);
+function withRunFileLock(runPath, operation, options = {}) {
+  return withFileLock(`${path.resolve(runPath)}.lock`, operation, options);
 }
 
-function withRunOperationLock(runPath, operation) {
-  return withFileLock(`${path.resolve(runPath)}.operation.lock`, operation);
+function withRunOperationLock(runPath, operation, options = {}) {
+  return withFileLock(`${path.resolve(runPath)}.operation.lock`, operation, options);
 }
 
-function withRunSubmissionLock(runPath, operation) {
-  return withFileLock(`${path.resolve(runPath)}.submission.lock`, operation);
+function withRunSubmissionLock(runPath, operation, options = {}) {
+  return withFileLock(`${path.resolve(runPath)}.submission.lock`, operation, options);
 }
 
-function withRunFinalizationLock(runPath, operation) {
-  return withFileLock(`${path.resolve(runPath)}.finalization.lock`, operation);
+function withRunFinalizationLock(runPath, operation, options = {}) {
+  return withFileLock(`${path.resolve(runPath)}.finalization.lock`, operation, options);
 }
 
 async function renameWithRetry(source, destination) {
@@ -252,6 +411,41 @@ function normalizeJsonArray(value) {
   }
 }
 
+function normalizeJsonObject(value, field) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be a JSON object`);
+  }
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    throw new Error(`${field} must be JSON serializable`);
+  }
+}
+
+function normalizeOptionalPid(value, field) {
+  if (value == null) {
+    return null;
+  }
+  const pid = Number(value);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    throw new Error(`${field} must be a positive integer`);
+  }
+  return pid;
+}
+
+function normalizeOptionalSafeId(value, field) {
+  const normalized = optionalText(value);
+  return normalized ? assertSafeId(normalized, field) : null;
+}
+
+function normalizeTargetRepoForComparison(value) {
+  const resolved = path.resolve(requiredText(value, "transport terminal targetRepo"));
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
 function normalizeStage(stage = {}) {
   const id = assertSafeId(stage.id, "router stage id");
   const status = stage.status || "pending";
@@ -273,6 +467,16 @@ function normalizeStage(stage = {}) {
     artifactIds: normalizeStringArray(stage.artifactIds),
     transportRequestId: optionalText(stage.transportRequestId),
     submissionState,
+    submissionOwnerPid: normalizeOptionalPid(
+      stage.submissionOwnerPid,
+      "Router stage submissionOwnerPid"
+    ),
+    submissionOwnerToken: normalizeOptionalSafeId(
+      stage.submissionOwnerToken,
+      "Router stage submissionOwnerToken"
+    ),
+    cancelRequestedAt: optionalText(stage.cancelRequestedAt),
+    cancelReason: optionalText(stage.cancelReason),
     inputArtifacts: normalizeJsonArray(stage.inputArtifacts),
     projectArtifactPaths: normalizeAbsolutePaths(stage.projectArtifactPaths),
     startedAt: optionalText(stage.startedAt),
@@ -327,11 +531,13 @@ function normalizeRun(input = {}, timestamps = {}) {
     conversationId: requiredText(input.conversationId, "conversationId"),
     codexThreadId: requiredText(input.codexThreadId, "codexThreadId"),
     transportId: requiredText(input.transportId, "transportId"),
+    autoAdvanceOnTransportTerminal: input.autoAdvanceOnTransportTerminal === true,
     originalRequestText: requiredText(input.originalRequestText, "originalRequestText"),
     targetRepo: input.targetRepo ? path.resolve(input.targetRepo) : null,
     chatgptProjectUrl: optionalText(input.chatgptProjectUrl),
     modePreference: optionalText(input.modePreference),
     modelPreference: optionalText(input.modelPreference),
+    routingDecision: normalizeJsonObject(input.routingDecision, "Router run routingDecision"),
     stages,
     projectArtifactPaths: normalizeAbsolutePaths(input.projectArtifactPaths),
     error: optionalText(input.error),
@@ -347,6 +553,12 @@ function assertTerminalStateIsImmutable(existing, candidate) {
   for (let index = 0; index < existing.stages.length; index += 1) {
     const existingStage = existing.stages[index];
     const candidateStage = candidate.stages?.[index];
+    if (
+      existingStage.submissionOwnerToken &&
+      candidateStage?.submissionOwnerToken !== existingStage.submissionOwnerToken
+    ) {
+      throw new Error(`Router stage submission owner token is immutable: ${existingStage.id}`);
+    }
     if (
       TERMINAL_STATUSES.has(existingStage.status) &&
       (candidateStage?.status !== existingStage.status ||
@@ -380,7 +592,9 @@ export function createRouterRunStore(options = {}) {
   });
   const clock = options.clock || (() => new Date());
   const runIdFactory = options.runIdFactory || defaultRunIdFactory;
+  const lockOperations = options.lockOperations;
   const runsDir = path.join(storeRoot, ROUTER_RUNS_DIR);
+  const lockOptions = (extra = {}) => ({ ...extra, lockOperations });
 
   async function ensureRunsDir() {
     await mkdir(runsDir, { recursive: true });
@@ -438,24 +652,30 @@ export function createRouterRunStore(options = {}) {
         }
       }
       return writeRun(run);
-    });
+    }, lockOptions());
   }
 
   async function get(runId, scope) {
     return assertRouterRunScope(await readRun(runId), scope);
   }
 
-  async function update(runId, scope, updaterOrPatch) {
+  async function update(runId, scope, updaterOrPatch, options = {}) {
+    const signal = options.signal;
+    throwIfAborted(signal);
     const targetPath = runPath(runId);
     return withRunFileLock(targetPath, async () => {
+      throwIfAborted(signal);
       const existing = await get(runId, scope);
+      throwIfAborted(signal);
       const immutableId = existing.id;
       const immutableCreatedAt = existing.createdAt;
       const updaterInput = JSON.parse(JSON.stringify(existing));
+      throwIfAborted(signal);
       const changed =
         typeof updaterOrPatch === "function"
           ? await updaterOrPatch(updaterInput)
           : { ...existing, ...(updaterOrPatch || {}) };
+      throwIfAborted(signal);
       if (!changed || typeof changed !== "object") {
         throw new Error("Router run updater must return an object");
       }
@@ -472,44 +692,153 @@ export function createRouterRunStore(options = {}) {
         createdAt: immutableCreatedAt,
         updatedAt: nowIso(clock)
       });
+      throwIfAborted(signal);
       return writeRun(updated);
-    });
+    }, lockOptions({ signal, commitOnOperationReturn: true }));
   }
 
-  async function withRunLease(runId, scope, operation) {
+  async function reopenFailedStageForSucceededTransport(
+    runId,
+    scope,
+    { transportRequestId, signal } = {}
+  ) {
+    throwIfAborted(signal);
+    const requestId = requiredText(transportRequestId, "transportRequestId");
+    const targetPath = runPath(runId);
+    return withRunFileLock(targetPath, async () => {
+      throwIfAborted(signal);
+      const existing = await get(runId, scope);
+      throwIfAborted(signal);
+      if (existing.status !== "failed") {
+        return existing;
+      }
+      const stageIndex = existing.stages.findIndex(
+        (stage) =>
+          stage.status === "failed" &&
+          stage.submissionState === "submitted" &&
+          stage.transportRequestId === requestId
+      );
+      if (stageIndex === -1) {
+        return existing;
+      }
+      if (existing.stages.slice(stageIndex + 1).some((stage) => stage.status !== "pending")) {
+        throw new Error("Router run cannot recover a failed stage after a later stage has started");
+      }
+      const candidate = {
+        ...existing,
+        status: "running",
+        currentStageIndex: stageIndex,
+        error: null,
+        stages: existing.stages.map((stage, index) =>
+          index === stageIndex
+            ? {
+                ...stage,
+                status: "running",
+                completedAt: null,
+                error: null
+              }
+            : stage
+        )
+      };
+      const updated = normalizeRun(candidate, {
+        createdAt: existing.createdAt,
+        updatedAt: nowIso(clock)
+      });
+      throwIfAborted(signal);
+      return writeRun(updated);
+    }, lockOptions({ signal, commitOnOperationReturn: true }));
+  }
+
+  async function cancelRecoveredStage(runId, scope, { job, reason, signal } = {}) {
+    const targetPath = runPath(runId);
+    return withRunFileLock(targetPath, async () => {
+      throwIfAborted(signal);
+      const existing = await get(runId, scope);
+      if (existing.status !== "failed") return existing;
+      if (job?.status !== "failed" || job.errorCode !== "manual_cancelled" ||
+          !routerRecovery(existing, job, { allowTerminal: true })) {
+        throw new Error("Recovered Router cancellation requires an exact cancelled transport");
+      }
+      const updated = normalizeRun({
+        ...existing, status: "cancelled", error: reason || "Router recovery cancelled",
+        stages: existing.stages.map((stage, index) => index === existing.currentStageIndex
+          ? {...stage, status: "cancelled", error: reason || "Router recovery cancelled", completedAt: nowIso(clock)} : stage)
+      }, { createdAt: existing.createdAt, updatedAt: nowIso(clock) });
+      throwIfAborted(signal);
+      return writeRun(updated);
+    }, lockOptions({ signal, commitOnOperationReturn: true }));
+  }
+
+  async function withRunLease(runId, scope, operation, options = {}) {
     if (typeof operation !== "function") {
       throw new Error("Router run lease requires an operation function");
     }
+    const signal = options.signal;
+    throwIfAborted(signal);
     await ensureRunsDir();
+    throwIfAborted(signal);
     const targetPath = runPath(runId);
     return withRunOperationLock(targetPath, async () => {
+      throwIfAborted(signal);
       const run = await get(runId, scope);
-      return operation(run);
-    });
+      throwIfAborted(signal);
+      const result = await operation(run);
+      if (!commitPointReached(options.commitOnOperationReturn)) {
+        throwIfAborted(signal);
+      }
+      return result;
+    }, lockOptions({
+      signal,
+      commitOnOperationReturn: options.commitOnOperationReturn
+    }));
   }
 
-  async function withSubmissionLease(runId, scope, operation) {
+  async function withSubmissionLease(runId, scope, operation, options = {}) {
     if (typeof operation !== "function") {
       throw new Error("Router run submission lease requires an operation function");
     }
+    const signal = options.signal;
+    throwIfAborted(signal);
     await ensureRunsDir();
+    throwIfAborted(signal);
     const targetPath = runPath(runId);
     return withRunSubmissionLock(targetPath, async () => {
+      throwIfAborted(signal);
       const run = await get(runId, scope);
-      return operation(run);
-    });
+      throwIfAborted(signal);
+      const result = await operation(run);
+      if (!commitPointReached(options.commitOnOperationReturn)) {
+        throwIfAborted(signal);
+      }
+      return result;
+    }, lockOptions({
+      signal,
+      commitOnOperationReturn: options.commitOnOperationReturn
+    }));
   }
 
-  async function withFinalizationLease(runId, scope, operation) {
+  async function withFinalizationLease(runId, scope, operation, options = {}) {
     if (typeof operation !== "function") {
       throw new Error("Router run finalization lease requires an operation function");
     }
+    const signal = options.signal;
+    throwIfAborted(signal);
     await ensureRunsDir();
+    throwIfAborted(signal);
     const targetPath = runPath(runId);
     return withRunFinalizationLock(targetPath, async () => {
+      throwIfAborted(signal);
       const run = await get(runId, scope);
-      return operation(run);
-    });
+      throwIfAborted(signal);
+      const result = await operation(run);
+      if (!commitPointReached(options.commitOnOperationReturn)) {
+        throwIfAborted(signal);
+      }
+      return result;
+    }, lockOptions({
+      signal,
+      commitOnOperationReturn: options.commitOnOperationReturn
+    }));
   }
 
   async function list(scope) {
@@ -534,14 +863,84 @@ export function createRouterRunStore(options = {}) {
     return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
+  async function findByTransportRequestId(requestId, guard = {}) {
+    const expectedRequestId = requiredText(requestId, "transportRequestId");
+    const expectedConversationId = requiredText(
+      guard.conversationId,
+      "transport terminal conversationId"
+    );
+    const expectedTargetRepo = normalizeTargetRepoForComparison(guard.targetRepo);
+    await ensureRunsDir();
+    const entries = await readdir(runsDir, { withFileTypes: true });
+    const matches = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        continue;
+      }
+      const run = JSON.parse(await readFile(path.join(runsDir, entry.name), "utf8"));
+      const stageIndex = Array.isArray(run.stages)
+        ? run.stages.findIndex((stage) => stage.transportRequestId === expectedRequestId)
+        : -1;
+      if (stageIndex === -1) {
+        continue;
+      }
+      if (
+        run.conversationId !== expectedConversationId ||
+        !run.targetRepo ||
+        normalizeTargetRepoForComparison(run.targetRepo) !== expectedTargetRepo
+      ) {
+        continue;
+      }
+      matches.push({ run, stageIndex });
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `Router transport request is ambiguous across scoped runs: ${expectedRequestId}`
+      );
+    }
+    return matches[0] || null;
+  }
+
+  async function findByRunIdAndTransportRequestId(runId, requestId, guard = {}) {
+    const expectedRequestId = requiredText(requestId, "transportRequestId");
+    const expectedTargetRepo = normalizeTargetRepoForComparison(guard.targetRepo);
+    let run;
+    try {
+      run = await get(runId, {
+        projectId: guard.projectId,
+        conversationId: guard.conversationId,
+        codexThreadId: guard.codexThreadId
+      });
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    }
+    if (
+      !run.targetRepo ||
+      normalizeTargetRepoForComparison(run.targetRepo) !== expectedTargetRepo
+    ) {
+      return null;
+    }
+    const stageIndex = Array.isArray(run.stages)
+      ? run.stages.findIndex((stage) => stage.transportRequestId === expectedRequestId)
+      : -1;
+    return stageIndex === -1 ? null : { run, stageIndex };
+  }
+
   return {
     create,
     get,
     update,
+    reopenFailedStageForSucceededTransport,
+    cancelRecoveredStage,
     withRunLease,
     withSubmissionLease,
     withFinalizationLease,
     list,
+    findByRunIdAndTransportRequestId,
+    findByTransportRequestId,
     assertScope: assertRouterRunScope
   };
 }

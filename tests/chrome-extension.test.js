@@ -3,6 +3,280 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import test from "node:test";
 
+test("message stream error notices are not final content or historical incident reports", async () => {
+  const c = await loadContentScriptContext();
+  for (const text of ["消息流中的错误", "Error in message stream", "消息流中的错误。 重试", "Error in message stream. Try again"]) {
+    assert.equal(c.isInterimAssistantText(text), true, text);
+    assert.equal(c.hasGenerationFailureText(text), true, text);
+    assert.equal(c.hasUsableAssistantText(text, ""), false, text);
+  }
+  for (const text of ["The label Error in message stream describes a past incident; the repair is complete.", "昨天出现“消息流中的错误”，今天结果已正常返回。"])
+    assert.equal(c.hasGenerationFailureText(text), false, text);
+});
+
+for (const phase of ["upload_preview", "send_button"]) {
+  for (const scenario of ["cancelled", "offline", "expired", "ready"]) {
+    test(`pre-send wait releases its worker without page mutations: ${phase}/${scenario}`, async () => {
+      const context = await loadContentScriptContext();
+      const start = Date.now();
+      let now = start, cancelled = false, offline = false, checks = 0;
+      const job = { id: "sync_wait_guard", status: "running", claimedAt: new Date(start - (scenario === "expired" ? 59000 : 0)).toISOString(),
+        inputArtifacts: [{ id: "artifact_wait_guard", filename: "wait.png", contentType: "image/png" }] };
+      class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
+      context.Date = Clock;
+      context.installAssistantActivityObserver = () => true;
+      context.assertNoChatGptBlocker = () => {};
+      context.waitForAssistantActivity = async ms => {
+        now += ms;
+        cancelled = scenario === "cancelled";
+        offline = scenario === "offline";
+        return scenario === "ready" && now - start >= 5000;
+      };
+      context.bridgeApi = async () => {
+        checks++;
+        if (offline) throw new Error("Bridge disconnected");
+        return { job: { ...job, status: cancelled ? "failed" : "running", errorCode: cancelled ? "manual_cancelled" : null } };
+      };
+      const button = {};
+      const ready = () => scenario === "ready" && now - start >= 5000;
+      context.findSendButton = () => ready() ? button : null;
+      context.isDisabledButton = () => false;
+      // Only DOM evidence is controlled; the waiting loop and state guard are real.
+      context.uploadPreviewElements = () => [];
+      context.missingInputArtifacts = () => ready() ? [] : job.inputArtifacts;
+      const waiting = phase === "upload_preview"
+        ? context.waitForInputArtifactsVisible(job.inputArtifacts, 60000, job)
+        : context.waitForReadySendButton(60000, job);
+      const result = await waiting.then(value => ({ value }), error => ({ error }));
+      if (scenario === "ready") {
+        assert.equal(result.error, undefined);
+        assert.equal(now - start, 5000);
+        if (phase === "send_button") assert.equal(result.value, button);
+        assert.ok(checks >= 2 && checks <= 4, "state reads must be throttled, not performed on every DOM poll");
+      } else {
+        assert.ok(now - start <= 3500, "cancelled/unconfirmed work must not hold the worker until the 60-second UI timeout");
+        if (scenario === "cancelled") assert.equal(result.error?.bridgeJobStopped, true);
+        if (scenario === "offline") assert.equal(result.error?.errorCode, "pre_send_state_unconfirmed");
+        if (scenario === "expired") assert.equal(result.error?.errorCode, "pre_send_stale");
+      }
+    });
+  }
+}
+
+for (const scenario of ["cancelled_before_read", "cancelled_between_reads", "cancelled_after_last_read", "expired_after_read", "offline_after_read", "active"]) {
+  test(`attachment upload commit guard: ${scenario}`, async () => {
+    const context = await loadContentScriptContext();
+    let now = Date.now(), cancelled = scenario === "cancelled_before_read", offline = false;
+    let assignments = 0, changes = 0, previews = 0;
+    const fetched = [];
+    const job = { id: "sync_upload_guard", projectId: "project_upload_guard", status: "running",
+      claimedAt: new Date(now).toISOString(), inputArtifacts: [{ id: "one", filename: "one.png" }, { id: "two", filename: "two.png" }] };
+    class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
+    context.Date = Clock;
+    context.DataTransfer = class { files = []; items = { add: file => this.files.push(file) }; };
+    context.Event = class { constructor(type) { this.type = type; } };
+    context.findFileInput = () => ({
+      set files(value) { assignments++; assert.deepEqual(Array.from(value, f => f.name), ["one.png", "two.png"]); },
+      dispatchEvent(event) { assert.equal(event.type, "change"); changes++; }
+    });
+    context.bridgeApi = async () => {
+      if (offline) throw new Error("connection lost during file read");
+      return { job: { ...job, status: cancelled ? "failed" : "running", errorCode: cancelled ? "manual_cancelled" : null } };
+    };
+    context.fetchInputArtifactFile = async (artifact, options) => {
+      assert.equal(options.projectId, "project_upload_guard");
+      fetched.push(artifact.id);
+      await Promise.resolve();
+      if (scenario === "cancelled_between_reads" || (scenario === "cancelled_after_last_read" && artifact.id === "two")) cancelled = true;
+      if (scenario === "expired_after_read") now += 61000;
+      if (scenario === "offline_after_read") offline = true;
+      return { name: artifact.filename };
+    };
+    context.waitForInputArtifactsVisible = async (_artifacts, _timeout, waitJob) => { assert.equal(waitJob, job); previews++; };
+    const result = await context.uploadInputArtifacts(job).then(files => ({ files }), error => ({ error }));
+    const active = scenario === "active";
+    assert.equal(assignments, active ? 1 : 0, "cancelled or unconfirmed files must not enter the page");
+    assert.equal(changes, active ? 1 : 0, "must not trigger the page upload after cancellation");
+    assert.equal(previews, active ? 1 : 0);
+    assert.deepEqual(fetched, scenario === "cancelled_before_read" ? [] : active || scenario === "cancelled_after_last_read" ? ["one", "two"] : ["one"]);
+    if (scenario.startsWith("cancelled")) assert.equal(result.error?.bridgeJobStopped, true);
+    if (scenario === "expired_after_read") assert.equal(result.error?.errorCode, "pre_send_stale");
+    if (scenario === "offline_after_read") assert.equal(result.error?.errorCode, "pre_send_state_unconfirmed");
+    if (active) assert.deepEqual(Array.from(result.files, f => f.name), ["one.png", "two.png"]);
+  });
+}
+
+for (const scenario of ["slow_preferences", "slow_button", "cancelled_button", "offline_button", "slow_final_check", "ready_without_fixed_sleep", "draft_wrong", "draft_changed_before_send"]) {
+  test(`pre-send guard prevents delayed submission: ${scenario}`, async () => {
+    const context = await loadContentScriptContext();
+    const start = Date.parse("2026-09-12T00:00:00Z");
+    let now = start, cancelled = false, offline = false, finalCheck = false, sends = 0;
+    const job = { id: "sync_guard_fixture", status: "running", claimedAt: new Date(start).toISOString(), payloadText: "test draft", modelPreference: "latest" };
+    class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
+    context.Date = Clock;
+    context.sleep = async ms => { if(scenario === "ready_without_fixed_sleep" && [300,700].includes(ms)) now += 61000; };
+    context.ensureExpectedChatGptPage = () => true;
+    context.stopStaleGenerationIfNeeded = async () => {};
+    context.dismissArtifactPreviewIfNeeded = async () => {};
+    const composerNode = { value: "", tagName: "TEXTAREA" };
+    context.waitForComposer = async () => composerNode;
+    context.preferencesAlreadyApplied = () => false;
+    context.applyJobPreferences = async () => { if (scenario === "slow_preferences") now += 61000; };
+    context.fillComposerText = async (composer,text) => {composer.value=scenario === "draft_wrong" ? "different draft" : text;};
+    context.uploadInputArtifacts = async () => {};
+    context.waitForReadySendButton = async (_timeout, waitJob) => {
+      assert.equal(waitJob, job);
+      if (scenario === "slow_button") now += 61000;
+      cancelled = scenario === "cancelled_button";
+      offline = scenario === "offline_button";
+      finalCheck = true;
+      if(scenario === "draft_changed_before_send") composerNode.value = "user changed draft";
+      return {};
+    };
+    context.conversationTurns = () => [];
+    context.directUserPromptNodes = () => [];
+    context.generatedImageBaselineKeys = () => [];
+    context.triggerSendButton = async () => { sends++; return {}; };
+    context.waitForSubmittedPrompt = async () => ({ index: 0 });
+    context.markJobSent = async () => {};
+    context.waitForAssistantReply = async () => { throw Object.assign(new Error("end fixture"), { bridgeJobStopped: true }); };
+    context.clearBridgeDraftIfPresent = () => {};
+    context.bridgeApi = async (route) => {
+      if (offline) throw new Error("Bridge disconnected");
+      if (scenario === "slow_final_check" && finalCheck) now += 61000;
+      return { job: { ...job, status: cancelled ? "failed" : "running", errorCode: cancelled ? "manual_cancelled" : null } };
+    };
+    const error = await context.processJob(job).then(() => null, e => e);
+    assert.equal(sends, scenario === "ready_without_fixed_sleep" ? 1 : 0,
+      "ready inputs must not need fixed sleeps; invalid or cancelled inputs must not send");
+    if (scenario.startsWith("slow")) assert.equal(error?.errorCode, "pre_send_stale");
+    if (scenario.startsWith("draft_")) assert.equal(error?.errorCode, "composer_text_not_applied");
+  });
+}
+
+test("draft fallback stops before another submit when cancellation arrives after its DOM click", async () => {
+  const c=await loadContentScriptContext();
+  const job={id:'sync_fallback_guard',status:'running',claimedAt:new Date().toISOString(),payloadText:'draft'};
+  let cancelled=false, clicks=0, forms=0, enters=0;
+  c.sleep=async()=>{};
+  c.composerContainsBridgeDraft=()=>true;
+  c.isDisabledButton=()=>false;
+  c.buttonDiagnosticInfo=()=>({});
+  c.dispatchEnterSubmit=()=>{enters++;};
+  c.bridgeApi=async()=>({job:{...job,status:cancelled?'failed':'running',errorCode:cancelled?'manual_cancelled':null}});
+  const composer={focus(){},closest(){return {requestSubmit(){forms++;}};}};
+  const button={click(){clicks++;cancelled=true;}};
+  await assert.rejects(c.retryUnsentComposerDraft(job,{composer,sendButton:button}),e=>e.bridgeJobStopped===true);
+  assert.equal(clicks,1);
+  assert.equal(forms,0);
+  assert.equal(enters,0);
+});
+
+test("pre-send diagnostics include visibility and claim age without the draft", async()=>{
+  const c=await loadContentScriptContext();
+  c.document.visibilityState='hidden';
+  const record=c.traceCapturePhase({id:'sync_trace_guard',claimedAt:new Date(Date.now()-1000).toISOString(),payloadText:'PRIVATE_DRAFT'},'pre_send_preferences');
+  assert.equal(record.trace[0].visibilityState,'hidden');
+  assert.ok(record.trace[0].claimAgeMs>=1000);
+  assert.doesNotMatch(JSON.stringify(record),/PRIVATE_DRAFT/);
+});
+
+test("content script exposes an active sentinel for safe background reinjection", async () => {
+  const source = await readFile("chrome-extension/content-script.js", "utf8");
+
+  assert.match(
+    source,
+    /globalThis\.__CODEX_GPT_BRIDGE_CONTENT_SCRIPT_ACTIVE__ = true;/
+  );
+});
+
+test("content script proxies Bridge API through the extension background when the page origin is blocked", async () => {
+  const context = await loadContentScriptContext();
+  const messages = [];
+  context.fetch = async () => ({
+    ok: false,
+    status: 403,
+    async text() {
+      return JSON.stringify({ error: "Origin is not allowed" });
+    }
+  });
+  context.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage(message, callback) {
+        messages.push(message);
+        callback({
+          ok: true,
+          response: {
+            ok: true,
+            status: 200,
+            bodyText: JSON.stringify({ connected: true })
+          }
+        });
+      }
+    }
+  };
+
+  const result = await context.bridgeApi("/api/extension/heartbeat", {
+    method: "POST",
+    body: JSON.stringify({ workerId: "worker_background_proxy" })
+  });
+
+  assert.equal(result.connected, true);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].type, "bridge:api");
+  assert.equal(messages[0].bridgeOrigin, "http://127.0.0.1:4317");
+  assert.equal(messages[0].path, "/api/extension/heartbeat");
+});
+
+test("content script aborts a stuck heartbeat request before it can block later polling", async () => {
+  const context = await loadContentScriptContext();
+  let scheduledTimeoutMs = null;
+  let observedSignal = null;
+
+  context.AbortController = class {
+    constructor() {
+      const listeners = [];
+      this.signal = {
+        aborted: false,
+        addEventListener(type, listener) {
+          if (type === "abort") listeners.push(listener);
+        }
+      };
+      this.abort = () => {
+        this.signal.aborted = true;
+        for (const listener of listeners) listener();
+      };
+    }
+  };
+  context.setTimeout = (callback, timeoutMs) => {
+    scheduledTimeoutMs = timeoutMs;
+    queueMicrotask(callback);
+    return 1;
+  };
+  context.clearTimeout = () => {};
+  context.fetch = async (_url, options = {}) => {
+    observedSignal = options.signal || null;
+    if (!observedSignal) {
+      throw new Error("heartbeat request is not abortable");
+    }
+    return new Promise((_, reject) => {
+      observedSignal.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      });
+    });
+  };
+
+  await assert.rejects(
+    () => context.sendHeartbeat(),
+    (error) => error.errorCode === "bridge_api_timeout"
+  );
+  assert.equal(scheduledTimeoutMs, 5_000);
+  assert.equal(observedSignal.aborted, true);
+});
+
 async function loadContentScriptContext() {
   const bridgeConfigSource = await readFile("chrome-extension/bridge-config.js", "utf8");
   const source = await readFile("chrome-extension/content-script.js", "utf8");
@@ -38,6 +312,284 @@ async function loadContentScriptContext() {
   return context;
 }
 
+test("Excel output is captured when the request forbids images only", async () => {
+  const context=await loadContentScriptContext();
+  assert.equal(context.shouldSkipArtifactCapture({kind:"user_request",payloadText:"请生成一个真实可下载的 Excel 文件 bridge_excel_acceptance.xlsx。不要生成图片。"},"下载 Excel 文件 bridge_excel_acceptance.xlsx"),false);
+  assert.equal(context.expectsImageArtifact({kind:"user_request",payloadText:"生成 Excel 文件 report.xlsx，不要生成图片"}),false);
+});
+
+test("input artifact upload uses scoped background bytes when page fetch is unavailable", async () => {
+  const context=await loadContentScriptContext();
+  const bytes=Buffer.from([0,255,128,65]);
+  context.File=File;
+  context.atob=value=>Buffer.from(value,"base64").toString("binary");
+  context.sleep=async()=>{};
+  context.canAskBackgroundForDownloads=()=>true;
+  context.fetch=async()=>{throw new Error("Page network access blocked");};
+  const messages=[];
+  context.chromeRuntimeMessage=async message=>{
+    messages.push(message);
+    return {ok:true,response:{ok:true,status:200,base64Data:bytes.toString("base64"),contentType:"application/octet-stream"}};
+  };
+  const file=await context.fetchInputArtifactFile({id:"artifact_input",filename:"input.bin",sizeBytes:4,uploadUrl:"/api/artifacts/artifact_input/raw"},{projectId:"project_upload"});
+  assert.deepEqual(Buffer.from(await file.arrayBuffer()),bytes);
+  assert.equal(file.name,"input.bin");
+  assert.equal(messages.length,1);
+  assert.equal(messages[0].type,"bridge:api");
+  assert.equal(messages[0].path,"/api/artifacts/artifact_input/raw?projectId=project_upload");
+  assert.equal(messages[0].options.responseType,"base64");
+});
+
+test("input artifact upload rejects byte loss before constructing the upload file", async () => {
+  const context=await loadContentScriptContext();
+  context.sleep=async()=>{};
+  context.canAskBackgroundForDownloads=()=>true;
+  context.atob=value=>Buffer.from(value,"base64").toString("binary");
+  let constructed=0;
+  context.File=class {constructor(){constructed++;}};
+  context.chromeRuntimeMessage=async()=>({ok:true,response:{ok:true,status:200,base64Data:"AA=="}});
+  await assert.rejects(context.fetchInputArtifactFile({id:"artifact_input",sizeBytes:2,uploadUrl:"/api/artifacts/artifact_input/raw"},{projectId:"project_upload"}),error=>error.errorCode==="input_artifact_fetch_failed" && /byte length/.test(error.message));
+  assert.equal(constructed,0);
+});
+
+test("input artifact upload accepts a genuinely empty file", async () => {
+  const context=await loadContentScriptContext();
+  context.File=File;
+  context.canAskBackgroundForDownloads=()=>true;
+  context.atob=value=>Buffer.from(value,"base64").toString("binary");
+  context.chromeRuntimeMessage=async()=>({ok:true,response:{ok:true,status:200,base64Data:"",contentType:"text/plain"}});
+  const file=await context.fetchInputArtifactFile({id:"artifact_empty",filename:"empty.txt",sizeBytes:0,uploadUrl:"/api/artifacts/artifact_empty/raw"},{projectId:"project_upload"});
+  assert.equal(file.size,0);
+  assert.equal(file.type,"text/plain");
+});
+
+test("authoritative manual cancellation ends capture diagnostics without later idle overwrites", async () => {
+  const context=await loadContentScriptContext();
+  const job={id:"cancel_diagnostics",status:"running",sentAt:"2026-09-10T00:00:00Z"};
+  context.traceCapturePhase(job,"waiting_reply");
+  context.bridgeApi=async()=>({job:{id:job.id,status:"failed",errorCode:"manual_cancelled"}});
+  assert.equal(await context.syncJobStillActive(job),false);
+  const status=vm.runInContext("lastCaptureStatus",context);
+  assert.equal(status.state,"cancelled");
+  assert.equal(status.trace.at(-1).phase,"cancelled");
+  await context.syncJobStillActive(job);
+  assert.equal(vm.runInContext("lastCaptureStatus.trace.length",context),2);
+  assert.equal(context.updateCaptureStatus(job,"job_inactive").state,"cancelled");
+  assert.equal(context.updateCaptureStatus(job,"job_ended_during_capture").state,"cancelled");
+});
+
+test("a late cancellation check for an old job cannot replace current capture diagnostics", async () => {
+  const context=await loadContentScriptContext();
+  context.traceCapturePhase({id:"new_job"},"waiting_reply");
+  context.bridgeApi=async()=>({job:{id:"old_job",status:"failed",errorCode:"manual_cancelled"}});
+  assert.equal(await context.syncJobStillActive({id:"old_job",status:"running",sentAt:"2026-09-10T00:00:00Z"}),false);
+  const status=vm.runInContext("lastCaptureStatus",context);
+  assert.equal(status.jobId,"new_job");
+  assert.equal(status.state,"waiting_reply");
+});
+
+test("a successful terminal observation is not classified as cancellation", async () => {
+  const context=await loadContentScriptContext();
+  const job={id:"success_wins",status:"running",sentAt:"2026-09-10T00:00:00Z"};
+  context.recordCompletionCaptureStatus(job,{job:{status:"succeeded"}});
+  context.bridgeApi=async()=>({job:{id:job.id,status:"succeeded"}});
+  assert.equal(await context.syncJobStillActive(job),false);
+  assert.equal(vm.runInContext("lastCaptureStatus.state",context),"captured");
+});
+
+test("capture timing trace is bounded and never carries another job's history", async () => {
+  const context = await loadContentScriptContext();
+  let result;
+  for (let index = 0; index < 40; index += 1) {
+    result = context.traceCapturePhase({id:"trace_a"}, "waiting_download", {
+      filename:"test.zip",url:"https://example.invalid/private?sig=secret",text:"private reply",
+      controlLabel:"Download https://example.invalid/private?sig=secret"
+    });
+  }
+  assert.equal(result.trace.length, 24);
+  assert.equal(result.trace[0].filename,"test.zip");
+  assert.equal(result.trace[0].controlLabel,"Download [url]");
+  assert.equal(JSON.stringify(result).includes("secret"),false);
+  assert.equal(JSON.stringify(result).includes("private reply"),false);
+  context.updateCaptureStatus({id:"trace_a"},"reply_not_final");
+  result = context.recordCompletionCaptureStatus({id:"trace_a"},{job:{status:"succeeded"}});
+  assert.equal(result,true);
+  const finished = vm.runInContext("lastCaptureStatus",context);
+  assert.equal(finished.trace.at(-1).phase,"captured");
+  const next = context.traceCapturePhase({id:"trace_b"},"waiting_reply");
+  assert.equal(next.trace.length,1);
+  assert.equal(next.trace[0].phase,"waiting_reply");
+});
+
+test("native download exposes its waiting phase before the file import completes", async () => {
+  const context = await loadContentScriptContext();
+  const gate = Promise.withResolvers();
+  const entered = Promise.withResolvers();
+  context.sleep = async () => {};
+  context.expectedFilenameForButton = () => "trace.zip";
+  context.chromeRuntimeMessage = async (message) => {
+    if(message.type === "bridge:startDownloadWatch") return {ok:true,watchId:"trace_watch"};
+    if(message.type === "bridge:awaitDownloadWatch") {
+      entered.resolve();
+      await gate.promise;
+      return {ok:true,artifact:{id:"trace_artifact"}};
+    }
+    throw new Error(`Unexpected message ${message.type}`);
+  };
+  const operation = context.captureArtifactFromDownloadButtonAttempt({getAttribute:()=>"下载文件",focus(){},click(){}},{syncJobId:"trace_download"});
+  await entered.promise;
+  const pending = vm.runInContext("lastCaptureStatus",context);
+  gate.resolve();
+  await operation;
+  assert.equal(pending?.state,"waiting_download");
+  assert.deepEqual(Array.from(pending.trace,entry=>entry.phase),["starting_download_watch","clicking_download","native_dom_click","waiting_download"]);
+  const completed = vm.runInContext("lastCaptureStatus",context);
+  assert.equal(completed.trace.at(-1).phase,"download_received");
+});
+
+for (const label of ["复制", "复制链接", "Copy", "Copy link"]) {
+  test(`download candidates exclude the card's ${label} control`, async () => {
+    const context = await loadContentScriptContext();
+    const card = {textContent:"bundle.zip",querySelectorAll:()=>[copy,download]};
+    const copy = {getAttribute:name=>name==="aria-label"?label:null,parentElement:card,getClientRects:()=>[{}]};
+    const download = {getAttribute:name=>name==="aria-label"?"下载 bundle.zip":null,parentElement:card,getClientRects:()=>[{}]};
+    assert.deepEqual(Array.from(context.downloadButtonCandidates(card)),[download]);
+  });
+}
+
+for (const label of ["已思考 20 秒", "Thought for 20s", "更多操作", "分享"]) {
+  test(`a file in the reply does not turn the ${label} button into a download`, async () => {
+    const context = await loadContentScriptContext();
+    const card = {textContent:`${label} bundle.zip`,querySelectorAll:()=>[unrelated,download]};
+    const unrelated = {textContent:label,className:"inline-block",getAttribute:()=>null,parentElement:card,getClientRects:()=>[{}]};
+    const download = {getAttribute:name=>name==="aria-label"?"下载 bundle.zip":null,parentElement:card,getClientRects:()=>[{}]};
+    assert.deepEqual(Array.from(context.downloadButtonCandidates(card)),[download]);
+  });
+}
+
+test("content script preserves mixed Chinese filenames without inventing an ASCII suffix file", async () => {
+  const context = await loadContentScriptContext();
+  assert.deepEqual(Array.from(context.filenamesFromText("下载 bridge_验收068.zip")), ["bridge_验收068.zip"]);
+  assert.deepEqual(Array.from(context.filenamesFromText("验收068.zip")), ["验收068.zip"]);
+});
+
+test("content script recognizes a download anchor in the current assistant turn", async () => {
+  const context = await loadContentScriptContext();
+  const anchor = {href:"https://chatgpt.com/files/current.zip",textContent:"下载 current.zip",getAttribute:()=>null};
+  const turn = {querySelectorAll:s=>s==="a[href]"?[anchor]:[]};
+  const message = {closest:()=>turn,querySelectorAll:()=>[]};
+  assert.equal(context.hasDownloadableArtifact(message),true);
+  turn.querySelectorAll = () => [];
+  context.document.querySelectorAll = () => [anchor];
+  assert.equal(context.hasDownloadableArtifact(message),false,"a previous turn's download must not qualify");
+});
+
+test("non-image Office requests are recognized without requiring a filename extension",async()=>{
+  const context=await loadContentScriptContext();
+  for(const prompt of ["制作可下载的Excel，不要图片","导出Word文档，不生成图片","Generate an Excel workbook, do not generate images"]){
+    assert.equal(context.shouldSkipArtifactCapture({kind:"user_request",payloadText:prompt},"文件已准备好"),false,prompt);
+  }
+});
+
+test("explicit no-file instructions still prevent artifact capture",async()=>{
+  const context=await loadContentScriptContext();
+  for(const prompt of ["报告叫 report.xlsx，但不要生成文件，只解释步骤","写小说大纲，不要生成图片","Analyze input.xlsx, do not generate files"]){
+    assert.equal(context.shouldSkipArtifactCapture({kind:"user_request",payloadText:prompt},"完成"),true,prompt);
+  }
+});
+
+test("content script wakes reply processing when the assistant DOM changes", async () => {
+  const context = await loadContentScriptContext();
+  let observerCallback = null;
+  let observedTarget = null;
+  let observedOptions = null;
+  context.document.documentElement = { nodeName: "HTML" };
+  context.MutationObserver = class {
+    constructor(callback) {
+      observerCallback = callback;
+    }
+
+    observe(target, options) {
+      observedTarget = target;
+      observedOptions = options;
+    }
+  };
+
+  assert.equal(context.installAssistantActivityObserver(), true);
+  let settled = false;
+  const waiting = context.waitForAssistantActivity(10_000).then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+
+  assert.equal(settled, false);
+  observerCallback([{ type: "childList" }]);
+  await waiting;
+
+  assert.equal(settled, true);
+  assert.equal(observedTarget, context.document.documentElement);
+  assert.equal(observedOptions.childList, true);
+  assert.equal(observedOptions.characterData, true);
+  assert.equal(observedOptions.subtree, true);
+});
+
+test("content script coalesces rapid assistant DOM mutations before rescanning the conversation", async () => {
+  const context = await loadContentScriptContext();
+  let observerCallback = null;
+  const timers = [];
+  context.document.documentElement = { nodeName: "HTML" };
+  context.MutationObserver = class {
+    constructor(callback) {
+      observerCallback = callback;
+    }
+
+    observe() {}
+  };
+  context.setTimeout = (callback, timeoutMs) => {
+    timers.push({ callback, timeoutMs, cleared: false });
+    return timers.length;
+  };
+  context.clearTimeout = (timerId) => {
+    if (timers[timerId - 1]) timers[timerId - 1].cleared = true;
+  };
+
+  assert.equal(context.installAssistantActivityObserver(), true);
+  let settled = false;
+  const waiting = context.waitForAssistantActivity(10_000).then(() => {
+    settled = true;
+  });
+  observerCallback([{ type: "characterData" }]);
+  observerCallback([{ type: "characterData" }]);
+  observerCallback([{ type: "childList" }]);
+  await Promise.resolve();
+
+  assert.equal(settled, false);
+  const coalescedTimer = timers.find((timer) => timer.timeoutMs === 250);
+  assert.ok(coalescedTimer, "rapid DOM mutations should schedule one 250ms coalesced wake-up");
+  assert.equal(timers.filter((timer) => timer.timeoutMs === 250).length, 1);
+
+  coalescedTimer.callback();
+  await waiting;
+  assert.equal(settled, true);
+});
+
+test("reply scoping skips prompt-text fallback once a stable identity identifies an assistant turn", async () => {
+  const context = await loadContentScriptContext();
+  const indexedMessage = { id: "assistant-indexed" };
+  let promptFallbackScans = 0;
+  context.assistantTurnsAfterTurnId = () => [indexedMessage];
+  context.assistantTurnsAfterUserTexts = () => {
+    promptFallbackScans += 1;
+    return [{ id: "assistant-fallback" }];
+  };
+
+  const messages = context.assistantMessagesForReplyScope(3, ["a long prompt"], null, "stable-prompt");
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].id, "assistant-indexed");
+  assert.equal(promptFallbackScans, 0);
+});
+
 function fakeText(value) {
   return {
     nodeType: 3,
@@ -46,9 +598,650 @@ function fakeText(value) {
   };
 }
 
+function logicalTurn(id, role, text = "") {
+  return fakeElement("div", { "data-turn-id-container": id }, role
+    ? [fakeElement("section", { "data-turn-id": id, "data-message-author-role": role }, [fakeText(text)])]
+    : []);
+}
+
+test("file capture stays inside the modern assistant turn instead of a wider legacy wrapper",async()=>{
+  const c=await loadContentScriptContext();
+  const answer=logicalTurn("answer","assistant","result.txt");
+  fakeElement("article",{"data-testid":"conversation-turn-wide"},[logicalTurn("prompt","user","input.txt"),answer]);
+  const body=answer.querySelector('[data-message-author-role="assistant"]');
+  assert.equal(c.assistantDownloadScope(body),answer);
+});
+
+test("file capture uses the local card title before filenames mentioned in reply prose",async()=>{
+  const c=await loadContentScriptContext();
+  const button=fakeElement("button",{"aria-label":"下载文件"});
+  const title=fakeElement("span",{title:"bridge_accept_result.txt"},[fakeText("bridge_accept_…")]);
+  const card=fakeElement("div",{},[title,button]);
+  const message=fakeElement("section",{},[fakeText("读取 input.txt 后生成结果。"),card]);
+  assert.equal(c.expectedFilenameForButton(button,message),"bridge_accept_result.txt");
+});
+
+test("file capture skips user upload controls without rejecting same-named assistant output",async()=>{
+  const c=await loadContentScriptContext(); c.isVisibleElement=()=>true;
+  const upload=fakeElement("button",{"aria-label":"下载文件"});
+  const output=fakeElement("button",{"aria-label":"下载文件"});
+  const root=fakeElement("div",{},[
+    fakeElement("section",{"data-message-author-role":"user"},[fakeText("input.txt"),upload]),
+    fakeElement("section",{"data-message-author-role":"assistant"},[fakeText("input.txt"),output])
+  ]);
+  const captured=[];
+  c.captureArtifactFromDownloadButton=async button=>{captured.push(button);return{id:"edited-file"};};
+  const result=await c.collectDownloadArtifacts(root,{syncJobId:"input-output-scope"});
+  assert.deepEqual(captured,[output]);
+  assert.deepEqual(Array.from(result.artifactIds),["edited-file"]);
+});
+
+test("file capture does not guess the first filename for an ambiguous native download",async()=>{
+  const c=await loadContentScriptContext();
+  const button=fakeElement("button",{"aria-label":"下载文件"});
+  const message=fakeElement("section",{},[fakeText("input.txt result.txt"),button]);
+  assert.equal(c.expectedFilenameForButton(button,message),null);
+});
+
+test("file capture never borrows a sibling card title for an unnamed control",async()=>{
+  const c=await loadContentScriptContext();
+  const a=fakeElement("button",{"aria-label":"下载文件"}),b=fakeElement("button",{"aria-label":"下载文件"});
+  const message=fakeElement("section",{},[
+    fakeElement("div",{},[fakeText("file-a…"),a]),
+    fakeElement("div",{},[fakeElement("span",{title:"b.txt"},[fakeText("file-b…")]),b])
+  ]);
+  assert.equal(c.expectedFilenameForButton(a,message),null);
+  assert.equal(c.expectedFilenameForButton(b,message),"b.txt");
+});
+
+for(const name of ["script.py","clip.mp4"]) test(`file capture trusts explicit filename metadata for ${name}`,async()=>{
+  const c=await loadContentScriptContext();
+  const button=fakeElement("button",{"aria-label":"下载文件"});
+  const card=fakeElement("div",{"data-filename":name},[button]);
+  assert.equal(c.expectedFilenameForButton(button,card),name);
+});
+
+test("file capture cannot borrow a sibling anchor download name",async()=>{
+  const c=await loadContentScriptContext();
+  const button=fakeElement("button",{"aria-label":"下载文件"});
+  const root=fakeElement("section",{},[fakeElement("div",{},[fakeText("unknown…"),button]),
+    fakeElement("a",{href:"https://chatgpt.com/files/b.txt",download:"b.txt"},[fakeText("b.txt")])]);
+  assert.equal(c.expectedFilenameForButton(button,root),null);
+});
+
+test("file capture preserves Download as part of an explicit filename",async()=>{
+  const c=await loadContentScriptContext();
+  const button=fakeElement("button",{"aria-label":"下载文件"});
+  const card=fakeElement("div",{"data-filename":"Download report.txt"},[button]);
+  assert.equal(c.expectedFilenameForButton(button,card),"Download report.txt");
+});
+
+test("file capture permits a same-name link and native control within one explicit card",async()=>{
+  const c=await loadContentScriptContext();
+  const button=fakeElement("button",{"aria-label":"下载文件"});
+  const card=fakeElement("div",{"data-filename":"result.txt"},[
+    fakeElement("a",{href:"https://chatgpt.com/files/result.txt",download:"result.txt"},[fakeText("result.txt")]),button]);
+  assert.equal(c.expectedFilenameForButton(button,card),"result.txt");
+});
+
+test("explicit result link is collected even when native controls and Python filenames coexist",async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;
+  const link=fakeElement("a",{href:"https://chatgpt.com/files/result.txt",download:"result.txt"},[fakeText("下载 result.txt")]);
+  const button=fakeElement("button",{"aria-label":"下载文件","data-filename":"result.txt"});
+  const message=fakeElement("section",{"data-message-author-role":"assistant"},[fakeText("src=input.txt; out=result.txt"),link,button]);
+  let downloads=0,clicks=0;
+  c.downloadArtifactFromAnchor=async a=>{assert.equal(a,link);downloads++;return{filename:"result.txt",contentType:"text/plain",base64Data:"T0s="};};
+  c.captureArtifactFromDownloadButton=async()=>{clicks++;throw new Error("duplicate click");};
+  const result=await c.collectDownloadArtifacts(message,{syncJobId:"explicit-link"});
+  assert.equal(result.artifacts[0]?.filename,"result.txt");
+  assert.equal(downloads,1);
+  assert.equal(clicks,0,"do not reclick the same named file already collected via its link");
+});
+
+test('missing-file recovery collects only its named output and never reconstructs text or images',async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;
+  const a=fakeElement('button',{},[fakeText('下载 a.txt')]),b=fakeElement('button',{},[fakeText('下载 b.txt')]);
+  const root=fakeElement('section',{},[a,b]);
+  c.generatedTextArtifactsFromMessage=()=>assert.fail('must not reconstruct a missing original');
+  c.collectImageArtifacts=()=>assert.fail('must not collect images');
+  const clicked=[];
+  c.captureArtifactFromDownloadButton=async control=>{clicked.push(control);return{id:'b-artifact',filename:'b.txt'};};
+  const result=await c.collectDownloadArtifacts(root,{onlyFilenames:['b.txt'],syncJobId:'sync_missing'});
+  assert.deepEqual(clicked,[b]);assert.deepEqual(Array.from(result.artifactIds),['b-artifact']);
+});
+
+test('missing-file recovery downloads an already-open preview from a native source control',async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;c.sleep=async()=>{};
+  const source=fakeElement('button',{'aria-label':'下载文件','data-filename':'b.txt'});
+  source.click=()=>assert.fail('matching preview is already open');
+  const download=fakeElement('button',{'aria-label':'下载'});
+  const panel=fakeElement('div',{},[fakeText('Library / b.txt'),download,fakeElement('button',{'aria-label':'Close'})]);
+  c.document.querySelectorAll=selector=>panel.querySelectorAll(selector);
+  let clicked=false;download.click=()=>{clicked=true;};
+  c.bridgeApi=async()=>({job:{id:'sync_recovery',status:'running'}});
+  c.chromeRuntimeMessage=async r=>r.type==='bridge:startDownloadWatch'?{ok:true,watchId:'watch'}:
+    new Promise(resolve=>setImmediate(()=>resolve(clicked?{ok:true,artifact:{id:'b'}}:{ok:false,error:'preview download was not clicked'})));
+  assert.equal((await c.captureArtifactFromDownloadButtonAttempt(source,{syncJobId:'sync_recovery',preferExistingPreview:true})).id,'b');
+});
+
+test('missing-file recovery cannot enter the send path with a missing original anchor',async()=>{
+  const c=await loadContentScriptContext();c.syncJobStillActive=async()=>true;
+  c.waitForComposer=()=>assert.fail('capture-only must never look for a composer');
+  c.ensureExpectedChatGptPage=()=>true;
+  await assert.rejects(c.processJob({id:'sync_missing',recoverySourceJobId:'parent',recoveryFilenames:['b.txt'],payloadText:'old prompt'}),e=>e.errorCode==='capture_only_invalid');
+});
+
+test('missing-file recovery reads the original stable turn without sending or uploading',async()=>{
+  const c=await loadContentScriptContext();c.syncJobStillActive=async()=>true;c.ensureExpectedChatGptPage=()=>true;
+  const answer={textContent:'existing reply'};
+  c.lastAssistantMessage=options=>{assert.equal(options.afterUserTurnId,'original');return answer;};
+  c.visibleReplyTextFromAssistant=()=> 'existing reply';
+  c.waitForComposer=()=>assert.fail('must not send');c.uploadInputArtifacts=()=>assert.fail('must not upload');
+  let captured=0;
+  c.completeAssistantReplyOnce=async(job,node,text)=>{assert.equal(node,answer);assert.equal(text,'existing reply');captured++;};
+  await c.processJob({id:'sync_missing',recoverySourceJobId:'parent',recoveryFilenames:['b.txt'],sentAt:new Date().toISOString(),submittedPromptTurnId:'original',payloadText:'old prompt'});
+  assert.equal(captured,1);
+});
+
+test("explicit download label wins over ambiguous surrounding code",async()=>{
+  const c=await loadContentScriptContext();
+  const result=fakeElement("button",{},[fakeText("下载 result.txt")]);
+  const a=fakeElement("button",{"aria-label":"下载文件"});
+  const b=fakeElement("button",{"aria-label":"下载文件"});
+  const message=fakeElement("section",{},[fakeText("input.txt result.txt"),result,a,b]);
+  assert.equal(c.expectedFilenameForButton(result,message),"result.txt");
+});
+
+test("explicit link falls back to its own scoped click if direct fetching fails",async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;
+  const link=fakeElement("a",{href:"sandbox:/mnt/data/result.txt"},[fakeText("下载 result.txt")]);
+  const native=fakeElement("button",{"aria-label":"下载文件","data-filename":"result.txt"});
+  const message=fakeElement("section",{},[link,native]);
+  let clicks=0;
+  c.downloadArtifactFromAnchor=async()=>{throw new Error("unsupported URL scheme");};
+  c.captureArtifactFromDownloadButton=async control=>{assert.equal(control,link);clicks++;return{id:"existing-output",filename:"result.txt"};};
+  const result=await c.collectDownloadArtifacts(message,{syncJobId:"explicit-link-fallback"});
+  assert.deepEqual(Array.from(result.artifactIds),["existing-output"]);
+  assert.equal(clicks,1);
+});
+
+test("explicit text link returning HTML falls back without suppressing its native file",async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;
+  const link=fakeElement("a",{href:"https://chatgpt.com/files/result.txt",download:"result.txt"},[fakeText("下载 result.txt")]);
+  const native=fakeElement("button",{"aria-label":"下载文件","data-filename":"result.txt"});
+  const message=fakeElement("section",{},[link,native]);
+  c.fetch=async()=>({ok:true,url:"https://chatgpt.com/auth/login",headers:{get:name=>name==="content-type"?"text/html; charset=utf-8":null},arrayBuffer:async()=>Buffer.from("<html>Sign in</html>")});
+  const clicks=[];
+  c.captureArtifactFromDownloadButton=async control=>{clicks.push(control);if(control===link)throw new Error("link did not download");return{id:"real-output",filename:"result.txt"};};
+  const result=await c.collectDownloadArtifacts(message,{syncJobId:"html-mismatch"});
+  assert.equal(result.artifacts.length,0);
+  assert.deepEqual(Array.from(result.artifactIds),["real-output"]);
+  assert.deepEqual(clicks,[link,native]);
+});
+
+test("explicit file link follows the matching library preview download in the same watch",async()=>{
+  const c=await loadContentScriptContext(); c.isVisibleElement=()=>true;c.sleep=async()=>{};
+  const link=fakeElement("button",{},[fakeText("下载 result.txt")]);
+  const message=fakeElement("section",{"data-message-author-role":"assistant"},[link]);
+  const download=fakeElement("button",{"aria-label":"下载"});
+  const close=fakeElement("button",{"aria-label":"关闭"});
+  const panel=fakeElement("div",{},[fakeText("资料库 / result.txt"),download,close]);
+  let shown=false,received=false,watches=0;
+  c.document.querySelectorAll=selector=>shown?panel.querySelectorAll(selector):[];
+  const captured=Promise.withResolvers();
+  link.click=()=>{shown=true;};download.click=()=>{received=true;captured.resolve({ok:true,artifact:{id:"real-file",filename:"result.txt"}});};
+  c.canAskBackgroundForDownloads=()=>false;
+  c.bridgeApi=async()=>({job:{id:"sync_preview",status:"running"}});
+  c.chromeRuntimeMessage=async request=>{
+    if(request.type==="bridge:startDownloadWatch"){watches++;return{ok:true,watchId:"one-watch"};}
+    if(request.type==="bridge:awaitDownloadWatch")return captured.promise;
+    throw new Error(request.type);
+  };
+  const artifact=await c.captureArtifactFromDownloadButtonAttempt(link,{messageNode:message,syncJobId:"sync_preview"});
+  assert.equal(artifact.id,"real-file");assert.equal(watches,1);
+});
+
+test("explicit HTML file downloads remain supported",async()=>{
+  const c=await loadContentScriptContext();
+  const link=fakeElement("a",{href:"https://chatgpt.com/files/report.html",download:"report.html"},[fakeText("下载 report.html")]);
+  c.fetch=async()=>({ok:true,url:link.getAttribute("href"),headers:{get:name=>name==="content-type"?"text/html":null},arrayBuffer:async()=>Buffer.from("<html>Report</html>")});
+  assert.equal((await c.downloadArtifactFromAnchor(link)).filename,"report.html");
+});
+
+for (const scenario of ["different-file","body-mention","unsupported-title","chat-turn","modern-turn","turn-container","two-previews","cancelled","offline","changed-during-check","navigated"]) {
+  test(`library preview download refuses unsafe second click: ${scenario}`,async()=>{
+    const c=await loadContentScriptContext();c.isVisibleElement=()=>true;c.sleep=async()=>{};
+    const source=fakeElement("button",{},[fakeText("下载 result.txt")]);
+    const download=fakeElement("button",{"aria-label":"下载"});
+    const close=fakeElement("button",{"aria-label":"关闭"});
+    const title=scenario==="different-file"?"other.txt":scenario==="body-mention"?"other.txt result.txt":scenario==="unsupported-title"?"other.py result.txt":"result.txt";
+    const attrs=scenario==="chat-turn"?{"data-message-author-role":"assistant"}:scenario==="modern-turn"?{"data-turn":"assistant"}:scenario==="turn-container"?{"data-turn-id-container":"other-turn"}:{};
+    const panel=fakeElement("div",attrs,[fakeText(`资料库 / ${title}`),download,close]);
+    const secondDownload=fakeElement("button",{"aria-label":"下载"});
+    const second=fakeElement("div",{},[fakeText("Library / result.txt"),secondDownload,fakeElement("button",{"aria-label":"Close"})]);
+    let changed=false,clicks=0;
+    c.document.querySelectorAll=selector=>changed?[]:[...panel.querySelectorAll(selector),...(scenario==="two-previews"?second.querySelectorAll(selector):[])];
+    download.click=()=>{clicks++;};secondDownload.click=()=>{clicks++;};
+    c.canAskBackgroundForDownloads=()=>false;
+    c.bridgeApi=async()=>{
+      if(scenario==="offline")throw new Error("offline");
+      if(scenario==="changed-during-check")changed=true;
+      if(scenario==="navigated")c.location.href="https://chatgpt.com/c/different";
+      return{job:{id:"sync_preview",status:scenario==="cancelled"?"failed":"running"}};
+    };
+    await c.followMatchingLibraryPreview(source,"result.txt",{syncJobId:"sync_preview"});
+    assert.equal(clicks,0);
+  });
+}
+
+test("library preview refuses navigation caused by the original file link",async()=>{
+  const c=await loadContentScriptContext();c.sleep=async()=>{};c.isVisibleElement=()=>true;
+  const source=fakeElement("button",{},[fakeText("下载 result.txt")]);
+  const download=fakeElement("button",{"aria-label":"下载"});
+  const panel=fakeElement("div",{},[fakeText("Library / result.txt"),download,fakeElement("button",{"aria-label":"Close"})]);
+  let clicks=0;
+  source.click=()=>{c.location.href="https://chatgpt.com/c/foreign";};download.click=()=>{clicks++;};
+  c.document.querySelectorAll=selector=>panel.querySelectorAll(selector);
+  c.canAskBackgroundForDownloads=()=>false;
+  c.bridgeApi=async()=>({job:{id:"sync_preview",status:"running"}});
+  c.chromeRuntimeMessage=async r=>r.type==="bridge:startDownloadWatch"?{ok:true,watchId:"watch"}:{ok:false,error:"No download event"};
+  await assert.rejects(c.captureArtifactFromDownloadButtonAttempt(source,{syncJobId:"sync_preview"}),/No download event/);
+  assert.equal(clicks,0);
+});
+
+for(const scenario of ["late-preview","remounted-button"]){
+  test(`library preview continues waiting for the same file: ${scenario}`,async()=>{
+    const c=await loadContentScriptContext();c.isVisibleElement=()=>true;
+    const source=fakeElement('button',{},[fakeText('下载 result.txt')]);
+    const first=fakeElement('button',{'aria-label':'下载'});
+    const second=fakeElement('button',{'aria-label':'下载'});
+    const panel=button=>fakeElement('div',{},[fakeText('资料库 / result.txt'),button,fakeElement('button',{'aria-label':'关闭'})]);
+    const original=panel(first),replacement=panel(second);
+    let sleeps=0,checks=0,remounted=false,clicked=0;
+    c.sleep=async()=>{sleeps++;};
+    c.document.querySelectorAll=selector=>scenario==='late-preview'&&sleeps<25?[]:(remounted?replacement:original).querySelectorAll(selector);
+    first.click=()=>{assert.equal(remounted,false);clicked++;};second.click=()=>{clicked++;};
+    c.bridgeApi=async()=>{checks++;if(scenario==='remounted-button')remounted=true;return{job:{id:'sync_preview',status:'running'}};};
+    await c.followMatchingLibraryPreview(source,'result.txt',{syncJobId:'sync_preview',timeoutMs:5000});
+    assert.equal(clicked,1);assert.ok(checks>=1);
+  });
+}
+
+for(const duringCheck of [false,true]){
+  test(`library preview stops when its download watch settles (during check=${duringCheck})`,async()=>{
+    const c=await loadContentScriptContext();c.isVisibleElement=()=>true;c.sleep=async()=>{};
+    const source=fakeElement('button',{},[fakeText('下载 result.txt')]);
+    const download=fakeElement('button',{'aria-label':'下载'});
+    const panel=fakeElement('div',{},[fakeText('Library / result.txt'),download,fakeElement('button',{'aria-label':'Close'})]);
+    let stopped=!duringCheck,clicks=0;
+    c.document.querySelectorAll=selector=>panel.querySelectorAll(selector);
+    download.click=()=>{clicks++;};
+    c.bridgeApi=async()=>{stopped=true;return{job:{id:'sync_preview',status:'running'}};};
+    await c.followMatchingLibraryPreview(source,'result.txt',{syncJobId:'sync_preview',shouldStop:()=>stopped});
+    assert.equal(clicks,0);
+  });
+}
+
+test('finished download releases capture even when preview status HTTP is stuck',async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;c.sleep=async()=>{};
+  const source=fakeElement('button',{},[fakeText('下载 result.txt')]);source.click=()=>{};
+  const download=fakeElement('button',{'aria-label':'下载'});
+  const panel=fakeElement('div',{},[fakeText('Library / result.txt'),download,fakeElement('button',{'aria-label':'Close'})]);
+  c.document.querySelectorAll=selector=>panel.querySelectorAll(selector);c.canAskBackgroundForDownloads=()=>false;
+  const check=Promise.withResolvers(),entered=Promise.withResolvers(),watch=Promise.withResolvers();
+  let clicks=0,requestOptions;
+  download.click=()=>{clicks++;};
+  c.bridgeApi=async(_path,options)=>{requestOptions=options;entered.resolve();return check.promise;};
+  c.chromeRuntimeMessage=async r=>r.type==='bridge:startDownloadWatch'?{ok:true,watchId:'watch'}:watch.promise;
+  const operation=c.captureArtifactFromDownloadButtonAttempt(source,{syncJobId:'sync_preview',timeoutMs:15000});
+  await entered.promise;
+  watch.resolve({ok:true,artifact:{id:'real-file'}});
+  const outcome=await Promise.race([operation.then(()=> 'captured'),new Promise(resolve=>setImmediate(()=>resolve('hung')))]);
+  check.resolve({job:{id:'sync_preview',status:'running'}});
+  await operation;
+  assert.equal(outcome,'captured');assert.equal(clicks,0);
+  assert.ok(requestOptions.bridgeRequestTimeoutMs>0&&requestOptions.bridgeRequestTimeoutMs<=15000);
+  assert.equal(requestOptions.skipBackgroundOnTimeout,true);
+});
+
+test("explicit labelled download button is not hidden by an unnamed native control",async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;
+  const linkButton=fakeElement("button",{},[fakeText("下载 result.txt")]);
+  const native=fakeElement("button",{"aria-label":"下载文件"});
+  const root=fakeElement("section",{},[fakeText("input.txt result.txt"),linkButton,native]);
+  let clicks=0;
+  c.captureArtifactFromDownloadButton=async button=>{assert.equal(button,linkButton);clicks++;return{id:"output",filename:"result.txt"};};
+  const result=await c.collectDownloadArtifacts(root,{syncJobId:"explicit-control"});
+  assert.deepEqual(Array.from(result.artifactIds),["output"]);assert.equal(clicks,1);
+});
+
+test("explicit upload download links remain excluded from assistant output capture",async()=>{
+  const c=await loadContentScriptContext();c.isVisibleElement=()=>true;
+  const upload=fakeElement("a",{href:"https://chatgpt.com/files/input.txt",download:"input.txt"},[fakeText("下载 input.txt")]);
+  const native=fakeElement("button",{"aria-label":"下载文件","data-filename":"result.txt"});
+  const root=fakeElement("div",{},[fakeElement("section",{"data-message-author-role":"user"},[upload]),fakeElement("section",{"data-message-author-role":"assistant"},[native])]);
+  c.downloadArtifactFromAnchor=async()=>assert.fail("user upload is not an output");
+  c.captureArtifactFromDownloadButton=async button=>{assert.equal(button,native);return{id:"output",filename:"result.txt"};};
+  assert.deepEqual(Array.from((await c.collectDownloadArtifacts(root,{syncJobId:"user-link-filter"})).artifactIds),["output"]);
+});
+
+test("generation failure probe honors a stable anchor despite virtualized history",async()=>{
+  const c=await loadContentScriptContext();
+  c.conversationTurns=()=>[logicalTurn("old-placeholder",null),logicalTurn("own","user","image request"),logicalTurn("answer","assistant","image ready")];
+  assert.equal(c.detectScopedGenerationFailure({afterUserTurnId:"own",afterUserText:"image request"}),null);
+});
+
+test("generation failure probe cannot borrow historical failure when a stable anchor is missing",async()=>{
+  const c=await loadContentScriptContext();
+  c.conversationTurns=()=>[logicalTurn("old","user","same request"),logicalTurn("old-answer","assistant","Something went wrong while generating the response.")];
+  assert.equal(c.detectScopedGenerationFailure({afterUserTurnId:"missing",afterUserText:"same request",includeGenerationFailure:true}),null);
+});
+
+test("generation failure probe still reports the current anchored failure",async()=>{
+  const c=await loadContentScriptContext();
+  c.conversationTurns=()=>[logicalTurn("old-placeholder",null),logicalTurn("own","user","image request"),logicalTurn("answer","assistant","Something went wrong while generating the response.")];
+  assert.equal(c.detectScopedGenerationFailure({afterUserTurnId:"own",afterUserText:"image request"})?.code,"generation_failed");
+});
+
+test("image settling waiter passes stable identity into its failure probe",async()=>{
+  const c=await loadContentScriptContext(), answer=logicalTurn("answer","assistant","已生成图片");
+  c.conversationTurns=()=>[logicalTurn("old-placeholder",null),logicalTurn("own","user","image request"),answer];
+  c.isGenerating=()=>false;
+  c.uniqueGeneratedImageCount=node=>node===answer?1:0;
+  c.hasDownloadableArtifact=()=>false;
+  c.waitForAssistantActivity=async()=>true;
+  let probes=0,now=100000;
+  c.Date=class extends Date { static now(){now+=1000;return now;} };
+  c.assertNoChatGptBlocker=options=>{
+    probes++;
+    const failure=c.detectScopedGenerationFailure(options);
+    if(failure)throw new Error(failure.message);
+  };
+  const reply=await c.waitForAssistantReply("old reply",{afterUserTurnId:"own",afterUserText:"image request",expectedImageCount:1});
+  assert.match(reply,/图片/);
+  assert.ok(probes>0,"exercise the image settling blocker probe, not only stable-ID lookup");
+});
+
+test("stable turn identity follows a remounted prompt, not its old array index or repeated text", async () => {
+  const c = await loadContentScriptContext();
+  const own = logicalTurn("answer-own", "assistant", "CURRENT_OK");
+  const later = logicalTurn("answer-later", "assistant", "WRONG_LATER");
+  const turns = [logicalTurn("prompt-own", "user", "same request"), own,
+    logicalTurn("prompt-later", "user", "same request"), later];
+  c.conversationTurns = () => turns;
+  assert.equal(c.lastAssistantMessage({ afterUserTurnId: "prompt-own", afterUserTurnIndex: 9, afterUserText: "same request", requireAfterUserText: true }), own);
+  assert.deepEqual(Array.from(c.assistantMessagesForReplyScope(9, ["same request"], turns, "prompt-own")), [own]);
+});
+
+test("stable turn identity never falls back to a repeated historical prompt when the anchor is absent", async () => {
+  const c = await loadContentScriptContext();
+  const turns = [logicalTurn("old-prompt", "user", "same request"), logicalTurn("old-answer", "assistant", "OLD")];
+  c.conversationTurns = () => turns;
+  c.assistantMessages = () => [turns[1]];
+  assert.equal(c.lastAssistantMessage({afterUserTurnId:"missing",afterUserTurnIndex:0,afterUserText:"same request"}), null);
+  assert.deepEqual(Array.from(c.assistantMessagesForReplyScope(0,["same request"],turns,"missing")), []);
+});
+
+test("stable turn identity rejects duplicate logical anchors", async () => {
+  const c = await loadContentScriptContext();
+  c.conversationTurns = () => [logicalTurn("duplicate", "user", "one"), logicalTurn("duplicate", "user", "two"), logicalTurn("answer", "assistant", "WRONG")];
+  assert.throws(() => c.lastAssistantMessage({afterUserTurnId:"duplicate",afterUserText:"two"}), e=>e.errorCode==="reply_scope_ambiguous");
+});
+
+test("stable turn identity retains virtualized empty wrappers as scope boundaries", async () => {
+  const c = await loadContentScriptContext();
+  const own = logicalTurn("own-answer", "assistant", "OWN");
+  const turns = [logicalTurn("own-prompt", null),own,logicalTurn("unknown-next",null),logicalTurn("foreign-answer","assistant","FOREIGN")];
+  c.document.querySelectorAll = selector => selector === '[data-turn-id-container]' ? turns : [];
+  assert.deepEqual(Array.from(c.conversationTurns()),turns);
+  assert.equal(c.lastAssistantMessage({afterUserTurnId:"own-prompt"}),own);
+});
+
+test("stable turn identity submission baseline survives index renumbering", async () => {
+  const c = await loadContentScriptContext();
+  const turns = [logicalTurn("old", "user", "same request"), logicalTurn("new", "user", "same request")];
+  const info=c.latestUserPromptTurnInfo(["same request"],{turns,afterTurnIndex:20,initialTurnIds:["old"]});
+  assert.equal(info?.turnId,"new");
+  assert.equal(info?.index,1);
+});
+
+test("stable turn identity is persisted through the sent request and retained locally for recovery", async () => {
+  const c=await loadContentScriptContext(); let sent;
+  const job={id:"stable-sent"};
+  c.bridgeApi=async (_url, options)=>{sent=JSON.parse(options.body);return {job:{...job,...sent}};};
+  await c.markJobSent(job,"previous",{index:3,turnId:"prompt-stable"});
+  assert.equal(sent.submittedPromptTurnId,"prompt-stable");
+  assert.equal(job.submittedPromptTurnId,"prompt-stable");
+});
+
+test("stable turn identity waiter does not accept unscoped text while its anchor is missing", async () => {
+  const c=await loadContentScriptContext(); let appeared=false, waits=0;
+  const own=logicalTurn("own-answer","assistant","CURRENT_OK");
+  c.conversationTurns=()=>appeared?[logicalTurn("own-prompt","user","same"),own]:[];
+  c.assistantMessages=()=>[logicalTurn("old-answer","assistant","WRONG_OLD")];
+  c.isGenerating=()=>false;
+  c.assertNoChatGptBlocker=()=>{};
+  c.effectiveStableTarget=()=>1;
+  c.waitForAssistantActivity=async()=>{waits++;appeared=true;return true;};
+  const result=await c.waitForAssistantReply("previous",{afterUserTurnId:"own-prompt",afterUserTurnIndex:5,afterUserText:"same"});
+  assert.equal(result,"CURRENT_OK");
+  assert.equal(waits,1);
+});
+
+test("stable turn identity recovery refuses historical content and gallery when its prompt is missing",async()=>{
+  const c=await loadContentScriptContext();let completions=0;
+  c.isGenerating=()=>false;c.syncJobStillActive=async()=>true;
+  c.conversationTurns=()=>[logicalTurn("old-prompt","user","same"),logicalTurn("old-answer","assistant","OLD_FINAL_OK")];
+  c.hasUsableAssistantContent=()=>true;
+  c.visibleReplyTextFromAssistant=()=>"OLD_FINAL_OK";
+  c.looksLikePossiblyStreamingReply=()=>false;
+  c.completeAssistantReplyOnce=async()=>{completions++;return true;};
+  const result=await c.captureExistingReply({id:"stable-recovery",sentAt:new Date().toISOString(),payloadText:"same",submittedPromptTurnId:"missing"});
+  assert.equal(result,false);
+  assert.equal(completions,0);
+});
+
+for(const resume of [false,true]) {
+  test(`stable turn identity processJob carries the same anchor into waiting and artifact capture (resume=${resume})`,async()=>{
+    const c=await loadContentScriptContext();
+    const job={id:"stable-pipeline",status:"running",claimedAt:new Date().toISOString(),payloadText:"same request",
+      ...(resume?{sentAt:new Date().toISOString(),submittedPromptTurnId:"own-prompt",submittedPromptTurnIndex:20}:{})};
+    const own=logicalTurn("own-answer","assistant","CURRENT_FINAL_OK");
+    let turns=resume?[logicalTurn("own-prompt","user","same request"),own]:[logicalTurn("older-prompt","user","same request")];
+    const calls=[];let sends=0,captured=null;
+    const composer={value:"",tagName:"TEXTAREA"};
+    c.conversationTurns=()=>turns;c.directUserPromptNodes=()=>[];
+    c.ensureExpectedChatGptPage=()=>true;c.isGenerating=()=>false;
+    c.stopStaleGenerationIfNeeded=async()=>{};c.dismissArtifactPreviewIfNeeded=async()=>{};
+    c.waitForComposer=async()=>composer;c.findComposer=()=>composer;
+    c.preferencesAlreadyApplied=()=>true;c.applyJobPreferences=async()=>{};
+    c.fillComposerText=async(node,text)=>{node.value=text;};c.uploadInputArtifacts=async()=>{};
+    c.waitForReadySendButton=async()=>({});c.generatedImageBaselineKeys=()=>[];
+    c.triggerSendButton=async()=>{sends++;composer.value="";turns=[logicalTurn("own-prompt","user","same request"),own];return {};};
+    c.bridgeApi=async(url,options={})=>{
+      const body=options.body?JSON.parse(options.body):null;calls.push({url,body});
+      return {job:{...job,status:url.endsWith("/complete")?"succeeded":"running"}};
+    };
+    c.waitForAssistantReply=async(_previous,options)=>{
+      assert.equal(options.afterUserTurnId,"own-prompt");
+      turns=[logicalTurn("own-prompt","user","same request"),own,logicalTurn("later-prompt","user","same request"),logicalTurn("later-answer","assistant","WRONG")];
+      return "CURRENT_FINAL_OK";
+    };
+    c.collectDownloadArtifacts=async(scope,options)=>{captured=scope;assert.equal(options.includePageGallery,false);return {artifacts:[],artifactIds:[],errors:[]};};
+    await c.processJob(job,{resume});
+    assert.equal(sends,resume?0:1);
+    assert.equal(captured,own);
+    const sent=calls.find(x=>x.url.endsWith("/sent"));
+    assert.equal(sent?.body.submittedPromptTurnId,resume?undefined:"own-prompt");
+    assert.equal(calls.find(x=>x.url.endsWith("/complete"))?.body.replyText,"CURRENT_FINAL_OK");
+  });
+}
+
+test("stable turn identity capture-only recovery uses its original same-text prompt and disables global gallery",async()=>{
+  const c=await loadContentScriptContext(); const own=logicalTurn("own-answer","assistant","CURRENT_FINAL_OK");
+  c.isGenerating=()=>false;c.syncJobStillActive=async()=>true;
+  c.conversationTurns=()=>[logicalTurn("own-prompt","user","same"),own,logicalTurn("later-prompt","user","same"),logicalTurn("later-answer","assistant","WRONG")];
+  c.hasUsableAssistantContent=()=>true;c.visibleReplyTextFromAssistant=node=>node.textContent;c.looksLikePossiblyStreamingReply=()=>false;
+  c.completeAssistantReplyOnce=async(_job,node,text,options)=>{assert.equal(node,own);assert.equal(text,"CURRENT_FINAL_OK");assert.equal(options.includePageGallery,false);return true;};
+  assert.equal(await c.captureExistingReply({id:"stable-recovery-own",sentAt:new Date().toISOString(),payloadText:"same",submittedPromptTurnId:"own-prompt"}),true);
+});
+
+test("stable turn identity baseline excludes old remounted prompts even when indices grow",async()=>{
+  const c=await loadContentScriptContext();
+  const turns=[logicalTurn("prior","assistant","history"),logicalTurn("old-prompt","user","same request")];
+  assert.equal(c.latestUserPromptTurnInfo(["same request"],{turns,afterTurnIndex:0,initialTurnIds:["prior","old-prompt"]}),null);
+});
+
+test("stable turn identity rejects an empty identity on an explicitly modern container",async()=>{
+  const c=await loadContentScriptContext();
+  c.conversationTurns=()=>[logicalTurn("","user","same"),logicalTurn("a","assistant","WRONG")];
+  assert.throws(()=>c.lastAssistantMessage({afterUserTurnId:"target"}),e=>e.errorCode==="reply_scope_ambiguous");
+});
+
+test("stable turn identity does not bind an unidentified answer or partially identified submission baseline",async()=>{
+  const c=await loadContentScriptContext();
+  const unidentified=fakeElement("section",{"data-message-author-role":"assistant"},[fakeText("UNPROVEN")]);
+  const turns=[logicalTurn("own-prompt","user","same"),unidentified];
+  c.conversationTurns=()=>turns;
+  assert.equal(c.lastAssistantMessage({afterUserTurnId:"own-prompt"}),null);
+  assert.throws(()=>c.submissionTurnBaseline(turns),e=>e.errorCode==="reply_scope_ambiguous");
+});
+
+test("stable turn identity ignores only duplicate nested wrappers of the same identity",async()=>{
+  const c=await loadContentScriptContext();
+  const outer=logicalTurn("one","user","prompt");
+  const inner=logicalTurn("one",null);
+  inner.parentElement={closest:()=>outer};
+  const different=logicalTurn("two","assistant","answer");
+  different.parentElement={closest:()=>outer};
+  c.document.querySelectorAll=selector=>selector==='[data-turn-id-container]'?[outer,inner,different]:[];
+  assert.deepEqual(Array.from(c.conversationTurns()),[outer,different]);
+});
+
+test("stable turn identity submission refuses two new same-text prompts instead of choosing the last",async()=>{
+  const c=await loadContentScriptContext();
+  const turns=[logicalTurn("new-one","user","same"),logicalTurn("new-two","user","same")];
+  assert.throws(()=>c.latestUserPromptTurnInfo(["same"],{turns,initialTurnIds:[],afterTurnIndex:-1}),e=>e.errorCode==="reply_scope_ambiguous");
+});
+
+test("stable turn identity confirmation does not turn a cleared composer into proof of a new message",async()=>{
+  const c=await loadContentScriptContext();let now=1000;
+  c.Date=class extends Date {static now(){return now;}};
+  c.conversationTurns=()=>[logicalTurn("old","user","same")];
+  c.directUserPromptNodes=()=>[];c.isGenerating=()=>true;c.assertNoChatGptBlocker=()=>{};
+  c.waitForAssistantActivity=async()=>{now+=500;return true;};
+  await assert.rejects(c.waitForSubmittedPrompt({id:"confirm",payloadText:"same"},100,{composer:{tagName:"TEXTAREA",value:""},afterTurnIndex:0,initialTurnIds:["old"]}),e=>e.errorCode==="send_not_confirmed");
+});
+
+test("scope hardening keeps an empty stable baseline in identity-confirmation mode",async()=>{
+  const c=await loadContentScriptContext();let now=1000;
+  c.Date=class extends Date {static now(){return now;}};
+  c.conversationTurns=()=>[];c.directUserPromptNodes=()=>[];
+  c.isGenerating=()=>true;c.assertNoChatGptBlocker=()=>{};
+  c.waitForAssistantActivity=async()=>{now+=500;return true;};
+  await assert.rejects(c.waitForSubmittedPrompt({id:"empty-baseline",payloadText:"new"},100,
+    {composer:{tagName:"TEXTAREA",value:""},afterTurnIndex:-1,initialTurnIds:[],afterUserMessageCount:0}),e=>e.errorCode==="send_not_confirmed");
+});
+
+test("scope hardening stops legacy index replies at the next user turn",async()=>{
+  const c=await loadContentScriptContext();
+  const user=text=>fakeElement("section",{},[fakeElement("div",{"data-message-author-role":"user"},[fakeText(text)])]);
+  const answer=text=>fakeElement("section",{},[fakeElement("div",{"data-message-author-role":"assistant"},[fakeText(text)])]);
+  const own=answer("OWN_REPLY"),other=answer("WRONG_OTHER");
+  const turns=[user("own prompt"),own,user("next prompt"),other];c.conversationTurns=()=>turns;
+  assert.deepEqual(Array.from(c.assistantTurnsAfterTurnIndex(0,turns)),[own]);
+  assert.equal(c.lastAssistantMessage({afterUserTurnIndex:0,afterUserText:"own prompt",requireAfterUserText:true}),own);
+});
+
+for (const nextPrompt of ["next prompt", "own prompt"]) test(`scope hardening does not fall through to a later response when a legacy prompt has no answer (${nextPrompt})`,async()=>{
+  const c=await loadContentScriptContext();let waits=0;
+  const user=text=>fakeElement("section",{},[fakeElement("div",{"data-message-author-role":"user"},[fakeText(text)])]);
+  const foreign=fakeElement("section",{},[fakeElement("div",{"data-message-author-role":"assistant"},[fakeText("WRONG_OTHER_REPLY")])]);
+  c.conversationTurns=()=>[user("own prompt"),user(nextPrompt),foreign];
+  c.assistantMessages=()=>[foreign];c.isGenerating=()=>false;c.effectiveStableTarget=()=>1;c.assertNoChatGptBlocker=()=>{};
+  c.waitForAssistantActivity=async()=>{waits++;throw Object.assign(new Error("scope still unavailable"),{code:"TEST_END"});};
+  await assert.rejects(c.waitForAssistantReply("previous",{afterUserTurnIndex:0,afterUserText:"own prompt"}),
+    e=>nextPrompt==="own prompt"?e.errorCode==="reply_scope_ambiguous":e.code==="TEST_END");
+  assert.equal(waits,nextPrompt==="own prompt"?0:1);
+});
+
+test("scope hardening confirms an actual new identity after an initially empty page",async()=>{
+  const c=await loadContentScriptContext();let now=1000,visible=false,waits=0;
+  c.Date=class extends Date {static now(){return now;}};
+  c.conversationTurns=()=>visible?[logicalTurn("new-visible","user","new prompt")]:[];
+  c.directUserPromptNodes=()=>[];c.isGenerating=()=>true;c.assertNoChatGptBlocker=()=>{};
+  c.waitForAssistantActivity=async()=>{now+=20;visible=true;waits++;return true;};
+  const result=await c.waitForSubmittedPrompt({id:"empty-then-visible",payloadText:"new prompt"},100,
+    {composer:{tagName:"TEXTAREA",value:""},afterTurnIndex:-1,initialTurnIds:[],afterUserMessageCount:0});
+  assert.equal(result.turnId,"new-visible");assert.equal(result.fallback,undefined);assert.equal(waits,1);
+});
+
+function legacyTurn(role,text) {
+  return fakeElement("section",{},[fakeElement("div",{"data-message-author-role":role},[fakeText(text)])]);
+}
+
+test("legacy unique prompt ignores a stale index pointing at a different user's question",async()=>{
+  const c=await loadContentScriptContext();
+  const wrong=legacyTurn("assistant","WRONG"),right=legacyTurn("assistant","RIGHT");
+  const turns=[legacyTurn("user","other question"),wrong,legacyTurn("user","actual question"),right];c.conversationTurns=()=>turns;
+  assert.equal(c.lastAssistantMessage({afterUserTurnIndex:0,afterUserText:"actual question",requireAfterUserText:true}),right);
+  assert.deepEqual(Array.from(c.assistantMessagesForReplyScope(0,["actual question"],turns)),[right]);
+});
+
+test("legacy unique prompt rejects duplicate matching questions even when an old index looks valid",async()=>{
+  const c=await loadContentScriptContext();
+  const turns=[legacyTurn("user","same question"),legacyTurn("assistant","FIRST"),legacyTurn("user","same question"),legacyTurn("assistant","LATER")];c.conversationTurns=()=>turns;
+  for(const index of [undefined,0,9]) {
+    assert.throws(()=>c.lastAssistantMessage({afterUserTurnIndex:index,afterUserText:"same question",requireAfterUserText:true}),e=>e.errorCode==="reply_scope_ambiguous");
+    assert.throws(()=>c.assistantMessagesForReplyScope(index,["same question"],turns),e=>e.errorCode==="reply_scope_ambiguous");
+  }
+});
+
+test("legacy unique prompt does not return indexed content when the requested question is absent",async()=>{
+  const c=await loadContentScriptContext();const turns=[legacyTurn("user","other"),legacyTurn("assistant","WRONG")];c.conversationTurns=()=>turns;
+  assert.equal(c.lastAssistantMessage({afterUserTurnIndex:0,afterUserText:"missing",requireAfterUserText:true}),null);
+  assert.deepEqual(Array.from(c.assistantMessagesForReplyScope(0,["missing"],turns)),[]);
+});
+
+test("legacy full prompt rejects a different request sharing the first eighty characters",async()=>{
+  const c=await loadContentScriptContext();const prefix="Common instruction. ".repeat(8);
+  c.conversationTurns=()=>[legacyTurn("user",prefix+"task A"),legacyTurn("assistant","WRONG")];
+  assert.equal(c.lastAssistantMessage({afterUserText:prefix+"task B",requireAfterUserText:true}),null);
+});
+
+test("legacy full prompt never treats a filename-only overlap as proof of the request",async()=>{
+  const c=await loadContentScriptContext();
+  c.conversationTurns=()=>[legacyTurn("user","Delete the file report.csv"),legacyTurn("assistant","WRONG")];
+  assert.equal(c.lastAssistantMessage({afterUserTexts:["Summarize report.csv","report.csv"],requireAfterUserText:true}),null);
+});
+
+test("legacy full prompt refuses to claim uniqueness when earlier history is virtualized",async()=>{
+  const c=await loadContentScriptContext();
+  c.conversationTurns=()=>[logicalTurn("hidden-earlier",null),logicalTurn("visible-later","user","same question"),logicalTurn("visible-reply","assistant","WRONG")];
+  assert.throws(()=>c.lastAssistantMessage({afterUserText:"same question",requireAfterUserText:true}),e=>e.errorCode==="reply_scope_ambiguous");
+});
+
+test("stable turn identity supports modern data-turn roles without legacy author-role attributes",async()=>{
+  const c=await loadContentScriptContext();
+  const user=fakeElement("section",{"data-turn-id":"modern-user","data-turn":"user"},[fakeText("same")]);
+  const reply=fakeElement("section",{"data-turn-id":"modern-answer","data-turn":"assistant"},[fakeText("same")]);
+  c.conversationTurns=()=>[user,reply];
+  assert.equal(c.lastAssistantMessage({afterUserTurnId:"modern-user"}),reply);
+  assert.equal(c.latestUserPromptTurnInfo(["same"],{turns:[user,reply],initialTurnIds:["modern-user"],afterTurnIndex:0}),null);
+});
+
+test("stable turn identity supports modern roles inside persistent identity wrappers",async()=>{
+  const c=await loadContentScriptContext();
+  const user=fakeElement("div",{"data-turn-id-container":"modern-user"},[fakeElement("section",{"data-turn":"user"},[fakeText("prompt")])]);
+  const reply=fakeElement("div",{"data-turn-id-container":"modern-answer"},[fakeElement("section",{"data-turn":"assistant"},[fakeText("reply")])]);
+  c.conversationTurns=()=>[user,reply];
+  assert.equal(c.lastAssistantMessage({afterUserTurnId:"modern-user"}),reply);
+});
+
 test("pre-send preparation has a hard timeout", async () => {
   const context = await loadContentScriptContext();
 
+  assert.equal(context.preSendTimeoutMs({}), 30_000);
   await assert.rejects(
     () => context.withPreSendTimeout(
       { id: "sync_pre_send_timeout", _bridgePreSendTimeoutMs: 1 },
@@ -58,18 +1251,128 @@ test("pre-send preparation has a hard timeout", async () => {
   );
 });
 
+test("reply waiting uses activity-aware idle expiry with an enlarged hard ceiling", async () => {
+  const context = await loadContentScriptContext();
+  const limits = context.responseWaitLimits();
+
+  assert.equal(limits.idleTimeoutMs, 15 * 60_000);
+  assert.equal(limits.hardTimeoutMs, 45 * 60_000);
+  assert.equal(
+    context.responseWaitExpired({
+      startedAt: 0,
+      lastActivityAt: 0,
+      now: 20 * 60_000,
+      pageStillGenerating: true
+    }),
+    false,
+    "visible generation must keep the reply wait alive past the idle window"
+  );
+  assert.equal(
+    context.responseWaitExpired({
+      startedAt: 0,
+      lastActivityAt: 10 * 60_000,
+      now: 20 * 60_000,
+      pageStillGenerating: false
+    }),
+    false,
+    "recent reply progress must renew the idle window"
+  );
+  assert.equal(
+    context.responseWaitExpired({
+      startedAt: 0,
+      lastActivityAt: 0,
+      now: 15 * 60_000,
+      pageStillGenerating: false
+    }),
+    true,
+    "a genuinely idle page must eventually expire"
+  );
+  assert.equal(
+    context.responseWaitExpired({
+      startedAt: 0,
+      lastActivityAt: 44 * 60_000,
+      now: 45 * 60_000,
+      pageStillGenerating: true
+    }),
+    true,
+    "the hard ceiling must still stop a permanently stuck page"
+  );
+});
+
+test("content script expires a claimed unsent job before another refresh cycle can block the queue", async () => {
+  const context = await loadContentScriptContext();
+  const claimedAt = new Date(Date.now() - 61_000).toISOString();
+  context.document.querySelector = () => {
+    throw new Error("expired unsent job must not touch the GPT composer");
+  };
+  context.bridgeApi = async (path) => {
+    if (path === "/api/sync/jobs/sync_expired_unsent") {
+      return {
+        job: {
+          id: "sync_expired_unsent",
+          status: "running",
+          claimedAt,
+          sentAt: null
+        }
+      };
+    }
+    throw new Error(`Unexpected bridge call: ${path}`);
+  };
+
+  await assert.rejects(
+    () =>
+      context.processJob({
+        id: "sync_expired_unsent",
+        status: "running",
+        claimedAt,
+        sentAt: null,
+        payloadText: "must not stay at the head of the queue",
+        _bridgePreSendTimeoutMs: 1
+      }),
+    (error) => {
+      assert.equal(error.errorCode, "pre_send_expired");
+      assert.equal(error.recoveryAction, "retry");
+      return true;
+    }
+  );
+});
+
 test("content script preserves structured Bridge API errors", async () => {
   const context = await loadContentScriptContext();
-  context.fetch = async () => ({
-    ok: false,
-    status: 409,
-    async text() {
-      return JSON.stringify({
-        error: "GPT reply is still streaming or interrupted",
-        code: "interim_chatgpt_reply"
-      });
+  const calls = [];
+  context.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).endsWith("/api/config")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { apiToken: "extension-session-token" };
+        }
+      };
     }
-  });
+    if (!options.headers?.["X-Bridge-Token"]) {
+      return {
+        ok: false,
+        status: 401,
+        async text() {
+          return JSON.stringify({
+            error: "Bridge API token is required"
+          });
+        }
+      };
+    }
+    return {
+      ok: false,
+      status: 409,
+      async text() {
+        return JSON.stringify({
+          error: "GPT reply is still streaming or interrupted",
+          code: "interim_chatgpt_reply"
+        });
+      }
+    };
+  };
 
   await assert.rejects(
     () => context.bridgeApi("/api/sync/jobs/sync_interim/complete", { method: "POST" }),
@@ -80,11 +1383,644 @@ test("content script preserves structured Bridge API errors", async () => {
       return true;
     }
   );
+  assert.equal(calls.length, 3);
+  assert.match(calls[0].url, /\/api\/sync\/jobs\/sync_interim\/complete$/);
+  assert.match(calls[1].url, /\/api\/config$/);
+  assert.equal(calls[2].options.headers["X-Bridge-Token"], "extension-session-token");
+});
+
+test("content script reads one full-page text surface instead of duplicating a long conversation", async () => {
+  const context = await loadContentScriptContext();
+  const reads = {
+    bodyInnerText: 0,
+    bodyTextContent: 0,
+    documentInnerText: 0,
+    documentTextContent: 0
+  };
+
+  context.document.body = {
+    get innerText() {
+      reads.bodyInnerText += 1;
+      return "the complete long conversation";
+    },
+    get textContent() {
+      reads.bodyTextContent += 1;
+      return "duplicate body conversation";
+    }
+  };
+  context.document.documentElement = {
+    get innerText() {
+      reads.documentInnerText += 1;
+      return "duplicate document conversation";
+    },
+    get textContent() {
+      reads.documentTextContent += 1;
+      return "another duplicate document conversation";
+    }
+  };
+  context.document.title = "Bound conversation";
+
+  assert.equal(context.pageTextSnapshot(), "the complete long conversation");
+  assert.deepEqual(reads, {
+    bodyInnerText: 1,
+    bodyTextContent: 0,
+    documentInnerText: 0,
+    documentTextContent: 0
+  });
+});
+
+test("content script sends a lightweight heartbeat without scanning the page while a job is busy", async () => {
+  const context = await loadContentScriptContext();
+  let fullPageReads = 0;
+  let heartbeatBody = null;
+
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat"
+  };
+  context.document.title = "Bound conversation";
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a very long generated answer";
+    },
+    get textContent() {
+      fullPageReads += 1;
+      return "a very long generated answer";
+    }
+  };
+  context.document.documentElement = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a very long generated answer";
+    },
+    get textContent() {
+      fullPageReads += 1;
+      return "a very long generated answer";
+    }
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    assert.equal(path, "/api/extension/heartbeat");
+    heartbeatBody = JSON.parse(options.body);
+    return {};
+  };
+
+  await context.sendHeartbeat({ lightweight: true });
+
+  assert.equal(fullPageReads, 0);
+  assert.deepEqual(heartbeatBody.pageStatus, {
+    state: "working",
+    code: "bridge_busy",
+    recoveryAction: "wait_for_bridge",
+    message: "Bridge is processing the current GPT job."
+  });
+});
+
+test("content script lightweight heartbeat reports active generation without reading conversation text", async () => {
+  const context = await loadContentScriptContext();
+  let fullPageReads = 0;
+  let heartbeatBody = null;
+  const stopButton = {
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      if (name === "aria-label") return "Stop generating";
+      return null;
+    },
+    getClientRects() {
+      return [{}];
+    }
+  };
+
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat"
+  };
+  context.document.title = "Bound conversation";
+  context.document.querySelectorAll = () => [stopButton];
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "streaming response text";
+    },
+    get textContent() {
+      fullPageReads += 1;
+      return "streaming response text";
+    }
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    assert.equal(path, "/api/extension/heartbeat");
+    heartbeatBody = JSON.parse(options.body);
+    return {};
+  };
+
+  await context.sendHeartbeat({ lightweight: true });
+
+  assert.equal(fullPageReads, 0);
+  assert.equal(heartbeatBody.pageStatus.state, "working");
+  assert.equal(heartbeatBody.pageStatus.code, "active_generation");
+  assert.equal(heartbeatBody.pageStatus.recoveryAction, "wait_for_generation");
+});
+
+test("content script does not scan the full conversation when the normal composer is ready", async () => {
+  const context = await loadContentScriptContext();
+  let fullPageReads = 0;
+  const composer = {
+    disabled: false,
+    getClientRects() {
+      return [{}];
+    }
+  };
+
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat",
+    pathname: "/c/bound-chat"
+  };
+  context.document.querySelector = (selector) => {
+    if (selector === "#prompt-textarea") return composer;
+    return null;
+  };
+  context.document.querySelectorAll = () => [];
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a very long completed conversation";
+    },
+    get textContent() {
+      fullPageReads += 1;
+      return "a very long completed conversation";
+    }
+  };
+
+  const status = context.currentPageStatus();
+  assert.equal(status.state, "ready");
+  assert.equal(status.code, "ready");
+  assert.equal(status.message, "GPT 页面已就绪。");
+  assert.equal(fullPageReads, 0);
+});
+
+test("content script reuses one page text snapshot while classifying a missing composer", async () => {
+  const context = await loadContentScriptContext();
+  let fullPageReads = 0;
+
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat",
+    pathname: "/c/bound-chat"
+  };
+  context.document.title = "Bound conversation";
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = () => [];
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a very long completed conversation without a visible composer";
+    },
+    get textContent() {
+      fullPageReads += 1;
+      return "duplicate long conversation";
+    }
+  };
+
+  const status = context.currentPageStatus();
+
+  assert.equal(status.state, "warning");
+  assert.equal(status.code, "composer_missing");
+  assert.equal(fullPageReads, 1);
+});
+
+test("composer waiting skips blocker rescans until the page changes", async () => {
+  const context = await loadContentScriptContext();
+  let composerVisible = false;
+  let activityWaits = 0;
+  let fullPageReads = 0;
+  const composer = { tagName: "TEXTAREA", disabled: false };
+  const activityWake = async () => {
+    activityWaits += 1;
+    if (activityWaits === 1) {
+      return false;
+    }
+    if (activityWaits === 2) {
+      composerVisible = true;
+      return true;
+    }
+    throw new Error("composer wait did not react to the page change");
+  };
+
+  context.document.documentElement = { nodeName: "HTML" };
+  context.MutationObserver = class {
+    observe() {}
+  };
+  context.sleep = activityWake;
+  context.waitForAssistantActivity = activityWake;
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a normal bound conversation";
+    }
+  };
+  context.document.querySelector = (selector) =>
+    selector === "#prompt-textarea" && composerVisible ? composer : null;
+  context.document.querySelectorAll = () => [];
+
+  assert.equal(await context.waitForComposer(2_000), composer);
+  assert.equal(activityWaits, 2);
+  assert.equal(fullPageReads, 2);
+});
+
+test("composer waiting keeps polling blockers when DOM observation is unavailable", async () => {
+  const context = await loadContentScriptContext();
+  let pageBlocked = false;
+  let sleepCalls = 0;
+  let fullPageReads = 0;
+
+  context.sleep = async () => {
+    sleepCalls += 1;
+    pageBlocked = true;
+  };
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return pageBlocked ? "Cloudflare: verify you are human" : "a normal bound conversation";
+    }
+  };
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = () => [];
+
+  await assert.rejects(
+    () => context.waitForComposer(2_000),
+    (error) => error?.errorCode === "human_verification"
+  );
+  assert.equal(sleepCalls, 1);
+  assert.equal(fullPageReads, 2);
+});
+
+test("send button waiting skips blocker rescans until the page changes", async () => {
+  const context = await loadContentScriptContext();
+  let sendButtonReady = false;
+  let activityWaits = 0;
+  let fullPageReads = 0;
+  const sendButton = {
+    get disabled() {
+      return !sendButtonReady;
+    },
+    getAttribute() {
+      return null;
+    }
+  };
+  const activityWake = async () => {
+    activityWaits += 1;
+    if (activityWaits === 1) {
+      return false;
+    }
+    if (activityWaits === 2) {
+      sendButtonReady = true;
+      return true;
+    }
+    throw new Error("send button wait did not react to the page change");
+  };
+
+  context.document.documentElement = { nodeName: "HTML" };
+  context.MutationObserver = class {
+    observe() {}
+  };
+  context.sleep = activityWake;
+  context.waitForAssistantActivity = activityWake;
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a normal bound conversation";
+    }
+  };
+  context.document.querySelector = (selector) =>
+    selector === 'button[data-testid="send-button"]' ? sendButton : null;
+  context.document.querySelectorAll = () => [];
+
+  assert.equal(await context.waitForReadySendButton(2_000), sendButton);
+  assert.equal(activityWaits, 2);
+  assert.equal(fullPageReads, 2);
+});
+
+test("send button waiting keeps polling blockers when DOM observation is unavailable", async () => {
+  const context = await loadContentScriptContext();
+  let pageBlocked = false;
+  let sleepCalls = 0;
+  let fullPageReads = 0;
+  const disabledSendButton = {
+    disabled: true,
+    getAttribute() {
+      return null;
+    }
+  };
+
+  context.sleep = async () => {
+    sleepCalls += 1;
+    pageBlocked = true;
+  };
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return pageBlocked ? "Cloudflare: verify you are human" : "a normal bound conversation";
+    }
+  };
+  context.document.querySelector = (selector) =>
+    selector === 'button[data-testid="send-button"]' ? disabledSendButton : null;
+  context.document.querySelectorAll = () => [];
+
+  await assert.rejects(
+    () => context.waitForReadySendButton(2_000),
+    (error) => error?.errorCode === "human_verification"
+  );
+  assert.equal(sleepCalls, 1);
+  assert.equal(fullPageReads, 2);
+});
+
+test("reply waiting does not rescan unchanged page text after idle wakeups", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "Return one complete sentence.";
+  const finalText = "The completed response is available.";
+  let idleWakeups = 0;
+  let fullPageReads = 0;
+  const userTurn = fakeElement("section", { "data-testid": "conversation-turn-idle-user" }, [
+    fakeElement("div", { "data-message-author-role": "user" }, [fakeText(prompt)])
+  ]);
+  const assistantTurn = fakeElement("section", { "data-testid": "conversation-turn-idle-assistant" }, [
+    fakeElement("div", { "data-message-author-role": "assistant" }, [fakeText(finalText)])
+  ]);
+
+  const idleWake = async () => {
+    idleWakeups += 1;
+    return false;
+  };
+  context.sleep = idleWake;
+  context.waitForAssistantActivity = idleWake;
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a long unchanged bound conversation";
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') {
+      return idleWakeups >= 2 ? [userTurn, assistantTurn] : [];
+    }
+    return [];
+  };
+
+  const reply = await context.waitForAssistantReply("old answer", { afterUserText: prompt });
+
+  assert.equal(reply, finalText);
+  assert.ok(idleWakeups >= 2);
+  assert.equal(fullPageReads, 1);
+});
+
+test("reply waiting rescans blockers immediately after a DOM change", async () => {
+  const context = await loadContentScriptContext();
+  let pageBlocked = false;
+  let fullPageReads = 0;
+  let activityWaits = 0;
+
+  context.waitForAssistantActivity = async () => {
+    activityWaits += 1;
+    if (activityWaits === 1) {
+      pageBlocked = true;
+      return true;
+    }
+    throw new Error("blocker rescan was skipped after the DOM changed");
+  };
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return pageBlocked ? "Cloudflare: verify you are human" : "a normal bound conversation";
+    }
+  };
+  context.document.querySelectorAll = () => [];
+
+  await assert.rejects(
+    () => context.waitForAssistantReply("old answer", { afterUserText: "current prompt" }),
+    (error) => error?.errorCode === "human_verification"
+  );
+  assert.equal(activityWaits, 1);
+  assert.equal(fullPageReads, 2);
+});
+
+test("send confirmation does not rescan unchanged page text after idle wakeups", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "confirm this submitted prompt";
+  let idleWakeups = 0;
+  let fullPageReads = 0;
+  const oldAssistantTurn = fakeElement("section", { "data-testid": "conversation-turn-old-assistant" }, [
+    fakeElement("div", { "data-message-author-role": "assistant" }, [fakeText("older reply")])
+  ]);
+  const submittedUserTurn = fakeElement("section", { "data-testid": "conversation-turn-new-user" }, [
+    fakeElement("div", { "data-message-author-role": "user" }, [fakeText(prompt)])
+  ]);
+
+  const idleConfirmationWake = async () => {
+    idleWakeups += 1;
+    return false;
+  };
+  context.sleep = idleConfirmationWake;
+  context.waitForAssistantActivity = idleConfirmationWake;
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a long unchanged bound conversation";
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') {
+      return idleWakeups >= 2 ? [oldAssistantTurn, submittedUserTurn] : [oldAssistantTurn];
+    }
+    if (selector === '[data-message-author-role="user"]') {
+      return idleWakeups >= 2 ? [submittedUserTurn] : [];
+    }
+    return [];
+  };
+
+  const submitted = await context.waitForSubmittedPrompt(
+    { id: "sync_idle_confirmation", payloadText: prompt },
+    2_000,
+    { afterTurnIndex: 0 }
+  );
+
+  assert.equal(submitted.index, 1);
+  assert.ok(idleWakeups >= 2);
+  assert.equal(fullPageReads, 1);
+});
+
+test("send confirmation rescans blockers immediately after a DOM change", async () => {
+  const context = await loadContentScriptContext();
+  let pageBlocked = false;
+  let activityWaits = 0;
+  let fullPageReads = 0;
+  const activityWake = async () => {
+    activityWaits += 1;
+    if (activityWaits === 1) {
+      pageBlocked = true;
+      return true;
+    }
+    throw new Error("send blocker rescan was skipped after the DOM changed");
+  };
+
+  context.sleep = activityWake;
+  context.waitForAssistantActivity = activityWake;
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return pageBlocked ? "Cloudflare: verify you are human" : "a normal bound conversation";
+    }
+  };
+  context.document.querySelectorAll = () => [];
+
+  await assert.rejects(
+    () => context.waitForSubmittedPrompt(
+      { id: "sync_changed_confirmation", payloadText: "current prompt" },
+      2_000,
+      { afterTurnIndex: 0 }
+    ),
+    (error) => error?.errorCode === "human_verification"
+  );
+  assert.equal(activityWaits, 1);
+  assert.equal(fullPageReads, 2);
+});
+
+for (const fails of [false, true]) {
+  test(`slow preference preparation keeps heartbeat alive without concurrent actions: failure=${fails}`, async () => {
+    const c = await loadContentScriptContext();
+    c.location = { hostname: "chatgpt.com", href: "https://chatgpt.com/c/bound-chat" };
+    let releasePreparation, preparationStarted, releasePing;
+    const started = new Promise(r => { preparationStarted = r; });
+    const preparation = new Promise(r => { releasePreparation = r; });
+    const ping = new Promise(r => { releasePing = r; });
+    let heartbeats = 0, claims = 0, preferences = 0, recoveries = 0, opens = 0;
+    c.sendHeartbeat = async () => {
+      heartbeats++;
+      if (heartbeats === 2) { await ping; if (fails) throw new Error("Bridge temporarily unavailable"); }
+      return { controlsCurrentPage: true, preferences: { modelPreference: "latest", modePreference: "balanced" } };
+    };
+    c.maybeOpenProjectTabFromHeartbeat = async () => { opens++; };
+    c.handleHeartbeatRecovery = async () => { recoveries++; return false; };
+    c.isGenerating = () => false;
+    c.applyHeartbeatPreferences = async () => { preferences++; preparationStarted(); await preparation; return true; };
+    c.bridgeApi = async () => { claims++; return {}; };
+    const first = c.poll();
+    await started;
+    const second = c.poll();
+    const duplicate = c.poll();
+    try {
+      assert.equal(heartbeats, 2, "a pending preference operation must not suppress the next heartbeat");
+      assert.equal(preferences, 1);
+      assert.equal(recoveries, 1);
+      assert.equal(opens, 1);
+      assert.equal(claims, 0, "liveness must not claim a second task");
+    } finally {
+      releasePing();
+      await Promise.allSettled([second, duplicate]);
+      releasePreparation();
+      await first;
+    }
+    await c.poll();
+    assert.equal(heartbeats, 3, "heartbeat failure must release the single-flight guard");
+    assert.equal(preferences, 2);
+  });
+}
+
+test("content script allows only one polling cycle at a time", async () => {
+  const context = await loadContentScriptContext();
+  let heartbeatCalls = 0;
+  let releaseHeartbeat;
+  const heartbeatGate = new Promise((resolve) => {
+    releaseHeartbeat = resolve;
+  });
+
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat"
+  };
+  context.sendHeartbeat = async () => {
+    heartbeatCalls += 1;
+    await heartbeatGate;
+    return {};
+  };
+
+  const first = context.poll();
+  await Promise.resolve();
+  const second = context.poll();
+  await Promise.resolve();
+
+  let assertionError = null;
+  try {
+    assert.equal(heartbeatCalls, 1);
+  } catch (error) {
+    assertionError = error;
+  } finally {
+    releaseHeartbeat();
+    await Promise.all([first, second]);
+  }
+  if (assertionError) throw assertionError;
+});
+
+test("content script confirms a cleared composer when GPT is visibly generating", async () => {
+  const context = await loadContentScriptContext();
+  const composer = {
+    tagName: "DIV",
+    innerText: "",
+    textContent: ""
+  };
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat"
+  };
+  context.document.querySelectorAll = (selector) =>
+    selector === '[data-testid^="conversation-turn-"]' ? [{ textContent: "older assistant turn" }] : [];
+  context.isGenerating = () => true;
+
+  const submitted = await context.waitForSubmittedPrompt(
+    {
+      id: "sync_visible_generation",
+      payloadText: "write the detailed first episode"
+    },
+    20,
+    {
+      composer,
+      afterTurnIndex: 0
+    }
+  );
+
+  assert.equal(submitted.index, 0);
+  assert.equal(submitted.fallback, "composer_cleared");
+});
+
+test("content script never treats an arbitrary editable assistant surface as the composer", async () => {
+  const context = await loadContentScriptContext();
+  const assistantEditor = {
+    tagName: "DIV",
+    textContent: "a long assistant answer being edited",
+    innerText: "a long assistant answer being edited"
+  };
+
+  context.document.querySelector = (selector) => {
+    if (selector === '[contenteditable="true"]') {
+      return assistantEditor;
+    }
+    return null;
+  };
+
+  assert.equal(context.findComposer(), null);
 });
 
 function selectorMatches(node, selector) {
+  if (selector.includes(",")) return selector.split(",").some(part=>selectorMatches(node,part.trim()));
   const tag = String(node.tagName || "").toLowerCase();
+  if (selector === tag) return true;
   const attr = (name) => node.getAttribute?.(name);
+  const present = selector.match(/^\[([\w-]+)\]$/);
+  if (present) return attr(present[1]) != null;
+  if (selector === "#prompt-textarea") return attr("id") === "prompt-textarea";
+  if (selector === "textarea") return tag === "textarea";
+  if (["[data-turn-id-container]", "[title]", "[download]", "[data-filename]"].includes(selector)) return attr(selector.slice(1,-1)) !== null;
   if (selector === "button") return tag === "button";
   if (selector === "img") return tag === "img";
   if (selector === "tr") return tag === "tr";
@@ -93,8 +2029,10 @@ function selectorMatches(node, selector) {
   if (selector === "input[type=\"checkbox\"]") return tag === "input" && attr("type") === "checkbox";
   if (selector === "[data-message-author-role=\"assistant\"]") return attr("data-message-author-role") === "assistant";
   if (selector === "[data-message-author-role=\"user\"]") return attr("data-message-author-role") === "user";
-  if (selector === "section[data-testid^=\"conversation-turn-\"]") {
-    return tag === "section" && String(attr("data-testid") || "").startsWith("conversation-turn-");
+  if (selector === '[data-turn="assistant"]') return attr("data-turn") === "assistant";
+  if (selector === '[data-turn="user"]') return attr("data-turn") === "user";
+  if (selector === "[data-testid^=\"conversation-turn-\"]") {
+    return String(attr("data-testid") || "").startsWith("conversation-turn-");
   }
   return false;
 }
@@ -133,7 +2071,10 @@ function fakeElement(tagName, attrs = {}, children = []) {
     matches(selector) {
       return selectorMatches(this, selector);
     },
-    closest() {
+    closest(selector) {
+      for (let current=this; current; current=current.parentElement) {
+        if (selectorMatches(current,selector)) return current;
+      }
       return null;
     }
   };
@@ -157,6 +2098,26 @@ test("content script accepts short ChatGPT replies after the assistant text chan
   );
   assert.equal(context.hasUsableAssistantText("old reply", "old reply"), false);
   assert.equal(context.hasUsableAssistantText("   ", "old reply"), false);
+});
+
+test("content script keeps waiting on a short unfinished opening fragment", async () => {
+  const context = await loadContentScriptContext();
+  const fragment = "下面是一套完整统一";
+
+  assert.equal(context.looksLikePossiblyStreamingReply(fragment), true);
+  assert.ok(
+    context.assistantReplyStableTarget(fragment) >= 12,
+    "an unfinished opening fragment must remain stable for at least 12 probes"
+  );
+});
+
+test("content script treats an English sentence ending in a period as final", async () => {
+  const context = await loadContentScriptContext();
+
+  assert.equal(
+    context.looksLikePossiblyStreamingReply("The requested analysis is complete."),
+    false
+  );
 });
 
 test("content script ignores empty ChatGPT wrapper headings", async () => {
@@ -737,6 +2698,219 @@ test("content script accepts an image input artifact after a visible upload prev
   assert.deepEqual(changed, ["change"]);
 });
 
+for(const scenario of ['avatar','one_preview_for_two','duplicate_preview','two_previews','named_other_file','named_duplicate','mixed_previews','same_name_missing','same_name_two']){
+  test(`image upload evidence is scoped and counted: ${scenario}`,async()=>{
+    const c=await loadContentScriptContext();
+    const form={};const composer={closest:()=>form};
+    const image=(src,label='',inside=true)=>({tagName:'IMG',textContent:'',getAttribute:n=>n==='src'?src:n==='alt'?label:null,parentElement:inside?form:null,closest:()=>null,getClientRects:()=>[{}]});
+    c.findComposer=()=>composer;c.findFileInput=()=>null;
+    const a=image('blob:first'),b=image('blob:second');
+    const previews=scenario==='avatar'?[image('https://example.com/avatar.png','',false)]
+      :scenario==='duplicate_preview'?[a,image('blob:first')]
+      :scenario==='two_previews'?[a,b]
+      :scenario==='named_duplicate'?[image('blob:first','a.png'),a]
+      :scenario==='mixed_previews'?[image('blob:first','a.png'),b]
+      :scenario==='same_name_missing'?[image('blob:first','a.png')]
+      :scenario==='same_name_two'?[image('blob:first','a.png'),image('blob:second','a.png')]
+      :scenario==='named_other_file'?[image('blob:first','a.png')]:[a];
+    c.uploadPreviewElements=()=>previews;
+    c.assertNoChatGptBlocker=()=>{};
+    c.installAssistantActivityObserver=()=>false;
+    let now=0;c.Date=class extends Date{static now(){return now;}};
+    c.waitForAssistantActivity=async()=>{now+=10;return false;};
+    const artifacts=[{filename:'a.png',contentType:'image/png'},{filename:'b.png',contentType:'image/png'}];
+    if(scenario.startsWith('same_name'))artifacts[1].filename='a.png';
+    if(['two_previews','mixed_previews','same_name_two'].includes(scenario))await c.waitForInputArtifactsVisible(artifacts,5);
+    else await assert.rejects(c.waitForInputArtifactsVisible(artifacts,5),/附件没有出现/);
+  });
+}
+
+test('attachment filename evidence rejects suffixes and prefix collisions',async()=>{
+  const c=await loadContentScriptContext();
+  const artifact={filename:'report.csv',contentType:'text/csv'};
+  const preview=text=>({tagName:'DIV',textContent:text,getAttribute:()=>null});
+  assert.equal(c.inputArtifactAppearsUploaded(artifact,[preview('old-report.csv')]),false);
+  assert.equal(c.inputArtifactAppearsUploaded(artifact,[preview('report.csv.bak')]),false);
+  assert.equal(c.inputArtifactAppearsUploaded(artifact,[preview('删除 report.csv')]),true);
+});
+
+test('attachment candidates exclude ancestors aggregating draft or historical filenames',async()=>{
+  const c=await loadContentScriptContext();const composer={};
+  const node=()=>({tagName:'DIV',textContent:'a.png b.png',getClientRects:()=>[{}],closest:()=>null});
+  const draftParent={...node(),contains:x=>x===composer};
+  const historyParent={...node(),querySelector:()=>({})};
+  const preview=node();
+  c.findComposer=()=>composer;c.document.querySelectorAll=()=>[draftParent,historyParent,preview];
+  const candidates=c.uploadPreviewElements();
+  assert.equal(candidates.length,1);assert.equal(candidates[0],preview);
+});
+
+test("attachment confirmation reuses one preview snapshot for every input artifact", async () => {
+  const context = await loadContentScriptContext();
+  let previewScans = 0;
+  const preview = (filename) => ({
+    tagName: "DIV",
+    textContent: filename,
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 120, height: 40 }];
+    },
+    closest() {
+      return null;
+    }
+  });
+  const previews = [preview("chapter-outline.docx"), preview("cover-reference.png")];
+
+  context.document.body = { innerText: "a normal bound conversation" };
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "img,[data-testid],[aria-label],[title],a,button,div,span,p") {
+      previewScans += 1;
+      return previews;
+    }
+    return [];
+  };
+
+  await context.waitForInputArtifactsVisible([
+    { id: "artifact_outline", filename: "chapter-outline.docx", contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+    { id: "artifact_cover", filename: "cover-reference.png", contentType: "image/png" }
+  ], 1_000);
+
+  assert.equal(previewScans, 1);
+});
+
+test("attachment preview scanning resolves the composer once for all candidates", async () => {
+  const context = await loadContentScriptContext();
+  let composerQueries = 0;
+  const composer = {
+    contains() {
+      return false;
+    }
+  };
+  const candidates = Array.from({ length: 4 }, (_, index) => ({
+    tagName: "DIV",
+    textContent: `attachment-${index}.txt`,
+    getClientRects() {
+      return [{ width: 120, height: 40 }];
+    },
+    closest() {
+      return null;
+    }
+  }));
+
+  context.document.querySelector = (selector) => {
+    if (selector === "#prompt-textarea") {
+      composerQueries += 1;
+      return composer;
+    }
+    return null;
+  };
+  context.document.querySelectorAll = (selector) =>
+    selector === "img,[data-testid],[aria-label],[title],a,button,div,span,p" ? candidates : [];
+
+  assert.equal(context.uploadPreviewElements().length, candidates.length);
+  assert.equal(composerQueries, 1);
+});
+
+test("attachment waiting skips preview and blocker rescans until the page changes", async () => {
+  const context = await loadContentScriptContext();
+  let previewVisible = false;
+  let activityWaits = 0;
+  let fullPageReads = 0;
+  let previewScans = 0;
+  const preview = {
+    tagName: "DIV",
+    textContent: "chapter-outline.docx",
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 120, height: 40 }];
+    },
+    closest() {
+      return null;
+    }
+  };
+  const activityWake = async () => {
+    activityWaits += 1;
+    if (activityWaits === 1) {
+      return false;
+    }
+    if (activityWaits === 2) {
+      previewVisible = true;
+      return true;
+    }
+    throw new Error("attachment wait did not react to the page change");
+  };
+
+  context.document.documentElement = { nodeName: "HTML" };
+  context.MutationObserver = class {
+    observe() {}
+  };
+  context.sleep = activityWake;
+  context.waitForAssistantActivity = activityWake;
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "a normal bound conversation";
+    }
+  };
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "img,[data-testid],[aria-label],[title],a,button,div,span,p") {
+      previewScans += 1;
+      return previewVisible ? [preview] : [];
+    }
+    return [];
+  };
+
+  await context.waitForInputArtifactsVisible([
+    { id: "artifact_outline", filename: "chapter-outline.docx", contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+  ], 2_000);
+
+  assert.equal(activityWaits, 2);
+  assert.equal(fullPageReads, 2);
+  assert.equal(previewScans, 2);
+});
+
+test("attachment waiting keeps polling blockers when DOM observation is unavailable", async () => {
+  const context = await loadContentScriptContext();
+  let pageBlocked = false;
+  let sleepCalls = 0;
+  let fullPageReads = 0;
+  let previewScans = 0;
+
+  context.sleep = async () => {
+    sleepCalls += 1;
+    pageBlocked = true;
+  };
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return pageBlocked ? "Cloudflare: verify you are human" : "a normal bound conversation";
+    }
+  };
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "img,[data-testid],[aria-label],[title],a,button,div,span,p") {
+      previewScans += 1;
+    }
+    return [];
+  };
+
+  await assert.rejects(
+    () => context.waitForInputArtifactsVisible([
+      { id: "artifact_outline", filename: "chapter-outline.docx", contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+    ], 2_000),
+    (error) => error?.errorCode === "human_verification"
+  );
+  assert.equal(sleepCalls, 1);
+  assert.equal(fullPageReads, 2);
+  assert.equal(previewScans, 1);
+});
+
 test("content script classifies ChatGPT blocker pages before sending", async () => {
   const context = await loadContentScriptContext();
   context.document.body = {
@@ -836,11 +3010,11 @@ test("content script classifies ChatGPT blocker pages before sending", async () 
   assert.equal(context.detectChatGptBlocker(), null);
 });
 
-test("content script only treats generation failures as blockers for the current reply", async () => {
+for (const failureText of ["Something went wrong while generating the response.", "消息流中的错误", "Error in message stream. Try again"]) test(`generation failure stays scoped to the current reply: ${failureText}`, async () => {
   const context = await loadContentScriptContext();
   const oldUser = fakeElement("div", { "data-message-author-role": "user" }, [fakeText("闂佸搫鍞查崒娑樺簥??")]);
   const oldAssistant = fakeElement("div", { "data-message-author-role": "assistant" }, [
-    fakeText("Something went wrong while generating the response.")
+    fakeText(failureText)
   ]);
   const currentUser = fakeElement("div", { "data-message-author-role": "user" }, [fakeText("current prompt")]);
   const currentAssistant = fakeElement("div", { "data-message-author-role": "assistant" }, [fakeText("current answer")]);
@@ -851,7 +3025,7 @@ test("content script only treats generation failures as blockers for the current
     fakeElement("section", { "data-testid": "conversation-turn-4" }, [currentAssistant])
   ];
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') {
+    if (selector === '[data-testid^="conversation-turn-"]') {
       return turns;
     }
     return [];
@@ -864,14 +3038,14 @@ test("content script only treats generation failures as blockers for the current
 
   const failedUser = fakeElement("div", { "data-message-author-role": "user" }, [fakeText("failed prompt")]);
   const failedAssistant = fakeElement("div", { "data-message-author-role": "assistant" }, [
-    fakeText("Something went wrong while generating the response.")
+    fakeText(failureText)
   ]);
   const failedTurns = [
     fakeElement("section", { "data-testid": "conversation-turn-5" }, [failedUser]),
     fakeElement("section", { "data-testid": "conversation-turn-6" }, [failedAssistant])
   ];
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') {
+    if (selector === '[data-testid^="conversation-turn-"]') {
       return failedTurns;
     }
     return [];
@@ -1035,7 +3209,10 @@ test("content script completes a visible reply even if an account chooser appear
     payloadText: "What is this?"
   });
 
-  assert.equal(sent, true);
+  assert.equal(sent, true, JSON.stringify({
+    bridgeCalls: bridgeCalls.map((call) => call.path),
+    composerValue: composer.value
+  }));
   assert.deepEqual(
     bridgeCalls.map((call) => call.path),
     [
@@ -1299,7 +3476,7 @@ test("content script fails fast when ChatGPT shows a generation error", async ()
     ])
   ]);
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') {
+    if (selector === '[data-testid^="conversation-turn-"]') {
       return [userTurn, assistantTurn];
     }
     return [];
@@ -1311,6 +3488,52 @@ test("content script fails fast when ChatGPT shows a generation error", async ()
   await assert.rejects(
     () => context.waitForAssistantReply("old answer", { afterUserText: prompt }),
     (error) => error?.errorCode === "generation_failed"
+  );
+});
+
+test("content script does not rebuild full Markdown while GPT is still streaming", async () => {
+  const context = await loadContentScriptContext();
+  const assistantMessage = {
+    textContent: "A long response is still streaming.",
+    childNodes: [],
+    matches() {
+      return true;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  let streaming = true;
+  let fullReplyExtractions = 0;
+
+  context.assistantTurnsAfterTurnIndex = () => [assistantMessage];
+  context.isGenerating = () => streaming;
+  context.extractAssistantReplyText = () => {
+    fullReplyExtractions += 1;
+    return "A long response is complete.";
+  };
+  context.hasUsableAssistantContent = () => true;
+  context.visibleReplyTextFromAssistant = () => {
+    fullReplyExtractions += 1;
+    return "A long response is complete.";
+  };
+  context.uniqueGeneratedImageCount = () => 0;
+  context.hasDownloadableArtifact = () => false;
+  context.effectiveStableTarget = () => 1;
+  context.shouldAcceptStableTextDuringGlobalGeneration = () => false;
+  context.sleep = async () => {
+    streaming = false;
+  };
+
+  const reply = await context.waitForAssistantReply("old answer", {
+    afterUserTurnIndex: 0
+  });
+
+  assert.equal(reply, "A long response is complete.");
+  assert.equal(
+    fullReplyExtractions,
+    2,
+    "full reply extraction should run only after streaming has stopped"
   );
 });
 
@@ -1326,7 +3549,7 @@ test("content script fails fast when ChatGPT shows the short generic generation 
     ])
   ]);
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') {
+    if (selector === '[data-testid^="conversation-turn-"]') {
       return [userTurn, assistantTurn];
     }
     return [];
@@ -1944,7 +4167,7 @@ test("content script uses a stable per-tab worker id so ChatGPT tabs do not over
   const second = context.currentWorkerId();
 
   assert.equal(first, second);
-  assert.match(first, /v20260712-preference-verify:runtime-missing:tab_/);
+  assert.match(first, /v20260923-missing-recovery:runtime-missing:tab_/);
   assert.equal(storage.size, 1);
 });
 
@@ -1964,8 +4187,9 @@ test("content script reloads the current ChatGPT page once after extension reloa
   };
   context.chrome = {
     runtime: {
-      sendMessage(payload) {
+      sendMessage(payload, callback) {
         runtimeMessages.push(payload);
+        callback({ok:true});
       }
     }
   };
@@ -1982,23 +4206,125 @@ test("content script reloads the current ChatGPT page once after extension reloa
 
   assert.equal(context.maybeReloadExtensionFromHeartbeat({
     reloadExtension: true,
-    expectedExtensionVersion: "v20260712-preference-verify"
+    expectedExtensionVersion: "v20260923-missing-recovery"
   }), true);
   assert.equal(context.maybeReloadExtensionFromHeartbeat({
     reloadExtension: true,
-    expectedExtensionVersion: "v20260712-preference-verify"
+    expectedExtensionVersion: "v20260923-missing-recovery"
   }), true);
 
   assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), [
     {
       type: "bridge:reloadExtension",
-      expectedVersion: "v20260712-preference-verify"
+      expectedVersion: "v20260923-missing-recovery"
     }
   ]);
   assert.equal(scheduled.length, 1);
   assert.equal(scheduled[0].ms, 750);
   scheduled[0].callback();
   assert.equal(pageReloads, 1);
+});
+
+test("refresh guard does not reload a new extension to satisfy an older backend",async()=>{
+  const c=await loadContentScriptContext();let reloads=0;
+  c.chrome={runtime:{sendMessage(){reloads++;}}};
+  c.sessionStorage={getItem:()=>null,setItem(){}};
+  c.setTimeout=()=>{reloads++;};
+  assert.equal(c.maybeReloadExtensionFromHeartbeat({reloadExtension:true,expectedExtensionVersion:"v20260920-brand-diagnostics"}),true);
+  assert.equal(reloads,0);
+});
+
+test("refresh guard does not loop forever when reload keeps the same client and expected build",async()=>{
+  const c=await loadContentScriptContext();const storage=new Map();let reloads=0,now=100000;
+  c.Date=class extends Date{static now(){return now;}};
+  c.chrome={runtime:{sendMessage(_payload,callback){reloads++;callback({ok:true});}}};c.setTimeout=()=>{};
+  c.sessionStorage={getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)};
+  const heartbeat={reloadExtension:true,expectedExtensionVersion:"v20990101-forward"};
+  assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat),true);now+=120000;
+  assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat),true);
+  assert.equal(reloads,1);
+});
+
+for (const failure of ["throw", "promise_reject", "callback_error", "negative_ack", "no_response"]) {
+  test(`reload recovery retries a failed ${failure} handoff without claiming work`, async () => {
+    const c = await loadContentScriptContext();
+    const storage = new Map();
+    const scheduled = [];
+    let now = 100000, calls = 0, pageReloads = 0;
+    c.Date = class extends Date { static now() { return now; } };
+    c.sessionStorage = { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) };
+    c.location = { reload() { pageReloads++; } };
+    c.setTimeout = (callback, ms) => { scheduled.push({callback, ms}); return scheduled.length; };
+    c.chrome = { runtime: { sendMessage(_payload, callback) {
+      calls++;
+      if (calls > 1) { callback?.({ok:true}); return; }
+      if (failure === "throw") throw new Error("runtime temporarily unavailable");
+      if (failure === "promise_reject") return { then(_resolve, reject) { reject(new Error("channel closed")); } };
+      if (failure === "callback_error") {
+        c.chrome.runtime.lastError = {message:"channel closed"};
+        callback?.(undefined);
+        c.chrome.runtime.lastError = null;
+      }
+      if (failure === "negative_ack") callback?.({ok:false});
+    } } };
+    const heartbeat = {reloadExtension:true, expectedExtensionVersion:"v20990101-forward"};
+    assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat), true, "mismatched workers must stay paused even on handoff failure");
+    assert.equal(scheduled.length, 0, "no page refresh before a positive background acknowledgement");
+    now += 1000;
+    assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat), true);
+    assert.equal(calls, 1, "failure retries must respect cooldown");
+    now += 120000;
+    assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat), true);
+    assert.equal(calls, 2, "a recovered runtime must get another handoff attempt");
+    assert.equal(scheduled.length, 1);
+    scheduled[0].callback();
+    assert.equal(pageReloads, 1);
+    now += 120000;
+    c.maybeReloadExtensionFromHeartbeat(heartbeat);
+    assert.equal(calls, 2, "a confirmed reload must not loop on unchanged builds");
+  });
+}
+
+test("reload recovery stays paused while the extension runtime is unavailable", async () => {
+  const c = await loadContentScriptContext();
+  c.chrome = {};
+  assert.equal(c.maybeReloadExtensionFromHeartbeat({reloadExtension:true, expectedExtensionVersion:"v20990101-forward"}), true);
+});
+
+test("reload recovery ignores late acknowledgements from an expired handoff", async () => {
+  const c = await loadContentScriptContext();
+  const storage = new Map(), callbacks = [], scheduled = [];
+  let now = 100000;
+  c.Date = class extends Date { static now() { return now; } };
+  c.sessionStorage = {getItem:key=>storage.get(key), setItem:(key,value)=>storage.set(key,value)};
+  c.chrome = {runtime:{sendMessage(_payload, callback) { callbacks.push(callback); }}};
+  c.location = {reload() {}};
+  c.setTimeout = callback => scheduled.push(callback);
+  const heartbeat = {reloadExtension:true, expectedExtensionVersion:"v20990101-forward"};
+  c.maybeReloadExtensionFromHeartbeat(heartbeat);
+  now += 120000;
+  c.maybeReloadExtensionFromHeartbeat(heartbeat);
+  callbacks[0]({ok:true});
+  assert.equal(scheduled.length, 0);
+  callbacks[1]({ok:true});
+  callbacks[1]({ok:true});
+  assert.equal(scheduled.length, 1, "only the current handoff may refresh once");
+});
+
+test("reload recovery retains cooldown and confirmed handoff when storage is unavailable", async () => {
+  const c = await loadContentScriptContext();
+  let now = 100000, calls = 0;
+  c.Date = class extends Date { static now() { return now; } };
+  c.sessionStorage = {getItem(){throw new Error("storage blocked");}, setItem(){throw new Error("storage blocked");}};
+  c.chrome = {runtime:{sendMessage() { calls++; return Promise.resolve({ok:true}); }}};
+  c.setTimeout = () => {};
+  const heartbeat = {reloadExtension:true, expectedExtensionVersion:"v20990101-forward"};
+  assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat), true);
+  assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat), true);
+  await Promise.resolve();
+  now += 120000;
+  assert.equal(c.maybeReloadExtensionFromHeartbeat(heartbeat), true);
+  assert.equal(calls, 1);
 });
 
 test("content script retries when the ChatGPT preference menu is not ready yet", async () => {
@@ -2311,7 +4637,7 @@ test("content script ignores old assistant model buttons when using composer pre
       return null;
     },
     closest(selector) {
-      return selector === 'section[data-testid^="conversation-turn-"]' ? oldTurn : null;
+      return selector === '[data-testid^="conversation-turn-"]' ? oldTurn : null;
     },
     getClientRects() {
       return [{ width: 80, height: 30 }];
@@ -2586,6 +4912,18 @@ test("content script ignores disabled or hidden stop buttons when checking gener
   assert.equal(context.isGenerating(), false);
 });
 
+test("content script reuses one stop-control scan per generation-state check", async () => {
+  const context = await loadContentScriptContext();
+  let queryCount = 0;
+  context.document.querySelectorAll = () => {
+    queryCount += 1;
+    return [];
+  };
+
+  assert.equal(context.isGenerating(), false);
+  assert.equal(queryCount, 3);
+});
+
 test("content script treats a visible enabled stop button as active generation", async () => {
   const context = await loadContentScriptContext();
   const buttons = [
@@ -2780,7 +5118,7 @@ test("content script returns stable text replies even when a global stop button 
 
   context.document.querySelectorAll = (selector) => {
     if (selector === "button") return [stopButton];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
     return [];
   };
@@ -2792,6 +5130,276 @@ test("content script returns stable text replies even when a global stop button 
 
   assert.equal(reply, finalText);
   assert.ok(sleepCount < 15);
+});
+
+test("content script reuses one artifact snapshot per completed-reply stability check", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "Return one complete sentence.";
+  const finalText = "This completed reply should be captured once per stability check.";
+  let imageScans = 0;
+  let downloadScans = 0;
+  context.sleep = async () => {};
+
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      return selector === '[data-message-author-role="user"]' ? {} : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantMessage = {
+    textContent: finalText,
+    innerText: finalText,
+    querySelectorAll(selector) {
+      if (selector === "img") imageScans += 1;
+      if (selector === "button") downloadScans += 1;
+      return [];
+    },
+    closest() {
+      return assistantTurn;
+    }
+  };
+  const assistantTurn = {
+    textContent: finalText,
+    querySelector(selector) {
+      return selector === '[data-message-author-role="assistant"]' ? assistantMessage : null;
+    },
+    querySelectorAll(selector) {
+      if (selector === "img") imageScans += 1;
+      if (selector === "button") downloadScans += 1;
+      return selector === '[data-message-author-role="assistant"]' ? [assistantMessage] : [];
+    },
+    closest() {
+      return this;
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    return [];
+  };
+
+  const reply = await context.waitForAssistantReply("old answer", { afterUserText: prompt });
+
+  assert.equal(reply, finalText);
+  assert.equal(imageScans, 3);
+  assert.equal(downloadScans, 3);
+});
+
+test("content script reuses one conversation-turn snapshot per completed-reply stability check", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "Return one complete sentence.";
+  const finalText = "This completed reply should reuse one turn snapshot per stability check.";
+  let turnScans = 0;
+  context.sleep = async () => {};
+
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      return selector === '[data-message-author-role="user"]' ? {} : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantMessage = {
+    textContent: finalText,
+    innerText: finalText,
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return assistantTurn;
+    }
+  };
+  const assistantTurn = {
+    textContent: finalText,
+    querySelector(selector) {
+      return selector === '[data-message-author-role="assistant"]' ? assistantMessage : null;
+    },
+    querySelectorAll(selector) {
+      return selector === '[data-message-author-role="assistant"]' ? [assistantMessage] : [];
+    },
+    closest() {
+      return this;
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') {
+      turnScans += 1;
+      return [userTurn, assistantTurn];
+    }
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    return [];
+  };
+
+  const reply = await context.waitForAssistantReply("old answer", { afterUserText: prompt });
+
+  assert.equal(reply, finalText);
+  assert.equal(turnScans, 3);
+});
+
+test("content script does not repeat prompt matching while a scoped reply has not appeared", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "Wait for the scoped assistant reply.";
+  const finalText = "The scoped assistant reply is now complete.";
+  let turnScans = 0;
+  let userRoleChecks = 0;
+  context.sleep = async () => {};
+
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="user"]') {
+        userRoleChecks += 1;
+        return {};
+      }
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantMessage = {
+    textContent: finalText,
+    innerText: finalText,
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return assistantTurn;
+    }
+  };
+  const assistantTurn = {
+    textContent: finalText,
+    querySelector(selector) {
+      return selector === '[data-message-author-role="assistant"]' ? assistantMessage : null;
+    },
+    querySelectorAll(selector) {
+      return selector === '[data-message-author-role="assistant"]' ? [assistantMessage] : [];
+    },
+    closest() {
+      return this;
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') {
+      turnScans += 1;
+      return turnScans === 1 ? [userTurn] : [userTurn, assistantTurn];
+    }
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    return [];
+  };
+
+  const reply = await context.waitForAssistantReply("old answer", { afterUserText: prompt });
+
+  assert.equal(reply, finalText);
+  assert.equal(turnScans, 4);
+  assert.equal(userRoleChecks, 4);
+});
+
+test("content script keeps the global assistant fallback while turn wrappers are absent", async () => {
+  const context = await loadContentScriptContext();
+  const finalText = "The assistant reply is complete before turn wrappers appear.";
+  let clockReads = 0;
+  context.Date = class extends Date {
+    static now() {
+      clockReads += 1;
+      return clockReads <= 4 ? (clockReads - 1) * 1000 : 2_000_000;
+    }
+  };
+  context.sleep = async () => {};
+
+  const assistantMessage = {
+    textContent: finalText,
+    innerText: finalText,
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return null;
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [];
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    return [];
+  };
+
+  const reply = await context.waitForAssistantReply("old answer", {
+    afterUserText: "Return the assistant reply."
+  });
+
+  assert.equal(reply, finalText);
+});
+
+test("content script filters unrelated turn text before checking prompt roles", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "Find this exact current request.";
+  let userRoleChecks = 0;
+
+  const matchingUserTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="user"]') {
+        userRoleChecks += 1;
+        return {};
+      }
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const unrelatedTurns = Array.from({ length: 20 }, (_, index) => ({
+    textContent: `Unrelated historical turn ${index}.`,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="user"]') {
+        userRoleChecks += 1;
+        return null;
+      }
+      return selector === '[data-message-author-role="assistant"]' ? {} : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  }));
+
+  const result = context.latestUserPromptTurnInfo([prompt], {
+    turns: [matchingUserTurn, ...unrelatedTurns]
+  });
+
+  assert.equal(result.index, 0);
+  assert.equal(result.turn, matchingUserTurn);
+  assert.equal(userRoleChecks, 1);
+});
+
+test("content script checks a missing after-user prompt only once per assistant lookup", async () => {
+  const context = await loadContentScriptContext();
+  let textReads = 0;
+  const staleAssistantTurn = {
+    get textContent() {
+      textReads += 1;
+      return "An older unrelated assistant reply.";
+    },
+    querySelector(selector) {
+      return selector === '[data-message-author-role="assistant"]' ? {} : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+
+  const result = context.lastAssistantMessage({
+    afterUserText: "This prompt is not rendered yet.",
+    requireAfterUserText: true,
+    turns: [staleAssistantTurn]
+  });
+
+  assert.equal(result, null);
+  assert.equal(textReads, 1);
 });
 
 test("content script settles image replies that remain stuck in generating state", async () => {
@@ -2867,7 +5475,7 @@ test("content script settles image replies that remain stuck in generating state
   };
   context.document.querySelectorAll = (selector) => {
     if (selector === "button") return [stopButton];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     return [];
   };
 
@@ -3146,7 +5754,7 @@ test("content script waits for the ChatGPT composer before sending", async () =>
 
   assert.equal(sent, true);
   assert.equal(composer.value, "send after load");
-  assert.equal(composerQueries, 3);
+  assert.equal(composerQueries, 5);
   assert.deepEqual(
     bridgeCalls.map((call) => call.path),
     ["/api/sync/jobs/sync_wait_composer/sent", "/api/sync/jobs/sync_wait_composer/complete"]
@@ -3231,6 +5839,91 @@ test("content script sends with the ChatGPT composer submit button", async () =>
   assert.deepEqual(
     bridgeCalls.map((call) => call.path),
     ["/api/sync/jobs/sync_composer_submit/sent", "/api/sync/jobs/sync_composer_submit/complete"]
+  );
+});
+
+test("content script does not abandon a mutating send path behind a global timeout race", async () => {
+  const context = await loadContentScriptContext();
+  const bridgeCalls = [];
+  let sent = false;
+  const composer = {
+    tagName: "TEXTAREA",
+    value: "",
+    focus() {},
+    dispatchEvent() {}
+  };
+  const submitButton = {
+    disabled: false,
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      return name === "data-testid" ? "composer-submit-button" : null;
+    },
+    getClientRects() {
+      return [{ width: 24, height: 24 }];
+    },
+    click() {
+      sent = true;
+    }
+  };
+  const userMessage = {
+    textContent: "send without abandoned race",
+    innerText: "send without abandoned race",
+    getAttribute(name) {
+      return name === "data-message-author-role" ? "user" : null;
+    }
+  };
+  const assistant = () => ({
+    textContent: sent ? "completed safely" : "old answer",
+    innerText: sent ? "completed safely" : "old answer",
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return null;
+    }
+  });
+
+  context.sleep = async () => {};
+  context.withPreSendTimeout = async () => {
+    throw new Error("global pre-send timeout race must not wrap the mutating path");
+  };
+  context.triggerSendButton = async () => {
+    sent = true;
+    return { fallbackDomClick: true };
+  };
+  context.waitForAssistantReply = async () => "completed safely";
+  context.document.querySelector = (selector) => {
+    if (selector === "#prompt-textarea") return composer;
+    if (selector === 'button[data-testid="composer-submit-button"]') return submitButton;
+    return null;
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "button") return [submitButton];
+    if (selector === '[data-message-author-role="assistant"]') return [assistant()];
+    if (selector === '[data-message-author-role="user"]') return sent ? [userMessage] : [];
+    return [];
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    bridgeCalls.push({ path, options });
+    return {};
+  };
+
+  await context.processJob({
+    id: "sync_without_abandoned_timeout",
+    payloadText: "send without abandoned race"
+  });
+
+  assert.equal(sent, true, JSON.stringify({
+    bridgeCalls: bridgeCalls.map((call) => call.path),
+    composerValue: composer.value
+  }));
+  assert.deepEqual(
+    bridgeCalls.map((call) => call.path),
+    [
+      "/api/sync/jobs/sync_without_abandoned_timeout/sent",
+      "/api/sync/jobs/sync_without_abandoned_timeout/complete"
+    ]
   );
 });
 
@@ -3329,6 +6022,52 @@ test("content script uses a trusted browser click for the ChatGPT composer submi
     bridgeCalls.map((call) => call.path),
     ["/api/sync/jobs/sync_composer_trusted_submit/sent", "/api/sync/jobs/sync_composer_trusted_submit/complete"]
   );
+});
+
+test("content script falls back quickly when the trusted send click never answers", async () => {
+  const context = await loadContentScriptContext();
+  let domClicks = 0;
+  const submitButton = {
+    tagName: "BUTTON",
+    disabled: false,
+    textContent: "Send",
+    innerText: "Send",
+    getAttribute() {
+      return null;
+    },
+    click() {
+      domClicks += 1;
+    },
+    scrollIntoView() {},
+    getBoundingClientRect() {
+      return { left: 20, top: 40, width: 30, height: 30 };
+    }
+  };
+
+  context.sleep = async () => {};
+  context.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage() {
+        // Simulate a debugger-backed trusted click whose callback and promise never settle.
+      }
+    }
+  };
+
+  const attempt = await Promise.race([
+    context.triggerSendButton(submitButton, {
+      runtimeTimeoutMs: 5
+    }),
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("trusted send click remained pending")), 50);
+    })
+  ]);
+
+  assert.equal(domClicks, 1);
+  assert.equal(attempt.usedTrustedClick, true);
+  assert.equal(attempt.trustedClickOk, false);
+  assert.equal(attempt.trustedClickError, "trusted click timed out");
+  assert.equal(attempt.fallbackDomClick, true);
 });
 
 test("content script retries submit when trusted click leaves the draft in the composer", async () => {
@@ -3485,6 +6224,11 @@ test("content script replaces stale contenteditable composer text before sending
   };
 
   context.sleep = async () => {};
+  // A real contenteditable element derives innerText from its text nodes.
+  Object.defineProperty(composer, "innerText", {
+    get() { return this.textContent; },
+    set(value) { this.textContent = value; }
+  });
   context.document.execCommand = (command, _showUi, value) => {
     if (command === "insertText") {
       composer.textContent += value;
@@ -3501,7 +6245,7 @@ test("content script replaces stale contenteditable composer text before sending
     if (selector === "button") return [submitButton];
     if (selector === '[data-message-author-role="user"]') return sent ? [userMessage] : [];
     if (selector === '[data-message-author-role="assistant"]') return sent ? [assistantTurn] : [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
+    if (selector === '[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -3520,6 +6264,108 @@ test("content script replaces stale contenteditable composer text before sending
     bridgeCalls.map((call) => call.path),
     ["/api/sync/jobs/sync_replace_stale_composer/sent", "/api/sync/jobs/sync_replace_stale_composer/complete"]
   );
+});
+
+test("content script bypasses debugger insertion for a long routed prompt", async () => {
+  const context = await loadContentScriptContext();
+  const runtimeMessages = [];
+  let execCommands = 0;
+  let focused = false;
+  let composerText = "stale draft";
+  const prompt = "long dependency context ".repeat(900);
+  const composer = {
+    tagName: "DIV",
+    get textContent() {
+      return composerText;
+    },
+    set textContent(value) {
+      composerText = value;
+    },
+    get innerText() {
+      return composerText;
+    },
+    set innerText(value) {
+      composerText = value;
+    },
+    focus() {
+      focused = true;
+    },
+    dispatchEvent() {}
+  };
+
+  context.document.execCommand = () => {
+    execCommands += 1;
+    return true;
+  };
+  context.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage(payload, callback) {
+        runtimeMessages.push(payload);
+        composerText = payload.text;
+        callback?.({ ok: true });
+      }
+    }
+  };
+
+  await context.fillComposerText(composer, prompt);
+
+  assert.equal(focused, true);
+  assert.equal(execCommands, 0);
+  assert.equal(composerText, prompt);
+  assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), []);
+});
+
+test("content script avoids synchronous execCommand insertion for a medium staged prompt", async () => {
+  const context = await loadContentScriptContext();
+  const runtimeMessages = [];
+  let execCommands = 0;
+  let composerText = "stale draft";
+  const prompt = "海".repeat(3345);
+  const composer = {
+    tagName: "DIV",
+    get textContent() {
+      return composerText;
+    },
+    set textContent(value) {
+      composerText = value;
+    },
+    get innerText() {
+      return composerText;
+    },
+    set innerText(value) {
+      composerText = value;
+    },
+    focus() {},
+    dispatchEvent() {}
+  };
+
+  context.document.execCommand = () => {
+    execCommands += 1;
+    return true;
+  };
+  context.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage(payload, callback) {
+        runtimeMessages.push(payload);
+        composerText = payload.text;
+        callback?.({ ok: true });
+      }
+    }
+  };
+
+  await context.fillComposerText(composer, prompt);
+
+  assert.equal(prompt.length, 3345);
+  assert.equal(execCommands, 0);
+  assert.equal(composerText, prompt);
+  assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), [
+    {
+      type: "bridge:trustedInsertText",
+      text: prompt
+    }
+  ]);
 });
 
 test("content script clears a Bridge draft when a send fails before submit", async () => {
@@ -3564,7 +6410,7 @@ test("content script clears a Bridge draft when a send fails before submit", asy
   context.document.querySelectorAll = (selector) => {
     if (selector === "button") return [disabledSendButton];
     if (selector === '[data-message-author-role="assistant"]') return [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [];
+    if (selector === '[data-testid^="conversation-turn-"]') return [];
     return [];
   };
   context.bridgeApi = async () => ({});
@@ -3699,7 +6545,7 @@ test("content script refreshes an already sent job when ChatGPT reply times out"
   };
   context.document.querySelector = () => null;
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn];
     return [];
   };
   context.bridgeApi = async () => {
@@ -3753,6 +6599,9 @@ test("content script downloads artifacts from the last assistant message", async
     },
     arrayBuffer: async () => Buffer.from("report from gpt", "utf8")
   });
+  context.waitForInterpreterDownloadResources = async () => {
+    throw new Error("visible download links must be captured before waiting for interpreter resources");
+  };
 
   const result = await context.collectDownloadArtifacts(message);
 
@@ -3832,6 +6681,13 @@ test("content script captures artifacts from ChatGPT file card download buttons"
 
 test("content script does not use office preview images as downloadable file artifacts", async () => {
   const context = await loadContentScriptContext();
+  let now = 0;
+  let waitedMs = 0;
+  class FakeDate extends Date {
+    static now() {
+      return now;
+    }
+  }
   const image = {
     currentSrc: "data:image/png;base64,preview-image",
     src: "data:image/png;base64,preview-image",
@@ -3857,12 +6713,18 @@ test("content script does not use office preview images as downloadable file art
       return [];
     }
   };
+  context.Date = FakeDate;
+  context.sleep = async (delayMs) => {
+    waitedMs += delayMs;
+    now += delayMs;
+  };
 
   const result = await context.collectDownloadArtifacts(message, { syncJobId: "sync_xlsx_preview" });
 
   assert.equal(result.artifacts.length, 0);
   assert.equal(result.artifactIds.length, 0);
   assert.equal(result.errors.length, 0);
+  assert.ok(waitedMs <= 750, `office preview waited ${waitedMs}ms without a download surface`);
 });
 
 test("content script recovers imported artifacts when extension context invalidates during file-card capture", async () => {
@@ -4804,7 +7666,7 @@ test("content script ignores stale interpreter resources for preview-only presen
   assert.deepEqual(Array.from(result.errors), []);
 });
 
-test("content script rebuilds xlsx artifact from embedded spreadsheet output when interpreter download is unauthorized", async () => {
+test("content script never replaces an unavailable original xlsx with a lossy preview reconstruction", async () => {
   const context = await loadContentScriptContext();
   const filename = "bridge-preview-only-table.xlsx";
   const interpreterUrl =
@@ -4865,14 +7727,36 @@ test("content script rebuilds xlsx artifact from embedded spreadsheet output whe
   const result = await context.collectDownloadArtifacts(message, { syncJobId: "sync_embedded_xlsx" });
 
   assert.deepEqual(Array.from(result.artifactIds), []);
-  assert.equal(result.artifacts.length, 1);
-  assert.equal(result.artifacts[0].filename, filename);
-  assert.equal(
-    result.artifacts[0].contentType,
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  );
-  assert.ok(Buffer.from(result.artifacts[0].base64Data, "base64").subarray(0, 2).equals(Buffer.from("PK")));
-  assert.deepEqual(Array.from(result.errors), []);
+  assert.equal(result.artifacts.length, 0);
+  assert.ok(result.errors.some(error=>/401/.test(error.error)));
+});
+
+test("file-card download controls precede preview references for the same file",async()=>{
+  const context=await loadContentScriptContext();
+  const preview={getAttribute:()=>"下载 Excel 文件 report.xlsx",textContent:"report.xlsx"};
+  const download={getAttribute:()=>"下载文件",textContent:""};
+  context.isLikelyFileDownloadButton=()=>true;
+  assert.equal(context.downloadButtonCandidates({querySelectorAll:()=>[preview,download]})[0],download);
+});
+
+test("file download focuses hover-only controls before issuing the trusted click",async()=>{
+  const context=await loadContentScriptContext();let focused=false;
+  context.canAskBackgroundForDownloads=()=>true;
+  context.scrollElementIntoClickView=async()=>{};
+  context.sleep=async()=>{};
+  context.clickCoordinates=()=>({x:10,y:10});
+  context.chromeRuntimeMessage=async()=>{assert.equal(focused,true);return{ok:true};};
+  await context.triggerDownloadButton({focus:()=>{focused=true;},click(){assert.fail("Fallback must not hide an invalid trusted-click order");}});
+});
+
+test("native file download invokes the exact DOM control without debugger coordinate input",async()=>{
+  const context=await loadContentScriptContext();let clicks=0;
+  context.sleep=async()=>{};context.canAskBackgroundForDownloads=()=>true;
+  context.scrollElementIntoClickView=async()=>{};
+  context.clickCoordinates=()=>({x:10,y:20});
+  context.chromeRuntimeMessage=async()=>({ok:true});
+  await context.triggerDownloadButton({getAttribute:()=>"下载文件",focus(){},click(){clicks++;}});
+  assert.equal(clicks,1);
 });
 
 test("content script ignores stale interpreter download resources when the current reply has no filenames", async () => {
@@ -4900,6 +7784,25 @@ test("content script ignores stale interpreter download resources when the curre
       if (selector === "a[href]") return [];
       if (selector === "button") return [];
       if (selector === "img") return [];
+      return [];
+    }
+  };
+
+  const result = await context.collectDownloadArtifacts(message);
+
+  assert.deepEqual(Array.from(result.artifacts), []);
+  assert.deepEqual(Array.from(result.artifactIds), []);
+  assert.deepEqual(Array.from(result.errors), []);
+});
+
+test("content script does not wait for interpreter resources for a plain text reply", async () => {
+  const context = await loadContentScriptContext();
+  context.waitForInterpreterDownloadResources = async () => {
+    throw new Error("plain text replies must not enter the five-second interpreter wait");
+  };
+  const message = {
+    textContent: "This is a complete plain text reply.",
+    querySelectorAll() {
       return [];
     }
   };
@@ -5145,7 +8048,7 @@ test("content script reports one zip download failure without retrying the same 
   const result = await context.collectDownloadArtifacts(message, { syncJobId: "sync_zip_bundle_timeout" });
 
   assert.deepEqual(
-    messages.map((message) => message.type),
+    messages.filter((message) => message.type !== "bridge:api").map((message) => message.type),
     ["bridge:startDownloadWatch", "bridge:trustedClick", "bridge:awaitDownloadWatch"]
   );
   assert.deepEqual(Array.from(result.artifactIds), []);
@@ -5471,7 +8374,7 @@ test("content script tries another same-file card button when the first zip butt
   const result = await context.collectDownloadArtifacts(message, { syncJobId: "sync_zip_second_button" });
 
   assert.deepEqual(
-    messages.map((message) => message.type),
+    messages.filter((message) => message.type !== "bridge:api").map((message) => message.type),
     [
       "bridge:startDownloadWatch",
       "bridge:trustedClick",
@@ -5501,7 +8404,7 @@ test("content script scans the enclosing assistant turn for generated file cards
       return [];
     },
     closest(selector) {
-      return selector === 'section[data-testid^="conversation-turn-"]' ? section : null;
+      return selector === '[data-testid^="conversation-turn-"]' ? section : null;
     }
   };
   let clicked = false;
@@ -5589,6 +8492,9 @@ test("content script falls back to capturing generated images from the assistant
     },
     arrayBuffer: async () => imageBytes
   });
+  context.waitForInterpreterDownloadResources = async () => {
+    throw new Error("visible generated images must be captured before waiting for interpreter resources");
+  };
 
   const result = await context.collectDownloadArtifacts(message);
 
@@ -5691,6 +8597,28 @@ test("content script detects image artifact requests without matching normal sli
   assert.equal(context.expectsImageArtifact({ payloadText: "闁荤姴娲ˉ鎾诲极閹捐绠ｉ柟閭︿簽锟??food-mini.pptx" }), false);
   assert.equal(context.requestedImageFilename({ payloadText: "闂佸搫鍊稿ú锝呪枎閵忋倕瑙︾€广儱娲﹂弳?blue-circle-priority-v3.png" }), "blue-circle-priority-v3.png");
   assert.equal(context.requestedImageFilename({ payloadText: "闂佸搫鍊稿ú锝呪枎閵忋倕瑙︾€广儱娲﹂弳?food-mini.pptx" }), null);
+});
+
+test("content script does not wait for an image when the prompt explicitly says not to generate a poster", async () => {
+  const context = await loadContentScriptContext();
+  const payloadText = [
+    "\u6211\u60f3\u5199\u4e00\u672c\u5c0f\u8bf4\uff0c\u8bf7\u8bbe\u8ba1\u524d\u4e09\u96c6\u3002",
+    "\u4e0d\u8981\u7ee7\u7eed\u5199\u7b2c\u4e00\u96c6\u6b63\u6587\uff0c\u4e5f\u4e0d\u5236\u4f5c\u6d77\u62a5\u3002"
+  ].join("");
+
+  assert.equal(context.hasImageOutputRequestSignal(payloadText), true);
+  assert.equal(context.requestedImageCount({ payloadText }), 0);
+  assert.equal(context.expectsImageArtifact({ kind: "image_request", payloadText }), false);
+});
+
+test("content script still captures one requested image when the prompt only forbids duplicates", async () => {
+  const context = await loadContentScriptContext();
+  const payloadText =
+    "请生成且只生成1张正方形极简验收图片。不要生成多张，不要引用或重复本会话以前的图片。";
+
+  assert.equal(context.hasNegativeArtifactSignal(payloadText), false);
+  assert.equal(context.requestedImageCount({ kind: "image_request", payloadText }), 1);
+  assert.equal(context.expectsImageArtifact({ kind: "image_request", payloadText }), true);
 });
 
 test("content script splits multiple requested image filenames", async () => {
@@ -5879,6 +8807,131 @@ test("content script captures generated image galleries with rail thumbnails", a
 
   assert.equal(result.artifacts.length, 5);
   assert.equal(new Set(fetched).size, 5);
+});
+
+test("content script captures only the requested current image instead of older gallery images", async () => {
+  const context = await loadContentScriptContext();
+  const imageBytes = Buffer.from("png", "utf8");
+  const makeImage = (id) => ({
+    currentSrc: `https://chatgpt.com/backend-api/estuary/content?id=${id}`,
+    src: `https://chatgpt.com/backend-api/estuary/content?id=${id}`,
+    naturalWidth: 1024,
+    naturalHeight: 1024,
+    width: 520,
+    height: 520,
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      if (name === "src") return this.src;
+      if (name === "aria-label") return "";
+      return null;
+    },
+    getClientRects() {
+      return [{ width: this.width, height: this.height }];
+    }
+  });
+  const images = [
+    makeImage("current-poster"),
+    ...Array.from({ length: 6 }, (_, index) => makeImage(`older-poster-${index + 1}`))
+  ];
+  const message = {
+    textContent: "已生成 1 张小说海报",
+    querySelectorAll(selector) {
+      if (selector === "img") return images;
+      return [];
+    }
+  };
+  const fetched = [];
+  context.fetch = async (url) => {
+    fetched.push(String(url));
+    return {
+      ok: true,
+      url,
+      headers: {
+        get(name) {
+          if (name.toLowerCase() === "content-type") return "image/png";
+          return null;
+        }
+      },
+      arrayBuffer: async () => imageBytes
+    };
+  };
+
+  const result = await context.collectDownloadArtifacts(message, {
+    preferImages: true,
+    expectedImageCount: 1
+  });
+
+  assert.equal(result.artifacts.length, 1);
+  assert.deepEqual(fetched, [
+    "https://chatgpt.com/backend-api/estuary/content?id=current-poster"
+  ]);
+});
+
+test("content script excludes images that existed before the current job from recovery galleries", async () => {
+  const context = await loadContentScriptContext();
+  const imageBytes = Buffer.from("png", "utf8");
+  const makeImage = (id) => ({
+    currentSrc: `https://chatgpt.com/backend-api/estuary/content?id=${id}`,
+    src: `https://chatgpt.com/backend-api/estuary/content?id=${id}`,
+    naturalWidth: 1024,
+    naturalHeight: 1024,
+    width: 520,
+    height: 520,
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      if (name === "src") return this.src;
+      if (name === "aria-label") return "";
+      return null;
+    },
+    getClientRects() {
+      return [{ width: this.width, height: this.height }];
+    }
+  });
+  const currentImage = makeImage("current-job-image");
+  const historicalImage = makeImage("historical-image");
+  const historicalUrl = "https://chatgpt.com/backend-api/estuary/content?id=historical-image";
+  const message = {
+    textContent: "已生成当前任务图片",
+    querySelectorAll(selector) {
+      if (selector === "img") return [currentImage];
+      return [];
+    },
+    contains(node) {
+      return node === currentImage;
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === "img") return [currentImage, historicalImage];
+    return [];
+  };
+  const fetched = [];
+  context.fetch = async (url) => {
+    fetched.push(String(url));
+    return {
+      ok: true,
+      url,
+      headers: {
+        get(name) {
+          if (name.toLowerCase() === "content-type") return "image/png";
+          return null;
+        }
+      },
+      arrayBuffer: async () => imageBytes
+    };
+  };
+
+  const result = await context.collectDownloadArtifacts(message, {
+    preferImages: true,
+    includePageGallery: true,
+    excludeImageKeys: [historicalUrl]
+  });
+
+  assert.equal(result.artifacts.length, 1);
+  assert.deepEqual(fetched, [
+    "https://chatgpt.com/backend-api/estuary/content?id=current-job-image"
+  ]);
 });
 
 test("content script captures generated image galleries when rail thumbnails are small", async () => {
@@ -6308,7 +9361,7 @@ test("content script waits for a single requested image before completing", asyn
     if (selector === "button") return [sendButton];
     if (selector === '[data-message-author-role="user"]') return sent ? [userMessage] : [];
     if (selector === '[data-message-author-role="assistant"]') return sent ? [assistantTurn] : [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
+    if (selector === '[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -6380,7 +9433,7 @@ test("content script requires image content for a stable single-image reply", as
     if (sleepCalls >= 5) imageVisible = true;
   };
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantTurn];
     if (selector === "button" || selector === '[role="button"]' || selector === '[data-testid*="stop"]') return [];
     return [];
@@ -6510,7 +9563,7 @@ test("content script waits for the requested multi-image count before completing
     if (selector === "button") return [sendButton];
     if (selector === '[data-message-author-role="user"]') return sent ? [userMessage] : [];
     if (selector === '[data-message-author-role="assistant"]') return sent ? [assistantTurn] : [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
+    if (selector === '[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -6604,6 +9657,7 @@ test("content script selects an image-only reply after the matching user prompt"
     }
   };
   const userTurn = {
+    getAttribute(name) { return name === "data-turn-id" ? "image-user" : null; },
     textContent: "闂備浇宕垫慨鏉懨洪鈶哄骞樼拠鍙夌€梺鐟板綖缁鳖噣锟??blue-circle-filename-v4.png",
     querySelector() {
       return null;
@@ -6613,6 +9667,7 @@ test("content script selects an image-only reply after the matching user prompt"
     }
   };
   const imageReplyTurn = {
+    getAttribute(name) { return name === "data-turn-id" ? "image-answer" : null; },
     textContent: "",
     querySelector() {
       return null;
@@ -6625,11 +9680,11 @@ test("content script selects an image-only reply after the matching user prompt"
 
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return [oldAssistantMessage];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [oldAssistantTurn, userTurn, imageReplyTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [oldAssistantTurn, userTurn, imageReplyTurn];
     return [];
   };
 
-  assert.equal(context.lastAssistantMessage({ afterUserText: "blue-circle-filename-v4.png" }), imageReplyTurn);
+  assert.equal(context.lastAssistantMessage({ afterUserTurnId: "image-user", afterUserText: "blue-circle-filename-v4.png" }), imageReplyTurn);
 });
 
 test("content script anchors filename prompts to the user turn instead of the assistant reply", async () => {
@@ -6666,7 +9721,7 @@ test("content script anchors filename prompts to the user turn instead of the as
 
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     return [];
   };
 
@@ -6688,7 +9743,7 @@ test("content script does not fall back to stale assistant replies before the ma
 
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return [staleAssistantMessage];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [staleAssistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [staleAssistantTurn];
     return [];
   };
 
@@ -6713,7 +9768,7 @@ test("content script ignores ChatGPT bootstrap page text when no assistant messa
 
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [];
+    if (selector === '[data-testid^="conversation-turn-"]') return [];
     if (selector === "article, main [role='presentation'], main div") return [bootstrapNode];
     return [];
   };
@@ -6927,7 +9982,7 @@ test("content script waits past document reading placeholder before returning fi
   };
 
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
     return [];
   };
@@ -6998,7 +10053,7 @@ test("content script waits past file generation promise until a downloadable car
   };
 
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
     return [];
   };
@@ -7055,7 +10110,7 @@ test("content script waits past document skill lookup placeholder before returni
   };
 
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
     return [];
   };
@@ -7114,7 +10169,7 @@ test("content script waits longer for file analysis text that pauses mid sentenc
   };
 
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
     return [];
   };
@@ -7243,7 +10298,7 @@ test("content script accepts repeated text when it belongs to the matching new a
   let now = 0;
   context.Date = class extends Date {
     static now() {
-      now += 50_000;
+      now += 10_000;
       return now;
     }
   };
@@ -7278,7 +10333,7 @@ test("content script accepts repeated text when it belongs to the matching new a
     }
   };
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
     if (selector === "button") return [];
     return [];
@@ -7291,6 +10346,8 @@ test("content script accepts repeated text when it belongs to the matching new a
 
 test("content script matches Markdown list prompts after ChatGPT removes list markers", async () => {
   const context = await loadContentScriptContext();
+  let now = 0;
+  context.Date = class extends Date { static now() { now += 10000; return now; } };
   const payload = [
     "请只完成第 1 步：为玄幻穿越小说设计前十集的大纲。",
     "",
@@ -7303,8 +10360,8 @@ test("content script matches Markdown list prompts after ChatGPT removes list ma
   const previousReply = "旧版大纲回复。";
   const latestReply = "新版完整大纲回复。";
 
-  const userTurn = () => ({
-    textContent: renderedPrompt,
+  const userTurn = (text = renderedPrompt) => ({
+    textContent: text,
     querySelector(selector) {
       if (selector === '[data-message-author-role="user"]') return {};
       return null;
@@ -7341,11 +10398,11 @@ test("content script matches Markdown list prompts after ChatGPT removes list ma
   };
   const oldAssistant = assistantTurn(previousReply);
   const newAssistant = assistantTurn(latestReply);
-  const turns = [userTurn(), oldAssistant.turn, userTurn(), newAssistant.turn];
+  const turns = [userTurn("An earlier unrelated request"), oldAssistant.turn, userTurn(), newAssistant.turn];
 
   context.sleep = async () => {};
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return turns;
+    if (selector === '[data-testid^="conversation-turn-"]') return turns;
     if (selector === '[data-message-author-role="assistant"]') {
       return [oldAssistant.message, newAssistant.message];
     }
@@ -7360,7 +10417,181 @@ test("content script matches Markdown list prompts after ChatGPT removes list ma
   assert.equal(await context.waitForAssistantReply(previousReply, { afterUserText: payload }), latestReply);
 });
 
-test("content script completes repeated file analysis replies by matching attachment prompt candidates", async () => {
+test("content script does not confirm a send from an older duplicate prompt", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "基于上一阶段结果，只生成一张竖版中文小说海报。";
+  const makeUserTurn = () => ({
+    textContent: prompt,
+    querySelector(selector) {
+      return selector === '[data-message-author-role="user"]' ? {} : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  });
+  const oldAssistantTurn = {
+    textContent: "旧海报",
+    querySelector(selector) {
+      return selector === '[data-message-author-role="assistant"]' ? {} : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const turns = [makeUserTurn(), oldAssistantTurn];
+  let sleepCount = 0;
+  context.sleep = async () => {
+    sleepCount += 1;
+    if (sleepCount === 1) {
+      turns.push(makeUserTurn());
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return turns;
+    if (selector === '[data-message-author-role="user"]') {
+      return turns.filter((turn) => turn !== oldAssistantTurn);
+    }
+    return [];
+  };
+
+  const submitted = await context.waitForSubmittedPrompt(
+    { kind: "image_request", payloadText: prompt },
+    2_000,
+    { afterTurnIndex: 1 }
+  );
+
+  assert.equal(sleepCount, 1);
+  assert.equal(submitted.index, 2);
+});
+
+test("content script refuses an unanchored Canvas reply after ChatGPT reindexes away the confirmed user turn", async () => {
+  const context = await loadContentScriptContext();
+  const previousReply = "An older assistant answer.";
+  const canvasReply = [
+    "# 第七码头",
+    "",
+    "## 第三集：档案室里没有死者",
+    "",
+    "周叙从档案回溯中醒来，身份删除进度升到49%。",
+    "",
+    "以上只完成前三集设计，没有展开第一集正文，也没有生成海报。"
+  ].join("\n");
+  let now = 0;
+  context.Date = class extends Date {
+    static now() {
+      now += 10_000;
+      return now;
+    }
+  };
+  context.sleep = async () => {};
+
+  const assistantMessage = fakeElement(
+    "div",
+    { "data-message-author-role": "assistant" },
+    [fakeElement("article", {}, [fakeText(canvasReply)])]
+  );
+  const canvasTurn = fakeElement(
+    "section",
+    { "data-testid": "conversation-turn-canvas-reindexed" },
+    [assistantMessage]
+  );
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [canvasTurn];
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    if (selector === "button" || selector === '[role="button"]' || selector === '[data-testid*="stop"]') {
+      return [];
+    }
+    return [];
+  };
+
+  await assert.rejects(context.waitForAssistantReply(previousReply, {
+    afterUserTurnIndex: 7,
+    afterUserText: "请设计小说的前三集。"
+  }), /等待 GPT 回复超时/);
+});
+
+test("content script captures an image-only reply by prompt after the confirmed turn index is reindexed", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "只生成一张竖版中文小说海报。";
+  let now = 0;
+  context.Date = class extends Date {
+    static now() {
+      now += 60_000;
+      return now;
+    }
+  };
+  context.sleep = async () => {};
+
+  const image = {
+    currentSrc: "blob:https://chatgpt.com/generated-poster",
+    src: "blob:https://chatgpt.com/generated-poster",
+    naturalWidth: 1024,
+    naturalHeight: 1536,
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      if (name === "src") return this.src;
+      if (name === "aria-label") return "";
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 512, height: 768 }];
+    }
+  };
+  const userRole = { textContent: prompt };
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      return selector === '[data-message-author-role="user"]' ? userRole : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const imageTurn = {
+    textContent: "",
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === "img") return [image];
+      return [];
+    },
+    closest() {
+      return null;
+    }
+  };
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, imageTurn];
+    if (selector === '[data-message-author-role="assistant"]') return [];
+    if (
+      selector === "button" ||
+      selector === '[role="button"]' ||
+      selector === '[data-testid*="stop"]'
+    ) {
+      return [];
+    }
+    return [];
+  };
+
+  const reply = await context.waitForAssistantReply("older assistant reply", {
+    afterUserTurnIndex: 7,
+    afterUserText: prompt,
+    expectedImageCount: 1
+  });
+
+  assert.equal(reply, "GPT generated an image.");
+  assert.equal(
+    context.lastAssistantMessage({
+      afterUserTurnIndex: 7,
+      afterUserText: prompt,
+      requireAfterUserText: true
+    }),
+    imageTurn
+  );
+});
+
+test("content script completes repeated file analysis replies using the confirmed turn identity", async () => {
   const context = await loadContentScriptContext();
   const repeatedReply = "The ZIP contains one file: `Codex-Setup-Tool.cmd`.";
   const hiddenPayload = "Internal Bridge attachment instruction that is not visible in the ChatGPT turn.";
@@ -7378,6 +10609,7 @@ test("content script completes repeated file analysis replies by matching attach
 
   const userTurn = {
     textContent: visibleUserText,
+    getAttribute: name => name === "data-turn-id" ? "attachment-user" : null,
     querySelector(selector) {
       if (selector === '[data-message-author-role="user"]') return {};
       return null;
@@ -7397,6 +10629,7 @@ test("content script completes repeated file analysis replies by matching attach
   };
   const assistantTurn = {
     textContent: repeatedReply,
+    getAttribute: name => name === "data-turn-id" ? "attachment-answer" : null,
     querySelector(selector) {
       if (selector === '[data-message-author-role="assistant"]') return assistantMessage;
       return null;
@@ -7406,7 +10639,7 @@ test("content script completes repeated file analysis replies by matching attach
     }
   };
   context.document.querySelectorAll = (selector) => {
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
     if (selector === "button") return [];
     return [];
@@ -7419,6 +10652,7 @@ test("content script completes repeated file analysis replies by matching attach
   await context.processJob(
     {
       id: "sync_repeated_zip",
+      submittedPromptTurnId: "attachment-user",
       kind: "codex_file_analysis",
       payloadText: hiddenPayload,
       userText: "Ask GPT to analyze file: Codex-Setup-Tool.zip",
@@ -7483,7 +10717,582 @@ test("content script resumes a sent job without resending the prompt", async () 
     bridgeCalls.map((call) => call.path),
     ["/api/sync/jobs/sync_resume/complete"]
   );
-  assert.equal(JSON.parse(bridgeCalls[0].options.body).replyText, "new answer after reload");
+  const completedBody = JSON.parse(bridgeCalls[0].options.body);
+  assert.equal(completedBody.replyText, "new answer after reload");
+  assert.match(
+    completedBody.workerId,
+    /^codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-missing:tab_/
+  );
+});
+
+test("content script publishes a captured heartbeat after normal completion succeeds", async () => {
+  const context = await loadContentScriptContext();
+  const reply = "This is the complete final response with enough detail to prove that normal reply capture has finished successfully.";
+  const assistant = {
+    textContent: reply,
+    innerText: reply,
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return null;
+    }
+  };
+  let heartbeatBody = null;
+
+  context.sleep = async () => {};
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-message-author-role="assistant"]') return [assistant];
+    if (selector === "button") return [];
+    return [];
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    if (path === "/api/sync/jobs/sync_normal_capture_status/complete") {
+      return {
+        job: {
+          id: "sync_normal_capture_status",
+          status: "succeeded"
+        }
+      };
+    }
+    if (path === "/api/extension/heartbeat") {
+      heartbeatBody = JSON.parse(options.body);
+      return {};
+    }
+    throw new Error(`Unexpected bridge call: ${path}`);
+  };
+
+  await context.processJob(
+    {
+      id: "sync_normal_capture_status",
+      payloadText: "return one final response",
+      previousAssistantText: "old answer",
+      sentAt: "2026-07-31T11:45:52.018Z"
+    },
+    { resume: true }
+  );
+  await context.sendHeartbeat({ lightweight: true });
+
+  assert.equal(heartbeatBody.captureStatus.jobId, "sync_normal_capture_status");
+  assert.equal(heartbeatBody.captureStatus.state, "captured");
+  assert.equal(heartbeatBody.captureStatus.replyLength, reply.length);
+  assert.equal(heartbeatBody.captureStatus.artifactCount, 0);
+});
+
+test("content script can capture an already-finished scoped reply while the original waiter is stuck", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "请只设计小说前三集，不要继续写正文。";
+  const reply = "这是已经完整返回的前三集设计。第一集建立冲突，第二集扩大危机，第三集以强悬念收尾。";
+  const userMessage = {
+    textContent: prompt,
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantMessage = {
+    textContent: reply,
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return assistantTurn;
+    }
+  };
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="user"]') return userMessage;
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantTurn = {
+    textContent: reply,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="assistant"]') return assistantMessage;
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const bridgeCalls = [];
+
+  context.sleep = async () => {};
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    if (selector === "button") return [];
+    return [];
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    bridgeCalls.push({ path, options });
+    if (path === "/api/sync/jobs/sync_stuck_waiter") {
+      return { job: { id: "sync_stuck_waiter", status: "running" } };
+    }
+    return {};
+  };
+
+  assert.equal(
+    await context.captureExistingReply({
+      id: "sync_stuck_waiter",
+      status: "running",
+      payloadText: prompt,
+      userText: prompt,
+      previousAssistantText: "旧回复",
+      sentAt: "2026-07-28T10:12:54.115Z",
+      inputArtifacts: []
+    }),
+    true
+  );
+
+  assert.deepEqual(
+    bridgeCalls.map((call) => call.path),
+    [
+      "/api/sync/jobs/sync_stuck_waiter",
+      "/api/sync/jobs/sync_stuck_waiter",
+      "/api/sync/jobs/sync_stuck_waiter",
+      "/api/sync/jobs/sync_stuck_waiter/complete"
+    ]
+  );
+  assert.equal(JSON.parse(bridgeCalls.at(-1).options.body).replyText, reply);
+});
+
+test("content script does not report capture success when the server returns a failed completion job", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "Return one complete project analysis.";
+  const reply = [
+    "The requested report has been fully prepared and the generation task is complete.",
+    "It contains the final introduction, findings, recommendations, validation checklist, and closing summary.",
+    "No additional analysis or generation is still running, and this is the final response."
+  ].join(" ");
+  const userMessage = {
+    textContent: prompt,
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantMessage = {
+    textContent: reply,
+    innerText: reply,
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return assistantTurn;
+    }
+  };
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="user"]') return userMessage;
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantTurn = {
+    textContent: reply,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="assistant"]') return assistantMessage;
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  let heartbeatBody = null;
+
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    if (selector === "button") return [];
+    return [];
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    if (path === "/api/sync/jobs/sync_failed_completion_status") {
+      return {
+        job: {
+          id: "sync_failed_completion_status",
+          status: "running"
+        }
+      };
+    }
+    if (path === "/api/sync/jobs/sync_failed_completion_status/complete") {
+      return {
+        job: {
+          id: "sync_failed_completion_status",
+          status: "failed",
+          errorCode: "server_validation_failed",
+          error: "The server rejected the captured result"
+        }
+      };
+    }
+    if (path === "/api/extension/heartbeat") {
+      heartbeatBody = JSON.parse(options.body);
+      return {};
+    }
+    throw new Error(`Unexpected bridge call: ${path}`);
+  };
+
+  const captured = await context.captureExistingReply({
+    id: "sync_failed_completion_status",
+    status: "running",
+    payloadText: prompt,
+    userText: prompt,
+    previousAssistantText: "old answer",
+    sentAt: "2026-07-31T12:00:00.000Z",
+    inputArtifacts: []
+  });
+  await context.sendHeartbeat({ lightweight: true });
+
+  assert.equal(captured, false);
+  assert.equal(heartbeatBody.captureStatus.jobId, "sync_failed_completion_status");
+  assert.equal(heartbeatBody.captureStatus.state, "completion_failed");
+  assert.equal(heartbeatBody.captureStatus.errorCode, "server_validation_failed");
+});
+
+async function captureConcurrencyFixture() {
+  const context = await loadContentScriptContext();
+  const prompt = "Download the current Excel file.";
+  const reply = "Download current.xlsx.";
+  const job = { id: "sync_capture_concurrency", status: "running", sentAt: "2026-09-10T00:00:00Z",
+    payloadText: prompt, userText: prompt, previousAssistantText: "old reply", inputArtifacts: [] };
+  const userMessage = { textContent: prompt, querySelectorAll: () => [] };
+  const assistantMessage = { textContent: reply, innerText: reply, querySelectorAll: () => [], closest: () => assistantTurn };
+  const userTurn = { textContent: prompt, querySelector: (s) => s === '[data-message-author-role="user"]' ? userMessage : null, querySelectorAll: () => [] };
+  const assistantTurn = { textContent: reply, querySelector: (s) => s === '[data-message-author-role="assistant"]' ? assistantMessage : null, querySelectorAll: () => [] };
+  context.document.querySelectorAll = (s) => s === '[data-testid^="conversation-turn-"]'
+    ? [userTurn, assistantTurn] : s === '[data-message-author-role="assistant"]' ? [assistantMessage] : [];
+  // Browser download and HTTP boundaries are delayed; both production capture paths stay real.
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const effects = { downloads: 0, completions: 0, status: "running" };
+  context.waitForAssistantReply = async () => reply;
+  context.collectDownloadArtifacts = async () => {
+    effects.downloads += 1;
+    entered.resolve();
+    await release.promise;
+    return { artifacts: [], artifactIds: ["artifact_current"], errors: [] };
+  };
+  context.bridgeApi = async (url, options = {}) => {
+    if (url === `/api/sync/jobs/${job.id}`) return { job: { id: job.id, status: effects.status } };
+    if (url === `/api/sync/jobs/${job.id}/complete`) {
+      assert.deepEqual(JSON.parse(options.body).artifactIds, ["artifact_current"]);
+      effects.completions += 1;
+      effects.status = "succeeded";
+      return { job: { id: job.id, status: effects.status } };
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  return { context, job, entered, release, effects };
+}
+
+for (const firstPath of ["normal waiter", "recovery"]) {
+  test(`content script shares one download and completion when ${firstPath} overlaps recovery`, async () => {
+    const { context, job, entered, release, effects } = await captureConcurrencyFixture();
+    const first = firstPath === "normal waiter" ? context.processJob(job) : context.captureExistingReply(job);
+    await entered.promise;
+    const second = context.captureExistingReply(job);
+    await new Promise(setImmediate);
+    release.resolve();
+    await Promise.all([first, second]);
+    assert.equal(effects.downloads, 1, "one browser download per job, including heartbeat recovery");
+    assert.equal(effects.completions, 1, "the shared capture must submit one terminal result");
+    assert.equal(effects.status, "succeeded");
+  });
+}
+
+test("content script keeps the capture shared until the completion request settles", async () => {
+  const { context, job, release, effects } = await captureConcurrencyFixture();
+  const completionEntered = Promise.withResolvers();
+  const completionRelease = Promise.withResolvers();
+  const api = context.bridgeApi;
+  context.bridgeApi = async (url, options) => {
+    if (url.endsWith("/complete")) {
+      completionEntered.resolve();
+      await completionRelease.promise;
+    }
+    return api(url, options);
+  };
+  release.resolve();
+  const first = context.processJob(job);
+  await completionEntered.promise;
+  const second = context.captureExistingReply(job);
+  await new Promise(setImmediate);
+  completionRelease.resolve();
+  await Promise.all([first, second]);
+  assert.equal(effects.downloads, 1);
+  assert.equal(effects.completions, 1);
+});
+
+test("content script releases a failed shared capture so the same job can recover", async () => {
+  const { context, job, release, effects } = await captureConcurrencyFixture();
+  const download = context.collectDownloadArtifacts;
+  context.collectDownloadArtifacts = async () => { throw new Error("download interrupted"); };
+  await assert.rejects(context.processJob(job), /download interrupted/);
+  assert.equal(effects.completions, 0);
+  context.collectDownloadArtifacts = download;
+  release.resolve();
+  assert.equal(await context.captureExistingReply(job), true);
+  assert.equal(effects.downloads, 1);
+  assert.equal(effects.completions, 1);
+});
+
+test("content script does not complete a job cancelled during a shared capture", async () => {
+  const { context, job, entered, release, effects } = await captureConcurrencyFixture();
+  const first = context.processJob(job);
+  await entered.promise;
+  const second = context.captureExistingReply(job);
+  await new Promise(setImmediate);
+  effects.status = "failed";
+  release.resolve();
+  await Promise.all([first, second]);
+  assert.equal(effects.downloads, 1);
+  assert.equal(effects.completions, 0);
+  assert.equal(effects.status, "failed");
+});
+
+test("content script does not let a late recovery probe overwrite a captured terminal status", async () => {
+  const context = await loadContentScriptContext();
+  const job = {
+    id: "sync_late_recovery_probe",
+    status: "running",
+    sentAt: "2026-07-31T12:07:18.682Z"
+  };
+  let heartbeatBody = null;
+
+  context.document.querySelectorAll = () => [];
+  context.recordCompletionCaptureStatus(
+    job,
+    {
+      job: {
+        id: job.id,
+        status: "succeeded"
+      }
+    },
+    {
+      replyLength: 17,
+      artifactCount: 0
+    }
+  );
+  context.bridgeApi = async (path, options = {}) => {
+    if (path === `/api/sync/jobs/${job.id}`) {
+      return {
+        job: {
+          id: job.id,
+          status: "succeeded"
+        }
+      };
+    }
+    if (path === "/api/extension/heartbeat") {
+      heartbeatBody = JSON.parse(options.body);
+      return {};
+    }
+    throw new Error(`Unexpected bridge call: ${path}`);
+  };
+
+  assert.equal(await context.captureExistingReply(job), true);
+  await context.sendHeartbeat({ lightweight: true });
+
+  assert.equal(heartbeatBody.captureStatus.jobId, job.id);
+  assert.equal(heartbeatBody.captureStatus.state, "captured");
+  assert.equal(heartbeatBody.captureStatus.replyLength, 17);
+});
+
+test("content script preserves captured status when the job finishes during recovery collection", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "Return the final sentence.";
+  const reply = "CAPTURE-RACE-OK.";
+  const job = {
+    id: "sync_finishes_during_recovery_collection",
+    status: "running",
+    payloadText: prompt,
+    userText: prompt,
+    previousAssistantText: "old answer",
+    sentAt: "2026-07-31T12:17:50.948Z",
+    inputArtifacts: []
+  };
+  const userMessage = {
+    textContent: prompt,
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantMessage = {
+    textContent: reply,
+    innerText: reply,
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return assistantTurn;
+    }
+  };
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="user"]') return userMessage;
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantTurn = {
+    textContent: reply,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="assistant"]') return assistantMessage;
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  let jobReads = 0;
+  let heartbeatBody = null;
+
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    if (selector === "button") return [];
+    return [];
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    if (path === `/api/sync/jobs/${job.id}`) {
+      jobReads += 1;
+      if (jobReads === 1) {
+        return { job: { id: job.id, status: "running" } };
+      }
+      context.recordCompletionCaptureStatus(
+        job,
+        { job: { id: job.id, status: "succeeded" } },
+        { replyLength: reply.length, artifactCount: 0 }
+      );
+      return { job: { id: job.id, status: "succeeded" } };
+    }
+    if (path === "/api/extension/heartbeat") {
+      heartbeatBody = JSON.parse(options.body);
+      return {};
+    }
+    throw new Error(`Unexpected bridge call: ${path}`);
+  };
+
+  assert.equal(await context.captureExistingReply(job), true);
+  await context.sendHeartbeat({ lightweight: true });
+
+  assert.equal(jobReads, 2);
+  assert.equal(heartbeatBody.captureStatus.jobId, job.id);
+  assert.equal(heartbeatBody.captureStatus.state, "captured");
+  assert.equal(heartbeatBody.captureStatus.replyLength, reply.length);
+});
+
+test("content script captures a finished image reply even when its short caption has no punctuation", async () => {
+  const context = await loadContentScriptContext();
+  const prompt = "请生成一张竖版小说海报。";
+  const reply = "图片已生成";
+  const image = {
+    currentSrc: "https://chatgpt.com/backend-api/estuary/content?id=file_finished_poster",
+    src: "https://chatgpt.com/backend-api/estuary/content?id=file_finished_poster",
+    naturalWidth: 1024,
+    naturalHeight: 1536,
+    getAttribute(name) {
+      if (name === "src") return this.src;
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 512, height: 768 }];
+    }
+  };
+  const userMessage = {
+    textContent: prompt,
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantMessage = {
+    textContent: reply,
+    innerText: reply,
+    querySelectorAll(selector) {
+      if (selector === "img") return [image];
+      return [];
+    },
+    closest() {
+      return assistantTurn;
+    }
+  };
+  const userTurn = {
+    textContent: prompt,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="user"]') return userMessage;
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const assistantTurn = {
+    textContent: reply,
+    querySelector(selector) {
+      if (selector === '[data-message-author-role="assistant"]') return assistantMessage;
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === "img") return [image];
+      return [];
+    }
+  };
+  const bridgeCalls = [];
+
+  context.document.querySelectorAll = (selector) => {
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+    if (selector === "button") return [];
+    return [];
+  };
+  context.collectDownloadArtifacts = async () => ({
+    artifacts: [{ filename: "poster.png", mimeType: "image/png", base64: "aW1hZ2U=" }],
+    artifactIds: [],
+    errors: []
+  });
+  context.bridgeApi = async (path, options = {}) => {
+    bridgeCalls.push({ path, options });
+    if (path === "/api/sync/jobs/sync_finished_image") {
+      return { job: { id: "sync_finished_image", status: "running" } };
+    }
+    return {};
+  };
+
+  assert.equal(
+    await context.captureExistingReply({
+      id: "sync_finished_image",
+      status: "running",
+      kind: "image_request",
+      payloadText: prompt,
+      userText: prompt,
+      previousAssistantText: "",
+      sentAt: "2026-07-29T10:00:10.591Z",
+      inputArtifacts: []
+    }),
+    true
+  );
+
+  assert.deepEqual(
+    bridgeCalls.map((call) => call.path),
+    [
+      "/api/sync/jobs/sync_finished_image",
+      "/api/sync/jobs/sync_finished_image",
+      "/api/sync/jobs/sync_finished_image",
+      "/api/sync/jobs/sync_finished_image/complete"
+    ]
+  );
+  const completion = JSON.parse(bridgeCalls.at(-1).options.body);
+  assert.equal(completion.replyText, reply);
+  assert.equal(completion.artifacts.length, 1);
 });
 
 test("content script does not complete a sent job after Bridge marks it cancelled", async () => {
@@ -7841,7 +11650,7 @@ test("content script sends a fresh job directly when the project page is ready",
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return [assistant()];
     if (selector === '[data-message-author-role="user"]') return sent ? [userNode] : [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
+    if (selector === '[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
     if (selector === "button") return [sendButton];
     return [];
   };
@@ -7953,7 +11762,7 @@ test("content script sends a claimed unsent job when pre-send refresh was alread
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return sent ? [assistant()] : [];
     if (selector === "button") return [sendButton];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
+    if (selector === '[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -7991,6 +11800,75 @@ test("content script sends a claimed unsent job when pre-send refresh was alread
       "/api/sync/jobs/sync_refresh_persisted/sent",
       "/api/sync/jobs/sync_refresh_persisted/complete"
     ]
+  );
+});
+
+test("content script reports a persisted pre-send job failure instead of swallowing it", async () => {
+  const context = await loadContentScriptContext();
+  const bridgeCalls = [];
+  const storage = new Map();
+  const job = {
+    id: "sync_persisted_pre_send_failure",
+    status: "running",
+    claimedAt: new Date(Date.now() - 61_000).toISOString(),
+    sentAt: null,
+    projectUrl: "https://chatgpt.com/c/demo",
+    payloadText: "release the queue",
+    _bridgePreSendRefresh: true,
+    _bridgeRefreshAttempts: 2
+  };
+  storage.set(
+    "chatgpt-codex-bridge:pre-send-refresh-job",
+    JSON.stringify({ job })
+  );
+  context.sessionStorage = {
+    getItem(key) {
+      return storage.get(key) || null;
+    },
+    setItem(key, value) {
+      storage.set(key, value);
+    },
+    removeItem(key) {
+      storage.delete(key);
+    }
+  };
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/demo"
+  };
+  context.sendHeartbeat = async () => ({
+    controlsCurrentPage: true,
+    projectUrl: "https://chatgpt.com/c/demo"
+  });
+  context.processJob = async () => {
+    const error = new Error("GPT task was claimed but never submitted");
+    error.errorCode = "pre_send_expired";
+    error.recoveryAction = "retry";
+    throw error;
+  };
+  context.bridgeApi = async (path, options = {}) => {
+    bridgeCalls.push({
+      path,
+      body: options.body ? JSON.parse(options.body) : null
+    });
+    if (path === `/api/sync/jobs/${job.id}`) {
+      return { job };
+    }
+    if (path === `/api/sync/jobs/${job.id}/fail`) {
+      return { job: { ...job, status: "failed" } };
+    }
+    throw new Error(`Unexpected bridge call: ${path}`);
+  };
+
+  await context.poll();
+
+  const failCall = bridgeCalls.find((call) => call.path === `/api/sync/jobs/${job.id}/fail`);
+  assert.ok(failCall);
+  assert.equal(failCall.body.errorCode, "pre_send_expired");
+  assert.equal(failCall.body.recoveryAction, "retry");
+  assert.match(
+    failCall.body.workerId,
+    /^codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-missing:tab_/
   );
 });
 
@@ -8133,7 +12011,7 @@ test("content script does not mark a job sent until ChatGPT shows the user promp
   context.document.querySelectorAll = (selector) => {
     if (selector === "button") return [sendButton];
     if (selector === '[data-message-author-role="assistant"]') return [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [];
+    if (selector === '[data-testid^="conversation-turn-"]') return [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -8156,6 +12034,7 @@ test("content script does not mark a job sent when ChatGPT clears the composer w
   const context = await loadContentScriptContext();
   const bridgeCalls = [];
   let sent = false;
+  let logicalNow = 0;
   const composer = {
     tagName: "TEXTAREA",
     value: "",
@@ -8190,6 +12069,12 @@ test("content script does not mark a job sent when ChatGPT clears the composer w
   };
 
   context.location.href = "https://chatgpt.com/c/demo";
+  context.Date = class extends Date {
+    static now() {
+      logicalNow += 500;
+      return logicalNow;
+    }
+  };
   context.sleep = async () => {};
   context.document.querySelector = (selector) => {
     if (selector === "#prompt-textarea") return composer;
@@ -8199,7 +12084,7 @@ test("content script does not mark a job sent when ChatGPT clears the composer w
   context.document.querySelectorAll = (selector) => {
     if (selector === "button") return [sendButton];
     if (selector === '[data-message-author-role="assistant"]') return sent ? [assistantNode] : [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [];
+    if (selector === '[data-testid^="conversation-turn-"]') return [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -8217,6 +12102,7 @@ test("content script does not mark a job sent when ChatGPT clears the composer w
     /(?:ChatGPT did not show the submitted prompt|GPT \u70b9\u51fb\u53d1\u9001\u540e\u6ca1\u6709\u663e\u793a\u5df2\u63d0\u4ea4\u7684\u63d0\u793a)/
   );
 
+  assert.ok(logicalNow >= 4_000, "the full logical send-confirmation window must elapse");
   assert.deepEqual(bridgeCalls.map((call) => call.path), []);
 });
 
@@ -8449,7 +12335,7 @@ test("content script skips per-message preference sync when heartbeat already ap
     if (selector === "button") return [sendButton];
     if (selector === '[data-message-author-role="user"]') return sent ? [userNode] : [];
     if (selector === '[data-message-author-role="assistant"]') return sent ? [assistantNode] : [];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
+    if (selector === '[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -8503,6 +12389,57 @@ test("content script sends an extension heartbeat before claiming work", async (
     ["/api/extension/heartbeat", "/api/sync/jobs/claim"]
   );
   assert.equal(JSON.parse(bridgeCalls[0].options.body).href, "https://chatgpt.com/c/demo");
+});
+
+test("content script asks the background to open another bound GPT conversation without replacing this tab", async () => {
+  const context = await loadContentScriptContext();
+  const runtimeMessages = [];
+  const navigations = [];
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/current-page",
+    replace(url) {
+      navigations.push(url);
+    }
+  };
+  context.document.title = "Current page";
+  context.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage(payload, callback) {
+        runtimeMessages.push(payload);
+        callback({ ok: true, opened: true, tabId: 77 });
+      }
+    }
+  };
+  context.bridgeApi = async (requestPath) => {
+    if (requestPath === "/api/extension/heartbeat") {
+      return {
+        controlsCurrentPage: true,
+        projectUrl: "https://chatgpt.com/c/current-page",
+        openTarget: {
+          action: "open_project_tab",
+          jobId: "sync_waiting_page",
+          projectUrl: "https://chatgpt.com/c/waiting-page"
+        }
+      };
+    }
+    if (requestPath === "/api/sync/jobs/claim") {
+      return { job: null, resume: false };
+    }
+    throw new Error(`Unexpected Bridge call: ${requestPath}`);
+  };
+
+  await context.poll();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), [
+    {
+      type: "bridge:openProjectTab",
+      jobId: "sync_waiting_page",
+      projectUrl: "https://chatgpt.com/c/waiting-page"
+    }
+  ]);
+  assert.deepEqual(navigations, []);
 });
 
 test("content script claims work when heartbeat confirms control without preferences", async () => {
@@ -8838,7 +12775,7 @@ test("content script retries heartbeat preferences after the preference timestam
 
   assert.equal(await context.applyHeartbeatPreferences(preferences), false);
   assert.equal(await context.applyHeartbeatPreferences(changedPreferences), false);
-  assert.equal(modeAttempts, 2);
+  assert.equal(modeAttempts, 0);
   assert.equal(modelAttempts, 2);
 });
 
@@ -8887,9 +12824,9 @@ test("content script reports heartbeat preference selection failures", async () 
     modePreference: "high",
     modelPreference: "gpt-5.6-sol",
     updatedAt: "2026-06-28T00:00:00.000Z",
-    modeSynced: true,
+    modeSynced: false,
     modelSynced: false,
-    error: "model preference was not applied"
+    error: "mode and model preferences were not applied"
   });
 });
 
@@ -8998,7 +12935,7 @@ test("content script does not repeatedly retry the same failed heartbeat prefere
 
   assert.equal(await context.applyHeartbeatPreferences(preferences), false);
   assert.equal(await context.applyHeartbeatPreferences(preferences), false);
-  assert.equal(modeAttempts, 1);
+  assert.equal(modeAttempts, 0);
   assert.equal(modelAttempts, 1);
 });
 
@@ -9053,7 +12990,7 @@ test("content script does not retry the same failed heartbeat preferences on a t
   assert.equal(await context.applyHeartbeatPreferences(preferences), false);
   now = 60001;
   assert.equal(await context.applyHeartbeatPreferences(preferences), false);
-  assert.equal(modeAttempts, 1);
+  assert.equal(modeAttempts, 0);
   assert.equal(modelAttempts, 1);
 });
 
@@ -9140,6 +13077,71 @@ test("content script clears a failed heartbeat preference when the page already 
   });
 });
 
+test("content script reapplies the same heartbeat preferences after the visible controls drift", async () => {
+  const context = await loadContentScriptContext();
+  const preferences = {
+    projectUrl: "https://chatgpt.com/project/demo",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol",
+    updatedAt: "2026-07-28T00:00:00.000Z"
+  };
+  let modeLabel = context.modeLabelForPreference("high");
+  let modelLabel = context.modelLabelForPreference("gpt-5.6-sol");
+  let modeAttempts = 0;
+  let modelAttempts = 0;
+  const visibleControl = (getText) => ({
+    get textContent() {
+      return getText();
+    },
+    get innerText() {
+      return getText();
+    },
+    getAttribute() {
+      return null;
+    },
+    getClientRects() {
+      return [{ width: 88, height: 32 }];
+    }
+  });
+  const modeButton = visibleControl(() => modeLabel);
+  const modelButton = visibleControl(() => modelLabel);
+
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/project/demo/c/abc"
+  };
+  context.document.body = { innerText: "", textContent: "" };
+  context.document.querySelector = (selector) => {
+    if (selector === "#prompt-textarea") {
+      return {
+        tagName: "TEXTAREA",
+        value: "",
+        focus() {},
+        dispatchEvent() {}
+      };
+    }
+    return null;
+  };
+  context.document.querySelectorAll = (selector) =>
+    selector === "button,[role='button']" ? [modeButton, modelButton] : [];
+  context.selectModePreference = async () => {
+    modeAttempts += 1;
+    modeLabel = context.modeLabelForPreference("high");
+    return true;
+  };
+  context.selectModelPreference = async () => {
+    modelAttempts += 1;
+    modelLabel = context.modelLabelForPreference("gpt-5.6-sol");
+    return true;
+  };
+
+  assert.equal(await context.applyHeartbeatPreferences(preferences), true);
+  modeLabel = "wrong mode";
+  assert.equal(await context.applyHeartbeatPreferences(preferences), true);
+  assert.equal(modeAttempts, 1);
+  assert.equal(modelAttempts, 1);
+});
+
 test("content script requests extension reload before claiming work when heartbeat is stale", async () => {
   const context = await loadContentScriptContext();
   const bridgeCalls = [];
@@ -9182,7 +13184,7 @@ test("content script requests extension reload before claiming work when heartbe
     if (path === "/api/extension/heartbeat") {
       return {
         reloadExtension: true,
-        expectedExtensionVersion: "v20260703-repeat-file-reply"
+        expectedExtensionVersion: "v20990101-forward"
       };
     }
     throw new Error(`unexpected call ${path}`);
@@ -9195,7 +13197,7 @@ test("content script requests extension reload before claiming work when heartbe
   assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), [
     {
       type: "bridge:reloadExtension",
-      expectedVersion: "v20260703-repeat-file-reply"
+      expectedVersion: "v20990101-forward"
     }
   ]);
 });
@@ -9597,7 +13599,7 @@ test("content script sends a stored pre-refresh job before applying another hear
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return sent ? [assistant()] : [];
     if (selector === "button") return [sendButton];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
+    if (selector === '[data-testid^="conversation-turn-"]') return sent ? [userTurn, assistantTurn] : [];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -9635,16 +13637,14 @@ test("content script sends a stored pre-refresh job before applying another hear
   assert.equal(sent, true);
   assert.equal(composer.value, "pre refresh prompt");
   assert.equal(storage.has("chatgpt-codex-bridge:pre-send-refresh-job"), false);
+  const stateReads = bridgeCalls.filter(call => call.path === "/api/sync/jobs/sync_stored_refresh");
+  assert.ok(stateReads.length > 0);
+  assert.ok(stateReads.every(call => !call.options?.method || call.options.method === "GET"));
   assert.deepEqual(
-    bridgeCalls.map((call) => call.path),
+    bridgeCalls.map((call) => call.path).filter(path => path !== "/api/sync/jobs/sync_stored_refresh"),
     [
       "/api/extension/heartbeat",
-      "/api/sync/jobs/sync_stored_refresh",
-      "/api/sync/jobs/sync_stored_refresh",
       "/api/sync/jobs/sync_stored_refresh/sent",
-      "/api/sync/jobs/sync_stored_refresh",
-      "/api/sync/jobs/sync_stored_refresh",
-      "/api/sync/jobs/sync_stored_refresh",
       "/api/sync/jobs/sync_stored_refresh/complete"
     ]
   );
@@ -9655,6 +13655,7 @@ test("content script can interrupt a busy wait with heartbeat recovery", async (
   const bridgeCalls = [];
   const storage = new Map();
   let reloaded = false;
+  let fullPageReads = 0;
   let firstSleepStarted;
   const firstSleep = new Promise((resolve) => {
     firstSleepStarted = resolve;
@@ -9683,6 +13684,12 @@ test("content script can interrupt a busy wait with heartbeat recovery", async (
   };
   context.document.querySelector = () => null;
   context.document.querySelectorAll = () => [];
+  context.document.body = {
+    get innerText() {
+      fullPageReads += 1;
+      return "bound conversation";
+    }
+  };
   context.sleep = async () => {
     firstSleepStarted();
     return new Promise(() => {});
@@ -9728,9 +13735,11 @@ test("content script can interrupt a busy wait with heartbeat recovery", async (
 
   context.poll();
   await firstSleep;
+  const readsBeforeBusyHeartbeat = fullPageReads;
   await context.poll();
 
   assert.equal(reloaded, true);
+  assert.equal(fullPageReads, readsBeforeBusyHeartbeat);
   assert.deepEqual(
     bridgeCalls.map((call) => call.path),
     ["/api/extension/heartbeat", "/api/sync/jobs/claim", "/api/extension/heartbeat"]
@@ -9849,6 +13858,90 @@ test("content script throttles duplicate heartbeat recovery for the same job", a
   assert.equal(reloads, 1);
 });
 
+test("content script ignores stale heartbeat recovery owned by a previous page worker", async () => {
+  const context = await loadContentScriptContext();
+  const storage = new Map();
+  let reloads = 0;
+
+  context.sessionStorage = {
+    getItem(key) {
+      return storage.get(key) || null;
+    },
+    setItem(key, value) {
+      storage.set(key, value);
+    },
+    removeItem(key) {
+      storage.delete(key);
+    }
+  };
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat",
+    reload() {
+      reloads += 1;
+    }
+  };
+
+  const recovered = await context.handleHeartbeatRecovery({
+    action: "reload",
+    projectUrl: "https://chatgpt.com/c/bound-chat",
+    workerId: "previous-page-worker",
+    job: {
+      id: "sync_previous_worker_recovery",
+      projectUrl: "https://chatgpt.com/c/bound-chat",
+      workerId: "previous-page-worker",
+      payloadText: "send after the refreshed page takes over"
+    }
+  });
+
+  assert.equal(recovered, false);
+  assert.equal(reloads, 0);
+  assert.equal(storage.has("chatgpt-codex-bridge:pre-send-refresh-job"), false);
+});
+
+test("content script ignores recovery issued to a previous worker after the job owner changed", async () => {
+  const context = await loadContentScriptContext();
+  const storage = new Map();
+  let reloads = 0;
+
+  context.sessionStorage = {
+    getItem(key) {
+      return storage.get(key) || null;
+    },
+    setItem(key, value) {
+      storage.set(key, value);
+    },
+    removeItem(key) {
+      storage.delete(key);
+    }
+  };
+  const currentWorker = context.currentWorkerId();
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/bound-chat",
+    reload() {
+      reloads += 1;
+    }
+  };
+
+  const recovered = await context.handleHeartbeatRecovery({
+    action: "reload",
+    projectUrl: "https://chatgpt.com/c/bound-chat",
+    workerId: "previous-page-worker",
+    job: {
+      id: "sync_reassigned_after_recovery",
+      projectUrl: "https://chatgpt.com/c/bound-chat",
+      workerId: currentWorker,
+      _bridgeRecoveryWorkerId: "previous-page-worker",
+      payloadText: "must not inherit an old reload"
+    }
+  });
+
+  assert.equal(recovered, false);
+  assert.equal(reloads, 0);
+  assert.equal(storage.has("chatgpt-codex-bridge:pre-send-refresh-job"), false);
+});
+
 test("content script resumes a sent job without resending it even when a legacy recovery flag is present", async () => {
   const context = await loadContentScriptContext();
   const bridgeCalls = [];
@@ -9922,7 +14015,7 @@ test("content script resumes a sent job without resending it even when a legacy 
   context.document.querySelectorAll = (selector) => {
     if (selector === '[data-message-author-role="assistant"]') return [assistant()];
     if (selector === "button") return [sendButton];
-    if (selector === 'section[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
+    if (selector === '[data-testid^="conversation-turn-"]') return [userTurn, assistantTurn];
     return [];
   };
   context.bridgeApi = async (path, options = {}) => {
@@ -10008,6 +14101,167 @@ test("content script navigates back to the project chat before pre-send refresh 
 
   assert.equal(replacedUrl, "https://chatgpt.com/c/demo");
   assert.ok(storage.get("chatgpt-codex-bridge:pre-send-refresh-job"));
+});
+
+test("artifact preview detection combines URL title and composer state", async () => {
+  const context = await loadContentScriptContext();
+  const composer = { tagName: "TEXTAREA" };
+  const closeButton = {
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      return name === "aria-label" ? "Close settings" : null;
+    },
+    getClientRects() {
+      return [{ width: 24, height: 24 }];
+    }
+  };
+
+  context.location = {
+    href: "https://chatgpt.com/c/report-pdf",
+    hostname: "chatgpt.com",
+    pathname: "/c/report-pdf"
+  };
+  context.document.title = "report.pdf";
+  context.document.querySelector = (selector) =>
+    selector === "#prompt-textarea" ? composer : null;
+  context.document.querySelectorAll = (selector) =>
+    selector === "button" ? [closeButton] : [];
+  assert.equal(context.isArtifactPreviewPage(), false);
+
+  context.location = {
+    href: "https://chatgpt.com/backend-api/estuary/content?id=file_preview",
+    hostname: "chatgpt.com",
+    pathname: "/backend-api/estuary/content"
+  };
+  context.document.title = "File preview";
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = () => [];
+  assert.equal(context.isArtifactPreviewPage(), true);
+});
+
+test("artifact preview close matching ignores ordinary labels containing x", async () => {
+  const context = await loadContentScriptContext();
+  const button = (label) => ({
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      return name === "aria-label" ? label : null;
+    },
+    getClientRects() {
+      return [{ width: 24, height: 24 }];
+    }
+  });
+  const expandButton = button("Expand image");
+  const closeButton = button("Close preview");
+  const chineseCloseButton = button("关闭预览");
+  const exactXButton = button("×");
+
+  context.document.querySelectorAll = (selector) =>
+    selector === "button" ? [expandButton, closeButton] : [];
+  assert.equal(context.findArtifactPreviewCloseButton(), closeButton);
+
+  context.document.querySelectorAll = (selector) =>
+    selector === "button" ? [expandButton, exactXButton] : [];
+  assert.equal(context.findArtifactPreviewCloseButton(), exactXButton);
+
+  context.document.querySelectorAll = (selector) =>
+    selector === "button" ? [expandButton, chineseCloseButton] : [];
+  assert.equal(context.findArtifactPreviewCloseButton(), chineseCloseButton);
+});
+
+test("artifact preview without a close button refreshes before the composer wait", async () => {
+  const context = await loadContentScriptContext();
+  const storage = new Map();
+  let reloads = 0;
+  let composerWaits = 0;
+
+  context.sessionStorage = {
+    getItem(key) {
+      return storage.get(key) || null;
+    },
+    setItem(key, value) {
+      storage.set(key, value);
+    },
+    removeItem(key) {
+      storage.delete(key);
+    }
+  };
+  context.location = {
+    hostname: "chatgpt.com",
+    href: "https://chatgpt.com/c/demo",
+    reload() {
+      reloads += 1;
+    }
+  };
+  context.document.title = "generated-report.pdf";
+  context.document.querySelector = () => null;
+  context.document.querySelectorAll = () => [];
+  context.stopStaleGenerationIfNeeded = async () => {};
+  context.waitForComposer = async () => {
+    composerWaits += 1;
+    throw new Error("the 60-second composer wait must not start from a stuck preview");
+  };
+
+  await context.processJob({
+    id: "sync_preview_without_close",
+    projectUrl: "https://chatgpt.com/c/demo",
+    payloadText: "fresh prompt"
+  });
+
+  assert.equal(reloads, 1);
+  assert.equal(composerWaits, 0);
+  assert.ok(storage.get("chatgpt-codex-bridge:pre-send-refresh-job"));
+});
+
+test("artifact preview dismissal waits until the preview actually closes", async () => {
+  const context = await loadContentScriptContext();
+  let previewOpen = true;
+  let closeClicks = 0;
+  let activityWaits = 0;
+  const closeButton = {
+    textContent: "",
+    title: "",
+    getAttribute(name) {
+      return name === "aria-label" ? "Close" : null;
+    },
+    getClientRects() {
+      return previewOpen ? [{ width: 24, height: 24 }] : [];
+    },
+    click() {
+      closeClicks += 1;
+    }
+  };
+  const composer = { tagName: "TEXTAREA" };
+  const activityWake = async () => {
+    activityWaits += 1;
+    if (activityWaits === 1) {
+      return false;
+    }
+    if (activityWaits === 2) {
+      previewOpen = false;
+      return true;
+    }
+    throw new Error("preview dismissal did not stop after the preview closed");
+  };
+
+  context.document.title = "generated-cover.png";
+  context.document.documentElement = { nodeName: "HTML" };
+  context.MutationObserver = class {
+    observe() {}
+  };
+  context.sleep = activityWake;
+  context.waitForAssistantActivity = activityWake;
+  context.document.querySelector = (selector) =>
+    selector === "#prompt-textarea" && !previewOpen ? composer : null;
+  context.document.querySelectorAll = (selector) =>
+    selector === "button" && previewOpen ? [closeButton] : [];
+
+  await context.dismissArtifactPreviewIfNeeded(2_000);
+
+  assert.equal(closeClicks, 1);
+  assert.equal(activityWaits, 2);
+  assert.equal(previewOpen, false);
 });
 
 test("content script closes a ChatGPT artifact preview before sending a job", async () => {

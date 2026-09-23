@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
+import { observeRouterRecovery } from "./router-recovery.js";
 import path from "node:path";
 import { resolveBridgeDataDir } from "./runtime-config.js";
+import { runtimeIdentity } from "./runtime-identity.js";
 
 import {
   getArtifact,
@@ -128,18 +130,73 @@ function shouldWaitForDelegatedGpt(input = {}, route = {}, localFiles = []) {
   return route.kind !== "codex_only";
 }
 
-function waitOptionsFromInput(input = {}, shouldWait = false) {
+const CODEX_HOST_OBSERVATION_BUDGET_MS = 4 * 60_000;
+
+function waitOptionsFromInput(input = {}, shouldWait = false, options = {}) {
+  const requestedTimeoutMs = Number(input.timeoutMs);
+  const routerObservationTimeoutMs =
+    Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+      ? Math.min(requestedTimeoutMs, CODEX_HOST_OBSERVATION_BUDGET_MS)
+      : CODEX_HOST_OBSERVATION_BUDGET_MS;
   return {
-    timeoutMs: input.timeoutMs,
+    timeoutMs: options.preserveLiveOnTimeout
+      ? routerObservationTimeoutMs
+      : input.timeoutMs,
     pollMs: input.pollMs || input.pollIntervalMs,
-    timeoutGraceMs: input.timeoutGraceMs ?? input.graceMs,
-    failOnTimeout: input.failOnTimeout ?? shouldWait
+    timeoutGraceMs: options.preserveLiveOnTimeout
+      ? 0
+      : input.timeoutGraceMs ?? input.graceMs,
+    failOnTimeout: input.failOnTimeout ?? (options.preserveLiveOnTimeout ? false : shouldWait)
   };
 }
 
 function normalizeOptionalText(value) {
   const text = value?.trim();
   return text || null;
+}
+
+function normalizeProjectUrl(value) {
+  const text = normalizeOptionalText(value);
+  if (!text) {
+    return null;
+  }
+  try {
+    const url = new URL(text);
+    url.search = "";
+    url.hash = "";
+    return url.href.replace(/\/+$/, "");
+  } catch {
+    return text.replace(/[?#].*$/, "").replace(/\/+$/, "");
+  }
+}
+
+function assertWorkspaceOwnsRouterMetadata(
+  workspace = {},
+  metadata = {},
+  platform = process.platform
+) {
+  for (const [metadataField, workspaceField, label, normalize] of [
+    ["projectId", "projectId", "projectId", normalizeOptionalText],
+    ["conversationId", "conversationId", "conversationId", normalizeOptionalText],
+    ["currentCodexThreadId", "currentCodexThreadId", "codexThreadId", normalizeOptionalText],
+    ["targetRepo", "targetRepo", "targetRepo", normalizeScopeRepo],
+    ["chatgptProjectUrl", "chatgptProjectUrl", "chatgptProjectUrl", normalizeProjectUrl]
+  ]) {
+    const metadataValue = normalize(metadata[metadataField], platform);
+    const workspaceValue = normalize(workspace[workspaceField], platform);
+    if (metadataValue && workspaceValue && metadataValue !== workspaceValue) {
+      throw new Error(`Router scope mismatch: ${label}`);
+    }
+  }
+}
+
+function normalizeScopeRepo(value, platform = process.platform) {
+  const text = normalizeOptionalText(value);
+  if (!text) {
+    return null;
+  }
+  const resolved = path.resolve(text);
+  return platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 function workspaceFromProject(project, fallback = {}) {
@@ -157,17 +214,63 @@ function workspaceFromProject(project, fallback = {}) {
 }
 
 export function createBridgeTools(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
   const storeRoot = resolveBridgeDataDir({
     storeRoot: options.storeRoot,
-    env: options.env || process.env,
+    env,
     cwd: options.cwd || process.cwd()
   });
   const runnerMode = options.runnerMode || process.env.BRIDGE_RUNNER || "manual";
   const currentCodexThreadId =
-    options.currentCodexThreadId || process.env.BRIDGE_CURRENT_CODEX_THREAD_ID || null;
+    normalizeOptionalText(options.currentCodexThreadId) ||
+    normalizeOptionalText(env.BRIDGE_CURRENT_CODEX_THREAD_ID) ||
+    normalizeOptionalText(env.CODEX_THREAD_ID) ||
+    null;
   const routerV2Enabled =
-    options.routerV2Enabled ?? process.env.BRIDGE_ROUTER_V2 === "1";
+    options.routerV2Enabled ?? env.BRIDGE_ROUTER_V2 !== "0";
+  const semanticRouterEnabled =
+    options.semanticRouterEnabled ?? env.BRIDGE_SEMANTIC_ROUTER !== "0";
+  const semanticRouterMinConfidence =
+    options.semanticRouterMinConfidence ?? env.BRIDGE_SEMANTIC_ROUTER_MIN_CONFIDENCE;
   let routerOrchestrator = options.routerOrchestrator || null;
+  let routerRunStore = options.routerRunStore || null;
+
+  function assertSemanticRouterScope(input = {}, workspace = {}) {
+    if (!semanticRouterEnabled || !input.routingProposal) {
+      return;
+    }
+    const projectId = normalizeOptionalText(input.projectId);
+    const conversationId = normalizeOptionalText(input.conversationId);
+    if (!projectId || !conversationId) {
+      throw new Error(
+        "Semantic Router requires both projectId and conversationId for the current bound project"
+      );
+    }
+    if (
+      workspace.projectId !== projectId ||
+      workspace.conversationId !== conversationId
+    ) {
+      throw new Error(
+        "Semantic Router scope mismatch: projectId and conversationId must identify the same bound project"
+      );
+    }
+    const boundThreadId = normalizeOptionalText(workspace.currentCodexThreadId);
+    if (
+      !currentCodexThreadId ||
+      !boundThreadId ||
+      boundThreadId !== currentCodexThreadId
+    ) {
+      throw new Error(
+        "Semantic Router requires the current bound Codex thread for this project"
+      );
+    }
+    if (!workspace.targetRepo || !workspace.codexDelegationPath) {
+      throw new Error(
+        "Semantic Router requires a bound local project with generated Codex delegation rules"
+      );
+    }
+  }
 
   async function attachRoutingRules(workspace = {}) {
     const updated = { ...workspace };
@@ -184,7 +287,8 @@ export function createBridgeTools(options = {}) {
       projectId: updated.projectId,
       targetRepo: updated.targetRepo,
       chatgptProjectUrl: updated.chatgptProjectUrl,
-      conversationId: updated.conversationId
+      conversationId: updated.conversationId,
+      currentCodexThreadId: updated.currentCodexThreadId || currentCodexThreadId
     });
     updated.bridgeRulesPath = rules.path;
     updated.codexDelegationPath = delegation.path;
@@ -241,7 +345,11 @@ export function createBridgeTools(options = {}) {
     if (activeWorkspace.projectId) {
       return null;
     }
-    return activeWorkspace;
+    return {
+      ...activeWorkspace,
+      currentCodexThreadId:
+        activeWorkspace.currentCodexThreadId || currentCodexThreadId || null
+    };
   }
 
   async function requireWorkspaceForInput(input = {}) {
@@ -331,6 +439,7 @@ export function createBridgeTools(options = {}) {
     workspace,
     files,
     note,
+    routerRunId,
     kind = "codex_file_analysis"
   }) {
     const normalizedRequestId = normalizeOptionalText(requestId);
@@ -350,6 +459,10 @@ export function createBridgeTools(options = {}) {
     if (
       syncJob.kind !== kind ||
       syncJob.conversationId !== workspace.conversationId ||
+      normalizeProjectUrl(syncJob.projectUrl) !== normalizeProjectUrl(workspace.chatgptProjectUrl) ||
+      !syncJob.targetRepo ||
+      !workspace.targetRepo ||
+      path.resolve(syncJob.targetRepo) !== path.resolve(workspace.targetRepo) ||
       inputArtifacts.length !== files.length
     ) {
       throw new Error(
@@ -372,6 +485,17 @@ export function createBridgeTools(options = {}) {
         `Router file request id was reused with a different payload: ${normalizedRequestId}`
       );
     }
+    const normalizedRouterRunId = normalizeOptionalText(routerRunId);
+    if (normalizedRouterRunId) {
+      syncJob = await createSyncJob(storeRoot, {
+        ...syncJob,
+        id: normalizedRequestId,
+        routerTerminalSignalRequired: true,
+        routerRunId: normalizedRouterRunId,
+        projectId: workspace.projectId || null,
+        codexThreadId: workspace.currentCodexThreadId || null
+      });
+    }
     const artifacts = [];
     for (const inputArtifact of inputArtifacts) {
       artifacts.push(await getArtifact(storeRoot, inputArtifact.id));
@@ -384,12 +508,14 @@ export function createBridgeTools(options = {}) {
     if (!workspace.chatgptProjectUrl) {
       throw new Error("GPT 会话未绑定");
     }
+    assertWorkspaceOwnsRouterMetadata(workspace, input.metadata || {}, platform);
 
     const existing = await findExistingRouterFileSubmission({
       requestId: input.requestId,
       workspace,
       files: [input],
-      note: input.note
+      note: input.note,
+      routerRunId: input.metadata?.routerRunId
     });
     if (existing) {
       return {
@@ -416,7 +542,8 @@ export function createBridgeTools(options = {}) {
         targetRepo: workspace.targetRepo,
         chatgptProjectUrl: workspace.chatgptProjectUrl,
         ...(input.metadata || {})
-      }
+      },
+      scopePlatform: platform
     });
 
     return {
@@ -430,6 +557,7 @@ export function createBridgeTools(options = {}) {
     if (!workspace.chatgptProjectUrl) {
       throw new Error("GPT 会话未绑定");
     }
+    assertWorkspaceOwnsRouterMetadata(workspace, input.metadata || {}, platform);
 
     const gptPayloadText = input.payloadText || input.text;
     const requestId = normalizeOptionalText(input.requestId);
@@ -442,10 +570,14 @@ export function createBridgeTools(options = {}) {
           projectUrl: workspace.chatgptProjectUrl,
           targetRepo: workspace.targetRepo,
           conversationId: workspace.conversationId,
+          projectId: workspace.projectId || null,
+          codexThreadId: workspace.currentCodexThreadId || null,
           userText: input.text,
           payloadText: gptPayloadText,
           modePreference: input.modePreference,
           modelPreference: input.modelPreference,
+          routerTerminalSignalRequired: Boolean(input.metadata?.routerRunId),
+          routerRunId: input.metadata?.routerRunId || null,
           sourceMessageId: existing.sourceMessageId
         });
         return { message: null, syncJob };
@@ -461,14 +593,16 @@ export function createBridgeTools(options = {}) {
       to: ["gpt"],
       text: gptPayloadText,
       metadata: {
+        ...(input.metadata || {}),
         reason: input.reason || null,
         source: "current_codex_thread",
-        currentCodexThreadId,
+        projectId: workspace.projectId || null,
+        conversationId: workspace.conversationId,
+        currentCodexThreadId: workspace.currentCodexThreadId || null,
         targetRepo: workspace.targetRepo,
         chatgptProjectUrl: workspace.chatgptProjectUrl,
         routingKind: input.routingKind || null,
-        originalRequestText: gptPayloadText === input.text ? null : input.text,
-        ...(input.metadata || {})
+        originalRequestText: gptPayloadText === input.text ? null : input.text
       }
     });
 
@@ -478,10 +612,14 @@ export function createBridgeTools(options = {}) {
       projectUrl: workspace.chatgptProjectUrl,
       targetRepo: workspace.targetRepo,
       conversationId: workspace.conversationId,
+      projectId: workspace.projectId || null,
+      codexThreadId: workspace.currentCodexThreadId || null,
       userText: input.text,
       payloadText: gptPayloadText,
       modePreference: input.modePreference,
       modelPreference: input.modelPreference,
+      routerTerminalSignalRequired: Boolean(input.metadata?.routerRunId),
+      routerRunId: input.metadata?.routerRunId || null,
       sourceMessageId: message.id
     });
 
@@ -493,6 +631,7 @@ export function createBridgeTools(options = {}) {
     if (!workspace) {
       return scopeRequiredResult();
     }
+    assertSemanticRouterScope(input, workspace);
     const routingRules = {
       bridgeRulesPath: workspace.bridgeRulesPath || null,
       codexDelegationPath: workspace.codexDelegationPath || null,
@@ -505,7 +644,10 @@ export function createBridgeTools(options = {}) {
       text,
       workspace,
       attachmentCount: input.attachmentCount ?? localFiles.length,
-      hasAttachments: Boolean(input.hasAttachments || localFiles.length > 0)
+      hasAttachments: Boolean(input.hasAttachments || localFiles.length > 0),
+      semanticRouterEnabled,
+      semanticRouterMinConfidence,
+      routingProposal: input.routingProposal
     });
 
     if (route.kind === "codex_only") {
@@ -680,6 +822,7 @@ export function createBridgeTools(options = {}) {
     if (!transportRegistry) {
       const webSyncTransport = createWebSyncTransport({
         storeRoot,
+        platform,
         enqueueText: async (transportInput = {}) =>
           askChatGptProject(
             {
@@ -709,6 +852,7 @@ export function createBridgeTools(options = {}) {
             workspace: transportInput.workspace,
             files,
             note: transportInput.payloadText,
+            routerRunId: transportInput.metadata?.routerRunId,
             kind: artifactSyncKind
           });
           const savedArtifacts = existing?.artifacts || [];
@@ -744,7 +888,8 @@ export function createBridgeTools(options = {}) {
                   targetRepo: transportInput.workspace?.targetRepo,
                   chatgptProjectUrl: transportInput.workspace?.chatgptProjectUrl,
                   ...(transportInput.metadata || {})
-                }
+                },
+                scopePlatform: platform
               });
           const queuedFiles = savedArtifacts.map((artifact) => ({
             artifact,
@@ -789,13 +934,7 @@ export function createBridgeTools(options = {}) {
       });
     }
 
-    const runStore =
-      options.routerRunStore ||
-      createRouterRunStore({
-        storeRoot,
-        clock: options.routerClock,
-        runIdFactory: options.routerRunIdFactory
-      });
+    const runStore = resolveRouterRunStore();
     routerOrchestrator = createRouterOrchestrator({
       runStore,
       transportRegistry,
@@ -803,6 +942,17 @@ export function createBridgeTools(options = {}) {
       clock: options.routerClock
     });
     return routerOrchestrator;
+  }
+
+  function resolveRouterRunStore() {
+    if (!routerRunStore) {
+      routerRunStore = createRouterRunStore({
+        storeRoot,
+        clock: options.routerClock,
+        runIdFactory: options.routerRunIdFactory
+      });
+    }
+    return routerRunStore;
   }
 
   function routerCompatibilityResult({ route, text, workspace, orchestration }) {
@@ -820,6 +970,7 @@ export function createBridgeTools(options = {}) {
     const lastReplyStage = [...(orchestration.routerRun.stages || [])]
       .reverse()
       .find((stage) => stage.replyText != null);
+    const stillRunning = waited?.stillRunning === true;
 
     return {
       action: actionForRoute(route),
@@ -832,6 +983,16 @@ export function createBridgeTools(options = {}) {
       artifacts: inputArtifacts.length > 0 ? inputArtifacts : transportResult?.artifacts || [],
       finalJob,
       timedOut: waited?.timedOut ?? submitted?.timedOut ?? false,
+      observationState: stillRunning ? "still_running" : null,
+      nextAction: stillRunning
+        ? {
+            tool: "continue_router_run",
+            runId: orchestration.routerRun.id,
+            projectId: workspace.projectId,
+            conversationId: workspace.conversationId,
+            waitForGpt: true
+          }
+        : null,
       replyText: transportResult?.replyText ?? lastReplyStage?.replyText ?? null,
       routingRules: routingRulesFromWorkspace(workspace),
       routerRun: orchestration.routerRun,
@@ -841,6 +1002,15 @@ export function createBridgeTools(options = {}) {
   }
 
   async function delegateCurrentRequestV2(input = {}) {
+    if (
+      semanticRouterEnabled &&
+      input.routingProposal &&
+      (!normalizeOptionalText(input.projectId) || !normalizeOptionalText(input.conversationId))
+    ) {
+      throw new Error(
+        "Semantic Router requires both projectId and conversationId for the current bound project"
+      );
+    }
     const workspace = await resolveRouterWorkspaceForInput(input);
     if (!workspace) {
       return {
@@ -850,13 +1020,17 @@ export function createBridgeTools(options = {}) {
         projectArtifactPaths: []
       };
     }
+    assertSemanticRouterScope(input, workspace);
     const localFiles = normalizeLocalFiles(input);
     const text = input.text?.trim() || input.note?.trim() || "Please analyze the attached file.";
     const route = decideRoomRoute({
       text,
       workspace,
       attachmentCount: input.attachmentCount ?? localFiles.length,
-      hasAttachments: Boolean(input.hasAttachments || localFiles.length > 0)
+      hasAttachments: Boolean(input.hasAttachments || localFiles.length > 0),
+      semanticRouterEnabled,
+      semanticRouterMinConfidence,
+      routingProposal: input.routingProposal
     });
     const modePreference = input.modePreference || workspace.modePreference;
     const modelPreference = input.modelPreference || workspace.modelPreference;
@@ -877,8 +1051,9 @@ export function createBridgeTools(options = {}) {
       scope: routerScopeFromWorkspace(scopedWorkspace),
       transportId: options.gptTransportId,
       waitForGpt: shouldWait,
-      waitOptions: waitOptionsFromInput(input, shouldWait),
-      artifacts: inputArtifacts
+      waitOptions: waitOptionsFromInput(input, shouldWait, { preserveLiveOnTimeout: true }),
+      artifacts: inputArtifacts,
+      signal: input.signal
     });
     return routerCompatibilityResult({ route, text, workspace: scopedWorkspace, orchestration });
   }
@@ -893,8 +1068,21 @@ export function createBridgeTools(options = {}) {
     const lastReplyStage = [...(orchestration.routerRun.stages || [])]
       .reverse()
       .find((stage) => stage.replyText != null);
+    const waited = orchestration.transportResult?.raw?.waited || null;
+    const stillRunning = orchestration.observationState === "recovering" ||
+      (waited?.stillRunning === true && ["pending", "queued", "running"].includes(orchestration.routerRun.status));
     return {
       ...orchestration,
+      observationState: orchestration.observationState || (stillRunning ? "still_running" : null),
+      nextAction: stillRunning
+        ? {
+            tool: "continue_router_run",
+            runId: orchestration.routerRun.id,
+            projectId: orchestration.routerRun.projectId,
+            conversationId: orchestration.routerRun.conversationId,
+            waitForGpt: true
+          }
+        : null,
       replyText: orchestration.transportResult?.replyText ?? lastReplyStage?.replyText ?? null
     };
   }
@@ -910,10 +1098,201 @@ export function createBridgeTools(options = {}) {
     const orchestration = await resolveRouterOrchestrator().continueRouterRun({
       runId: input.runId,
       scope: routerScopeFromWorkspace(workspace),
+      signal: input.signal,
       waitForGpt: input.waitForGpt,
-      waitOptions: waitOptionsFromInput(input, input.waitForGpt === true)
+      waitOptions: waitOptionsFromInput(input, input.waitForGpt === true, { preserveLiveOnTimeout: true })
     });
     return routerContinuationResult(orchestration);
+  }
+
+  async function handleGptTransportTerminal(input = {}) {
+    if (!routerV2Enabled) {
+      return {
+        matched: false,
+        advanced: false,
+        reason: "router_v2_disabled"
+      };
+    }
+    const runStore = resolveRouterRunStore();
+    const routerRunId = normalizeOptionalText(input.routerRunId);
+    const hasVersionedPersistedScope = input.routerTerminalScopeVersion === 1;
+    const hasCompletePersistedScope = Boolean(
+      routerRunId &&
+      normalizeOptionalText(input.projectId) &&
+      normalizeOptionalText(input.conversationId) &&
+      normalizeOptionalText(input.codexThreadId) &&
+      normalizeOptionalText(input.targetRepo)
+    );
+    if (hasVersionedPersistedScope && !hasCompletePersistedScope) {
+      throw new Error("Router terminal scope version 1 requires complete ownership");
+    }
+    const matched = hasVersionedPersistedScope
+      ? await runStore.findByRunIdAndTransportRequestId(
+          routerRunId,
+          input.requestId,
+          {
+            projectId: input.projectId,
+            conversationId: input.conversationId,
+            codexThreadId: input.codexThreadId,
+            targetRepo: input.targetRepo
+          }
+        )
+      : await runStore.findByTransportRequestId(input.requestId, {
+          conversationId: input.conversationId,
+          targetRepo: input.targetRepo
+        });
+    if (!matched || (routerRunId && matched.run?.id !== routerRunId)) {
+      return {
+        matched: false,
+        advanced: false,
+        reason: "router_run_not_found"
+      };
+    }
+
+    const { run, stageIndex } = matched;
+    const stage = run.stages[stageIndex];
+    const firstIncompleteIndex = run.stages.findIndex(
+      (candidate) => !["succeeded", "failed", "cancelled"].includes(candidate.status)
+    );
+    const terminalStageCanBeFinalized =
+      firstIncompleteIndex === -1 &&
+      !["succeeded", "cancelled"].includes(run.status) &&
+      stageIndex === run.stages.length - 1;
+    const completedStageCanQueueNext =
+      stage.status === "succeeded" &&
+      firstIncompleteIndex === stageIndex + 1 &&
+      !run.stages[firstIncompleteIndex]?.transportRequestId;
+    const exactActiveStageCanBeReconciled =
+      firstIncompleteIndex === stageIndex ||
+      (run.status === "failed" &&
+        stage.status === "failed" &&
+        run.currentStageIndex === stageIndex);
+
+    if (
+      !exactActiveStageCanBeReconciled &&
+      !completedStageCanQueueNext &&
+      !terminalStageCanBeFinalized
+    ) {
+      return {
+        matched: true,
+        advanced: false,
+        reason: "terminal_signal_already_applied",
+        routerRun: run
+      };
+    }
+
+    const scope = {
+      projectId: run.projectId,
+      conversationId: run.conversationId,
+      codexThreadId: run.codexThreadId
+    };
+    const orchestration = await resolveRouterOrchestrator().continueRouterRun({
+      runId: run.id,
+      scope,
+      expectedTransportRequestId: input.requestId,
+      signal: input.signal,
+      waitForGpt: run.autoAdvanceOnTransportTerminal === true,
+      settleOnlyExistingTransport: run.autoAdvanceOnTransportTerminal !== true,
+      waitOptions: {
+        timeoutMs: 1,
+        pollMs: 1,
+        timeoutGraceMs: 0,
+        failOnTimeout: false
+      }
+    });
+    return {
+      matched: true,
+      advanced:
+        orchestration.routerRun.updatedAt !== run.updatedAt ||
+        orchestration.routerRun.status !== run.status,
+      reason:
+        run.autoAdvanceOnTransportTerminal === true
+          ? null
+          : "manual_continuation",
+      ...routerContinuationResult(orchestration)
+    };
+  }
+
+  async function getRouterRunStatus(input = {}) {
+    if (!routerV2Enabled) {
+      throw new Error("Router V2 is disabled");
+    }
+    const workspace = await resolveRouterWorkspaceForInput(input);
+    if (!workspace) {
+      throw new Error(ROUTER_SCOPE_REQUIRED_ERROR);
+    }
+    const scope = routerScopeFromWorkspace(workspace);
+    const runId = normalizeOptionalText(input.runId);
+    let routerRun = runId
+      ? await resolveRouterRunStore().get(runId, scope)
+      : (await resolveRouterRunStore().list(scope))[0] || null;
+    if (!routerRun) {
+      return {
+        routerRun: null,
+        replyText: null,
+        projectArtifactPaths: [],
+        nextAction: null
+      };
+    }
+    // A queued stage can already be running in Chrome while no caller is
+    // waiting. Observe the transport without driving or rewriting the run.
+    const activeStage = routerRun.stages?.[routerRun.currentStageIndex];
+    let recovery = null;
+    const failedStage = routerRun.status === "failed" && activeStage?.status === "failed" &&
+      activeStage.submissionState === "submitted" &&
+      routerRun.stages.slice(routerRun.currentStageIndex + 1).every(stage => stage.status === "pending");
+    if (routerRun.transportId === "web-sync" &&
+        ((["pending", "queued", "running"].includes(routerRun.status) && activeStage?.status === "queued") || failedStage) &&
+        activeStage.transportRequestId) {
+      const job = await getSyncJob(storeRoot, activeStage.transportRequestId).catch(() => null);
+      const repoKey = (value) => {
+        if (!value) return null;
+        const resolved = path.resolve(value);
+        return platform === "win32" ? resolved.toLowerCase() : resolved;
+      };
+      const recoveryObservation = observeRouterRecovery(routerRun, job, { platform });
+      const recovering = Boolean(recoveryObservation);
+      if ((recovering || (!failedStage && job?.status === "running")) && job.routerRunId === routerRun.id &&
+          job.projectId === scope.projectId && job.conversationId === scope.conversationId &&
+          job.codexThreadId === scope.codexThreadId &&
+          repoKey(job.targetRepo) === repoKey(routerRun.targetRepo)) {
+        const status = job.status === "pending" ? "queued" : "running";
+        if (recovering) recovery = recoveryObservation.recovery;
+        routerRun = recovering ? recoveryObservation.routerRun : {
+          ...routerRun, status, stages: routerRun.stages.map((stage, index) =>
+            index === routerRun.currentStageIndex ? {...stage, status} : stage)
+        };
+      }
+    }
+    const lastReplyStage = [...(routerRun.stages || [])]
+      .reverse()
+      .find((stage) => stage.replyText != null);
+    const stillActive = ["pending", "queued", "running"].includes(routerRun.status);
+    return {
+      routerRun,
+      ...(recovery ? { observationState: "recovering", recovery } : {}),
+      replyText: lastReplyStage?.replyText ?? null,
+      projectArtifactPaths: routerRun.projectArtifactPaths || [],
+      nextAction: stillActive
+        ? {
+            tool: "continue_router_run",
+            runId: routerRun.id,
+            projectId: routerRun.projectId,
+            conversationId: routerRun.conversationId,
+            waitForGpt: true
+          }
+        : null
+    };
+  }
+
+  async function listScopedRoomMessages(input = {}) {
+    const workspace = await resolveRouterWorkspaceForInput(input);
+    if (!workspace) {
+      throw new Error(ROUTER_SCOPE_REQUIRED_ERROR);
+    }
+    return listRoomMessages(storeRoot, {
+      conversationId: workspace.conversationId
+    });
   }
 
   async function cancelRouterRun(input = {}) {
@@ -935,6 +1314,10 @@ export function createBridgeTools(options = {}) {
   return {
     async bindCurrentCodexSession(input) {
       return bindCurrentCodexSessionToProject(input);
+    },
+
+    getRuntimeIdentity(expected = {}) {
+      return runtimeIdentity({ storeRoot, currentCodexThreadId }, expected);
     },
 
     async createTask(input) {
@@ -1013,6 +1396,10 @@ export function createBridgeTools(options = {}) {
       return listRoomMessages(storeRoot, input);
     },
 
+    async listScopedRoomMessages(input = {}) {
+      return listScopedRoomMessages(input);
+    },
+
     async askChatGptProject(input) {
       return askChatGptProject(input);
     },
@@ -1046,6 +1433,14 @@ export function createBridgeTools(options = {}) {
 
     async continueRouterRun(input) {
       return continueRouterRun(input);
+    },
+
+    async handleGptTransportTerminal(input) {
+      return handleGptTransportTerminal(input);
+    },
+
+    async getRouterRunStatus(input) {
+      return getRouterRunStatus(input);
     },
 
     async cancelRouterRun(input) {

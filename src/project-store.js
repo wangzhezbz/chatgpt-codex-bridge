@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { updateWorkspaceBinding } from "./conversation-store.js";
+import { getWorkspaceBinding, updateWorkspaceBinding } from "./conversation-store.js";
+import { normalizeChatGptPreferences } from "./preference-compat.js";
+import {readJsonState, writeJsonState, withJsonStateLock} from "./json-state-store.js";
 
 const PROJECTS_FILE = "projects.json";
 
@@ -26,28 +27,20 @@ function projectsPath(storeRoot) {
   return path.join(storeRoot, PROJECTS_FILE);
 }
 
-async function ensureStoreRoot(storeRoot) {
-  await mkdir(storeRoot, { recursive: true });
+function validProjectState(value) {
+  return value && typeof value === "object" && !Array.isArray(value) && Array.isArray(value.projects) &&
+    (value.activeProjectId == null || typeof value.activeProjectId === "string") &&
+    value.projects.every(project => project && typeof project === "object" && !Array.isArray(project) &&
+      typeof project.id === "string" && project.id.length > 0 && typeof project.updatedAt === "string");
 }
 
 async function readProjectState(storeRoot) {
-  try {
-    const parsed = JSON.parse(await readFile(projectsPath(storeRoot), "utf8"));
-    return {
-      activeProjectId: parsed.activeProjectId || null,
-      projects: Array.isArray(parsed.projects) ? parsed.projects : []
-    };
-  } catch {
-    return {
-      activeProjectId: null,
-      projects: []
-    };
-  }
+  const stored=await readJsonState(projectsPath(storeRoot),validProjectState);
+  return stored.exists ? {...stored.value,activeProjectId:stored.value.activeProjectId || null} : {activeProjectId:null,projects:[]};
 }
 
 async function writeProjectState(storeRoot, state) {
-  await ensureStoreRoot(storeRoot);
-  await writeFile(projectsPath(storeRoot), `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  await writeJsonState(projectsPath(storeRoot),state,validProjectState);
 }
 
 function normalizeOptionalText(value) {
@@ -76,6 +69,14 @@ function projectNameFromInput(input = {}) {
 
 function normalizeProjectInput(input = {}, existing = null) {
   const updatedAt = nowIso();
+  const hasPreferenceInput =
+    Object.hasOwn(input, "modePreference") || Object.hasOwn(input, "modelPreference");
+  const preferences = normalizeChatGptPreferences({
+    modePreference:
+      Object.hasOwn(input, "modePreference") ? input.modePreference : existing?.modePreference,
+    modelPreference:
+      Object.hasOwn(input, "modelPreference") ? input.modelPreference : existing?.modelPreference
+  });
   return {
     id: existing?.id || input.id || projectIdFromDate(new Date(updatedAt)),
     name: projectNameFromInput(input) || existing?.name || "未命名项目",
@@ -87,6 +88,11 @@ function normalizeProjectInput(input = {}, existing = null) {
       conversationIdFromDate(new Date(updatedAt)),
     currentCodexThreadId:
       normalizeOptionalText(input.currentCodexThreadId) || existing?.currentCodexThreadId || null,
+    modePreference: preferences.modePreference,
+    modelPreference: preferences.modelPreference,
+    preferenceUpdatedAt: hasPreferenceInput
+      ? updatedAt
+      : existing?.preferenceUpdatedAt || null,
     createdAt: existing?.createdAt || updatedAt,
     updatedAt
   };
@@ -100,7 +106,7 @@ function visibleProjects(projects = []) {
   return projects.filter((project) => !project.deletedAt);
 }
 
-export async function createProject(storeRoot, input = {}) {
+async function createProjectLocked(storeRoot, input = {}) {
   const state = await readProjectState(storeRoot);
   const project = normalizeProjectInput(input);
   state.projects = sortProjects([project, ...state.projects]);
@@ -126,13 +132,14 @@ function findCurrentSessionProject(state, currentCodexThreadId, input = {}) {
   return sortProjects(visible).find((project) => project.currentCodexThreadId === currentCodexThreadId) || null;
 }
 
-export async function bindCurrentSessionProject(storeRoot, input = {}, options = {}) {
+async function bindCurrentSessionProjectLocked(storeRoot, input = {}, options = {}) {
   const currentCodexThreadId =
     normalizeOptionalText(options.currentCodexThreadId) || normalizeOptionalText(input.currentCodexThreadId);
   if (!currentCodexThreadId) {
     throw new Error("Current Codex thread id is required to bind a Bridge project");
   }
 
+  await getWorkspaceBinding(storeRoot);
   const state = await readProjectState(storeRoot);
   const existing = findCurrentSessionProject(state, currentCodexThreadId, input);
   const project = normalizeProjectInput(
@@ -158,7 +165,9 @@ export async function bindCurrentSessionProject(storeRoot, input = {}, options =
     chatgptProjectUrl: project.chatgptProjectUrl,
     targetRepo: project.targetRepo,
     conversationId: project.conversationId,
-    currentCodexThreadId: project.currentCodexThreadId
+    currentCodexThreadId: project.currentCodexThreadId,
+    modePreference: project.modePreference,
+    modelPreference: project.modelPreference
   });
 
   return {
@@ -197,7 +206,7 @@ export async function getProject(storeRoot, projectId) {
   return project;
 }
 
-export async function updateProject(storeRoot, projectId, input = {}) {
+async function updateProjectLocked(storeRoot, projectId, input = {}) {
   const state = await readProjectState(storeRoot);
   const existing = state.projects.find((item) => item.id === projectId && !item.deletedAt);
   if (!existing) {
@@ -210,7 +219,8 @@ export async function updateProject(storeRoot, projectId, input = {}) {
   return project;
 }
 
-export async function deleteProject(storeRoot, projectId) {
+async function deleteProjectLocked(storeRoot, projectId) {
+  await getWorkspaceBinding(storeRoot);
   const state = await readProjectState(storeRoot);
   const existing = state.projects.find((item) => item.id === projectId && !item.deletedAt);
   if (!existing) {
@@ -241,7 +251,9 @@ export async function deleteProject(storeRoot, projectId) {
           projectId: nextProject.id,
           chatgptProjectUrl: nextProject.chatgptProjectUrl,
           targetRepo: nextProject.targetRepo,
-          conversationId: nextProject.conversationId
+          conversationId: nextProject.conversationId,
+          modePreference: nextProject.modePreference,
+          modelPreference: nextProject.modelPreference
         }
       : {
           projectId: null,
@@ -259,7 +271,7 @@ export async function deleteProject(storeRoot, projectId) {
   };
 }
 
-export async function ensureProjectForWorkspace(storeRoot, workspace = {}, options = {}) {
+async function ensureProjectForWorkspaceLocked(storeRoot, workspace = {}, options = {}) {
   if (!workspace.chatgptProjectUrl && !workspace.targetRepo) {
     return null;
   }
@@ -290,7 +302,9 @@ export async function ensureProjectForWorkspace(storeRoot, workspace = {}, optio
       chatgptProjectUrl: workspace.chatgptProjectUrl,
       targetRepo: workspace.targetRepo,
       conversationId: workspace.conversationId,
-      currentCodexThreadId: currentCodexThreadId || existing?.currentCodexThreadId || null
+      currentCodexThreadId: currentCodexThreadId || existing?.currentCodexThreadId || null,
+      modePreference: workspace.modePreference,
+      modelPreference: workspace.modelPreference
     },
     existing
   );
@@ -305,7 +319,8 @@ export async function ensureProjectForWorkspace(storeRoot, workspace = {}, optio
   return project;
 }
 
-export async function selectProject(storeRoot, projectId) {
+async function selectProjectLocked(storeRoot, projectId) {
+  await getWorkspaceBinding(storeRoot);
   const state = await readProjectState(storeRoot);
   const project = state.projects.find((item) => item.id === projectId && !item.deletedAt);
   if (!project) {
@@ -324,7 +339,9 @@ export async function selectProject(storeRoot, projectId) {
     projectId: updatedProject.id,
     chatgptProjectUrl: updatedProject.chatgptProjectUrl,
     targetRepo: updatedProject.targetRepo,
-    conversationId: updatedProject.conversationId
+    conversationId: updatedProject.conversationId,
+    modePreference: updatedProject.modePreference,
+    modelPreference: updatedProject.modelPreference
   });
 
   return {
@@ -333,3 +350,12 @@ export async function selectProject(storeRoot, projectId) {
     workspace
   };
 }
+
+// Lock order is projects -> workspace; workspace mutations never acquire the
+// projects lock. Hold through nested binding updates to prevent selection races.
+export function createProject(storeRoot,input={}) { return withJsonStateLock(projectsPath(storeRoot),()=>createProjectLocked(storeRoot,input)); }
+export function bindCurrentSessionProject(storeRoot,input={},options={}) { return withJsonStateLock(projectsPath(storeRoot),()=>bindCurrentSessionProjectLocked(storeRoot,input,options)); }
+export function updateProject(storeRoot,projectId,input={}) { return withJsonStateLock(projectsPath(storeRoot),()=>updateProjectLocked(storeRoot,projectId,input)); }
+export function deleteProject(storeRoot,projectId) { return withJsonStateLock(projectsPath(storeRoot),()=>deleteProjectLocked(storeRoot,projectId)); }
+export function ensureProjectForWorkspace(storeRoot,workspace={},options={}) { return withJsonStateLock(projectsPath(storeRoot),()=>ensureProjectForWorkspaceLocked(storeRoot,workspace,options)); }
+export function selectProject(storeRoot,projectId) { return withJsonStateLock(projectsPath(storeRoot),()=>selectProjectLocked(storeRoot,projectId)); }

@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.1.95",
   "description": "Connect a local Codex workspace with a user-bound GPT session through a local bridge and MCP tools.",
   "author": {
     "name": "CodexBridge",

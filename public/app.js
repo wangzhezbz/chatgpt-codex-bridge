@@ -1,6 +1,32 @@
+import {
+  createProjectRefreshCoordinator,
+  displayProjectConversationUrl,
+  projectIdFromPageUrl,
+  restoreProjectConversationUrl,
+  runProjectRefresh,
+  saveProjectBindingForScope,
+  selectProjectForScope,
+  withProjectIdInPageUrl
+} from "./project-binding-client.js";
+import {
+  installVisibleBrandingGuard,
+  maskVisibleBrandName
+} from "./visible-branding.js";
+import { createBridgeApiClient } from "./bridge-api-client.js";
+import { applyModelAvailability } from "./model-availability.js";
+
+installVisibleBrandingGuard();
+const PAGE_QUERY = new URLSearchParams(window.location.search);
+const PAGE_SCOPE_TOKEN = String(PAGE_QUERY.get("scope") || "");
+const PAGE_PROJECT_ID = projectIdFromPageUrl(window.location.href);
+const bridgeApiClient = createBridgeApiClient({
+  scopeToken: PAGE_SCOPE_TOKEN
+});
+
 const MODE_PREFERENCES = new Set(["fast", "balanced", "advanced", "high", "pro"]);
-const MODEL_PREFERENCES = new Set(["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
+const MODEL_PREFERENCES = new Set(["latest", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
 const MODEL_MODE_PREFERENCES = {
+  latest: ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.6-sol": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.5": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.4": ["fast", "balanced", "advanced", "high", "pro"],
@@ -16,32 +42,17 @@ const DEFAULT_MODE_LABELS = {
   pro: "Pro"
 };
 const MODE_LABELS_BY_MODEL = {
+  latest: { fast: "即时", pro: "Pro" },
   "gpt-5.6-sol": { fast: "极速 5.5", pro: "Pro" },
   "gpt-5.5": { fast: "极速", pro: "Pro 深度模式" },
   "gpt-5.4": { fast: "极速", pro: "专业" },
   "gpt-5.3": { fast: "极速" }
 };
-const ACCEPTANCE_MODE = new URLSearchParams(window.location.search).get("qa") === "1";
+const ACCEPTANCE_MODE = PAGE_QUERY.get("qa") === "1";
 const TEXT_PREVIEW_EXTENSIONS = new Set(["txt", "md", "json", "html", "css", "js", "ts", "py", "log", "xml", "yaml", "yml"]);
 const INLINE_PREVIEW_EXTENSIONS = new Set(["xlsx", "csv", "pptx", "pdf", "docx", "zip", "psd"]);
 const TEXT_ENCODING_LOSS_MESSAGE = "文本看起来已经乱码，里面出现大量问号。请重新输入后再发送。";
 const HIDDEN_ENCODING_LOSS_MESSAGE = "这条消息疑似在发送前已经乱码，已隐藏原文。";
-
-function storedPreference(key, allowedValues, fallback) {
-  const value = window.localStorage.getItem(key);
-  return allowedValues.has(value) ? value : fallback;
-}
-
-function storedModePreference() {
-  const current = storedPreference("bridge-mode-preference", MODE_PREFERENCES, null);
-  if (current) return current;
-  const legacy = window.localStorage.getItem("bridge-model-preference");
-  return MODE_PREFERENCES.has(legacy) ? legacy : "balanced";
-}
-
-function storedModelPreference() {
-  return storedPreference("bridge-model-preference", MODEL_PREFERENCES, "gpt-5.6-sol");
-}
 
 function modelSupportsModePreference(modelPreference) {
   return modePreferencesForModel(modelPreference).length > 0;
@@ -180,25 +191,27 @@ const state = {
   readingLongTextUntil: 0,
   initialBottomScrollUntil: 0,
   cancellingSyncJobIds: new Set(),
+  retryingSyncJobIds: new Set(),
   pendingFiles: [],
   acceptanceStatus: null,
   acceptanceRecordText: "",
   gptPreflight: null,
   currentCodexThreadId: null,
-  modePreference: storedModePreference(),
-  modelPreference: storedModelPreference(),
+  modePreference: "balanced",
+  modelPreference: "gpt-5.6-sol",
   theme: window.localStorage.getItem("bridge-theme") || "dark",
   loading: false
 };
 
 let preferenceSyncTimer = null;
+const projectRefreshCoordinator = createProjectRefreshCoordinator();
 
 document.documentElement.dataset.theme = state.theme;
 
 function normalizeVisibleGptText(input = "") {
   const text = String(input?.message || input || "").trim();
   if (!text) return "";
-  return text
+  const normalized = text
     .replace(/ChatGPT page cannot receive messages yet/gi, "GPT 页面暂时不能接收任务")
     .replace(
       /ChatGPT is still generating\. Bridge will wait for the current reply to finish\./gi,
@@ -240,6 +253,7 @@ function normalizeVisibleGptText(input = "") {
     )
     .replace(/\bChatGPT Project\b/g, "GPT 会话")
     .replace(/\bChatGPT\b/g, "GPT");
+  return maskVisibleBrandName(normalized);
 }
 
 function friendlyErrorMessage(input = "") {
@@ -302,7 +316,7 @@ function friendlySyncStatusReason(reason = "", syncStatus = "") {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await bridgeApiClient.fetch(path, {
     headers: {
       "Content-Type": "application/json",
       ...(options.headers || {})
@@ -322,6 +336,14 @@ async function api(path, options = {}) {
   }
 
   return response.json();
+}
+
+function scopedProjectPath(path, projectId = state.activeProjectId) {
+  if (!projectId) {
+    return path;
+  }
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}projectId=${encodeURIComponent(projectId)}`;
 }
 
 function showToast(message) {
@@ -377,15 +399,20 @@ function formatDurationMs(value) {
 }
 
 function reliableGptThoughtMs(durations = {}) {
+  if (!["number", "string"].includes(typeof durations.gptThoughtMs)) return null;
   const thoughtMs = Number(durations.gptThoughtMs);
-  if (!Number.isFinite(thoughtMs) || thoughtMs < 0) return null;
-  const responseMs = Number(durations.responseMs);
+  if (!Number.isFinite(thoughtMs) || thoughtMs <= 0) return null;
+  const responseMs = durations.responseMs;
   if (Number.isFinite(responseMs) && thoughtMs > responseMs + 5000) return null;
   return thoughtMs;
 }
 
 function formatSyncProgressDuration(progress = null) {
   const durations = progress?.durations || {};
+  if (progress?.timeline?.recoveryStartedAt && Number.isFinite(durations.recoveryMs)) {
+    const total = Number.isFinite(durations.totalMs) ? `总耗时 ${formatDurationMs(durations.totalMs)} · ` : "";
+    return `${total}本次恢复 ${formatDurationMs(durations.recoveryMs)}`;
+  }
   if (progress?.stage === "queued" && Number.isFinite(durations.queueMs)) {
     return `已等 ${formatDurationMs(durations.queueMs)}`;
   }
@@ -398,8 +425,8 @@ function formatSyncProgressDuration(progress = null) {
   if (progress?.stage === "completed") {
     const thoughtMs = reliableGptThoughtMs(durations);
     const parts = [];
-    if (Number.isFinite(thoughtMs)) parts.push(`GPT 用时 ${formatDurationMs(thoughtMs)}`);
-    if (Number.isFinite(durations.responseMs)) parts.push(`Bridge 捕获 ${formatDurationMs(durations.responseMs)}`);
+    if (Number.isFinite(thoughtMs)) parts.push(`网页思考 ${formatDurationMs(thoughtMs)}`);
+    if (Number.isFinite(durations.responseMs)) parts.push(`发送至收取 ${formatDurationMs(durations.responseMs)}`);
     return parts.join(" · ");
   }
   if (progress?.stage === "failed" && Number.isFinite(durations.totalMs)) {
@@ -465,7 +492,6 @@ function selectedModelPreference() {
 
 function setModePreference(value) {
   state.modePreference = MODE_PREFERENCES.has(value) ? value : state.modePreference || "balanced";
-  window.localStorage.setItem("bridge-mode-preference", state.modePreference);
   const visibleMode = compatibleModePreference(selectedModelPreference(), state.modePreference) || "default";
   if (els.modeSelect && els.modeSelect.value !== visibleMode) {
     els.modeSelect.value = visibleMode;
@@ -474,6 +500,7 @@ function setModePreference(value) {
 }
 
 function syncPreferenceControls() {
+  applyModelAvailability(els.modelSelect, state.status?.extension, state.workspace);
   if (!els.modeSelect) return;
   syncModeOptionLabels();
   const allowedModes = modePreferencesForModel(selectedModelPreference());
@@ -499,7 +526,6 @@ function syncPreferenceControls() {
 
 function setModelPreference(value) {
   state.modelPreference = MODEL_PREFERENCES.has(value) ? value : "gpt-5.6-sol";
-  window.localStorage.setItem("bridge-model-preference", state.modelPreference);
   if (els.modelSelect && els.modelSelect.value !== state.modelPreference) {
     els.modelSelect.value = state.modelPreference;
   }
@@ -513,9 +539,10 @@ function queuePreferenceSync() {
 
 async function syncPreferencesToChatGpt({ successToast = "已发送同步请求" } = {}) {
   try {
-    const result = await api("/api/preferences/sync", {
+    const result = await api(scopedProjectPath("/api/preferences/sync"), {
       method: "POST",
       body: JSON.stringify({
+        projectId: state.activeProjectId,
         modePreference: selectedModePreference(),
         modelPreference: selectedModelPreference()
       })
@@ -772,7 +799,15 @@ function createImageActions(artifact) {
   return actions;
 }
 
+function replacePageProjectId(projectId) {
+  const pageUrl = withProjectIdInPageUrl(window.location.href, projectId);
+  if (pageUrl !== window.location.href) {
+    window.history.replaceState({}, "", pageUrl);
+  }
+}
+
 function showProjects() {
+  replacePageProjectId(null);
   document.body.classList.add("project-mode");
   els.projectView.classList.remove("is-hidden");
   els.chatView.classList.add("is-hidden");
@@ -785,6 +820,7 @@ function showProjects() {
 }
 
 function showChat() {
+  replacePageProjectId(state.activeProjectId);
   document.body.classList.remove("project-mode");
   els.projectView.classList.add("is-hidden");
   els.chatView.classList.remove("is-hidden");
@@ -849,15 +885,17 @@ function renderOnboardingGuide() {
   els.onboardingGuide.dataset.hasProjects = state.projects.length > 0 ? "true" : "false";
 }
 
-async function loadProjects({ autoEnter = true } = {}) {
+async function loadProjects({ autoEnter = false, preferredProjectId = null } = {}) {
   const payload = await api("/api/projects");
   state.projects = payload.projects || [];
   state.otherProjects = payload.otherProjects || [];
-  state.activeProjectId = payload.activeProjectId || state.projects[0]?.id || null;
+  const preferredProject = state.projects.find((project) => project.id === preferredProjectId);
+  state.activeProjectId = preferredProject?.id || payload.activeProjectId || state.projects[0]?.id || null;
   state.activeProject = state.projects.find((project) => project.id === state.activeProjectId) || null;
   renderProjectList();
 
-  if (autoEnter && state.activeProject) {
+  const canAutoEnter = autoEnter && state.activeProject && (!preferredProjectId || preferredProject);
+  if (canAutoEnter) {
     showChat();
     await refreshWorkspaceSurface({ scrollToBottom: true });
   } else {
@@ -866,18 +904,30 @@ async function loadProjects({ autoEnter = true } = {}) {
 }
 
 async function selectProject(projectId) {
-  const payload = await api("/api/projects/current-session", {
-    method: "POST",
-    body: JSON.stringify({ projectId })
-  });
-  state.activeProjectId = payload.activeProjectId;
-  state.activeProject = payload.project;
-  await loadProjects({ autoEnter: false });
-  state.activeProjectId = payload.activeProjectId;
-  state.activeProject = payload.project;
-  showChat();
-  await refreshWorkspaceSurface({ scrollToBottom: true });
-  showToast("已进入项目");
+  try {
+    const payload = await selectProjectForScope({
+      api,
+      projectId,
+      currentCodexThreadId: state.currentCodexThreadId
+    });
+    projectRefreshCoordinator.invalidate();
+    state.workspace = null;
+    state.status = null;
+    state.artifacts = [];
+    state.messages = [];
+    renderMessages([]);
+    renderArtifacts([]);
+    state.activeProjectId = payload.activeProjectId;
+    state.activeProject = payload.project;
+    await loadProjects({ autoEnter: false });
+    state.activeProjectId = payload.activeProjectId;
+    state.activeProject = payload.project;
+    showChat();
+    await refreshWorkspaceSurface({ scrollToBottom: true });
+    showToast("已进入项目");
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 async function deleteProject(projectId) {
@@ -920,6 +970,7 @@ function syncLabel(status) {
   const preferenceStatus = status?.extension?.heartbeat?.preferenceStatus;
   const currentPreferenceStatus = preferenceStatusMatchesWorkspace(preferenceStatus, workspace) ? preferenceStatus : null;
   if (currentPreferenceStatus?.state === "failed") return "偏好未应用";
+  if (currentPreferenceStatus?.state === "unverified") return "网页偏好待确认";
   if (currentPreferenceStatus?.state === "applied") return "偏好已应用";
   const active = status?.activeSyncJob;
   if (!active) {
@@ -940,6 +991,7 @@ function connectionChipLevel(status) {
 }
 
 function connectionChipLabel(status) {
+  if (status?.connection?.label === "连接待确认") return "连接待确认";
   const level = connectionChipLevel(status);
   if (level === "ok") return "连接就绪";
   if (level === "working") return "处理中";
@@ -1076,6 +1128,7 @@ function shortChatgptPath(value = "") {
 
 function preferenceStatusDetail(preferenceStatus = null) {
   if (!preferenceStatus) return "";
+  if (preferenceStatus.state === "unverified") return "网页模型控件已被手动操作，发送前将重新确认偏好。";
   const mode = preferenceStatus.modePreference
     ? modeLabelForModel(preferenceStatus.modePreference, preferenceStatus.modelPreference || selectedModelPreference())
     : "未设置模式";
@@ -1554,7 +1607,9 @@ function updateStatusLine(status) {
 
 function updateSettingsFields() {
   const workspace = state.workspace || {};
-  els.settingsProjectUrlInput.value = workspace.chatgptProjectUrl || state.activeProject?.chatgptProjectUrl || "";
+  els.settingsProjectUrlInput.value = displayProjectConversationUrl(
+    workspace.chatgptProjectUrl || state.activeProject?.chatgptProjectUrl || ""
+  );
   els.settingsTargetRepoInput.value = workspace.targetRepo || state.activeProject?.targetRepo || "";
 }
 
@@ -1697,10 +1752,10 @@ function renderImagePreviewDialog(artifacts, index = 0) {
 
   state.imagePreviewArtifacts = images;
   state.imagePreviewIndex = safeIndex;
-  els.imagePreviewTitle.textContent = artifact.filename || "鍥剧墖";
+  els.imagePreviewTitle.textContent = artifact.filename || "图片";
   els.imagePreviewCounter.textContent = images.length > 1 ? `${safeIndex + 1}/${images.length}` : "";
   els.imagePreview.src = artifactDownloadUrl(artifact);
-  els.imagePreview.alt = artifact.filename || "GPT 杈撳嚭鍥剧墖棰勮";
+  els.imagePreview.alt = artifact.filename || "图片预览";
   if (els.imagePreviewDownloadButton) {
     els.imagePreviewDownloadButton.disabled = false;
   }
@@ -2451,11 +2506,13 @@ function renderFileCard(artifact, options = {}) {
   return card;
 }
 
-function renderArtifactErrors(errors = []) {
+function renderArtifactErrors(errors = [], options = {}) {
   if (!errors.length) return null;
   const wrap = document.createElement("div");
   wrap.className = "artifact-errors";
+  const skipped = options.outputSucceeded ? errors.filter(error => error.code === "download_filename_ambiguous" && !error.filename) : [];
   for (const error of errors) {
+    if (skipped.includes(error)) continue;
     const item = document.createElement("div");
     item.className = "artifact-error";
     const filename = error.filename || "未知文件";
@@ -2464,6 +2521,19 @@ function renderArtifactErrors(errors = []) {
         ? `GPT 提到了 ${filename}，但没有抓到真实可下载文件。需要在 GPT 页面重新生成或手动下载。`
         : `${filename} 获取失败：${error.error || "未知错误"}`;
     wrap.append(item);
+  }
+  if (skipped.length) {
+    const details = document.createElement("details");
+    details.className = "artifact-diagnostics";
+    const summary = document.createElement("summary");
+    summary.textContent = `收取诊断（${skipped.length} 项已跳过）`;
+    details.append(summary);
+    for (const error of skipped) {
+      const note = document.createElement("p");
+      note.textContent = `已跳过无法确认归属的下载控件。${error.error || "未猜测其他文件名。"}`;
+      details.append(note);
+    }
+    wrap.append(details);
   }
   return wrap;
 }
@@ -2487,7 +2557,10 @@ function renderMessageArtifacts(message) {
   for (const artifact of files) {
     wrap.append(renderFileCard(artifact, { compact: false, context: "message" }));
   }
-  const errorBlock = renderArtifactErrors(errors);
+  const errorBlock = renderArtifactErrors(errors, {
+    outputSucceeded: metadata.syncCurrentStatus === "succeeded" &&
+      outputArtifactIds.some(id => state.artifactCache.has(id))
+  });
   if (errorBlock) wrap.append(errorBlock);
   return wrap;
 }
@@ -2541,6 +2614,7 @@ function renderSyncTimeline(progress = null) {
     ["创建", timeline.createdAt],
     ["领取", timeline.claimedAt],
     ["发给 GPT", timeline.sentAt],
+    ["本次恢复", timeline.recoveryStartedAt],
     ["完成", timeline.completedAt]
   ].filter(([, value]) => value);
   if (!rows.length) return null;
@@ -2581,6 +2655,9 @@ function renderMessageStatus(message) {
 
   const status = document.createElement("details");
   status.className = `message-status message-status-strip is-${metadata.syncStatus}`;
+  if (metadata.syncMissingArtifactNames?.length && metadata.syncMissingRecoveryStatus !== "succeeded") {
+    status.className = "message-status message-status-strip is-failed";
+  }
   const summary = document.createElement("summary");
   summary.className = "message-status-summary";
   const dot = document.createElement("span");
@@ -2596,7 +2673,23 @@ function renderMessageStatus(message) {
 
 function renderSyncActions(message) {
   const metadata = message.metadata || {};
-  if (!metadata.syncJobId || (!metadata.syncCanRetry && !metadata.syncCanCancel)) return null;
+  if (metadata.syncJobId && metadata.syncMissingArtifactNames?.length) {
+    const actions = document.createElement("div");actions.className = "message-actions";
+    if (metadata.syncMissingRecoveryStatus === "succeeded") {
+      const note=document.createElement("span");note.textContent="缺失附件已补收，见补收记录。";actions.append(note);
+    } else if (["pending","running"].includes(metadata.syncMissingRecoveryStatus)) {
+      const note=document.createElement("span");note.textContent="正在补收缺失附件，不会重新发送。";actions.append(note);
+      actions.append(createButton("停止补收","button-like message-action-button",()=>cancelSyncJob(metadata.syncMissingRecoveryId)));
+    } else {
+      actions.append(markGptActionControl(createButton("补收缺失附件","button-like message-action-button",()=>
+        metadata.syncMissingRecoveryStatus === "failed"
+          ? retrySyncJob(metadata.syncMissingRecoveryId,"capture") : recoverMissingArtifacts(metadata.syncJobId))));
+    }
+    return actions;
+  }
+  const retryAction = metadata.syncCanRetry && ["capture", "resend"].includes(metadata.syncRetryAction)
+    ? metadata.syncRetryAction : null;
+  if (!metadata.syncJobId || (!retryAction && !metadata.syncCanCancel && !metadata.syncRetryReason)) return null;
 
   const actions = document.createElement("div");
   actions.className = "message-actions";
@@ -2609,8 +2702,22 @@ function renderSyncActions(message) {
     }
     actions.append(cancelButton);
   }
-  if (metadata.syncCanRetry) {
-    actions.append(markGptActionControl(createButton("重试", "button-like message-action-button", () => retrySyncJob(metadata.syncJobId))));
+  if (retryAction) {
+    const retryButton = markGptActionControl(createButton(
+      retryAction === "capture" ? "重新收取结果" : "重新发送",
+      "button-like message-action-button", () => retrySyncJob(metadata.syncJobId, retryAction)
+    ));
+    retryButton.setAttribute("data-sync-retry-control", metadata.syncJobId);
+    if (state.retryingSyncJobIds.has(metadata.syncJobId)) {
+      retryButton.disabled = true;
+      retryButton.textContent = "处理中";
+    }
+    actions.append(retryButton);
+  } else if (metadata.syncRetryReason) {
+    const reason = document.createElement("span");
+    reason.className = "muted";
+    reason.textContent = metadata.syncRetryReason;
+    actions.append(reason);
   }
   return actions;
 }
@@ -2634,7 +2741,7 @@ async function clearRoomConversation() {
   const confirmed = window.confirm("清空当前对话？只会清空 Bridge 当前房间视图，不会删除本地文件。");
   if (!confirmed) return;
   try {
-    await api("/api/room/messages", {
+    await api(scopedProjectPath("/api/room/messages"), {
       method: "DELETE"
     });
     state.expandedLongTextKeys.clear();
@@ -2665,7 +2772,7 @@ function renderMessage(message) {
   const from = message.from || message.role || "user";
   article.className = `message-row message-${visualMessageFrom(message)}`;
   article.dataset.messageId = message.id || "";
-  if (message.metadata?.syncStatus === "failed") {
+  if (message.metadata?.syncStatus === "failed" && !message.metadata?.syncRecovered) {
     article.classList.add("message-failed");
   }
 
@@ -2692,7 +2799,19 @@ function renderMessage(message) {
   body.className = "message-content";
   body.append(renderCodeBlocks(displayTextForMessage(message), message.id || message.createdAt || from));
 
-  article.append(header, body);
+  article.append(header);
+  if (message.metadata?.syncRecovered) {
+    const history = document.createElement("details");
+    history.className = "recovered-message-history";
+    const summary = document.createElement("summary");
+    summary.textContent = "已恢复 · 查看当时的失败记录";
+    history.append(summary, body);
+    const attachments = renderMessageArtifacts(message);
+    if (attachments) history.append(attachments);
+    article.append(history);
+    return article;
+  }
+  article.append(body);
   const status = renderMessageStatus(message);
   if (status) article.append(status);
   const syncActions = renderSyncActions(message);
@@ -2858,9 +2977,9 @@ function renderAcceptancePanel(payload) {
   syncGptActionControls();
 }
 
-async function loadAcceptanceStatus() {
+async function loadAcceptanceStatus(projectId = state.activeProjectId) {
   if (!ACCEPTANCE_MODE || !els.acceptancePanel) return null;
-  const payload = await api("/api/acceptance/status");
+  const payload = await api(scopedProjectPath("/api/acceptance/status", projectId));
   renderAcceptancePanel(payload);
   return payload;
 }
@@ -2989,40 +3108,65 @@ function renderArtifacts(artifacts = []) {
   }
 }
 
-async function loadWorkspace() {
-  state.workspace = await api("/api/workspace");
+function applyWorkspacePreferences(workspace = {}) {
+  const modelPreference = MODEL_PREFERENCES.has(workspace.modelPreference)
+    ? workspace.modelPreference
+    : "gpt-5.6-sol";
+  const modePreference =
+    compatibleModePreference(modelPreference, workspace.modePreference) ||
+    modePreferencesForModel(modelPreference)[0] ||
+    "balanced";
+  setModelPreference(modelPreference);
+  setModePreference(modePreference);
+}
+
+async function loadWorkspaceSurface(projectId) {
+  const [workspace, status, artifactsPayload, messagesPayload, acceptancePayload] = await Promise.all([
+    api(scopedProjectPath("/api/workspace", projectId)),
+    api(scopedProjectPath("/api/diagnostics/status", projectId)),
+    api(scopedProjectPath("/api/artifacts", projectId)),
+    api(scopedProjectPath("/api/room/messages", projectId)),
+    ACCEPTANCE_MODE && els.acceptancePanel
+      ? api(scopedProjectPath("/api/acceptance/status", projectId))
+      : Promise.resolve(null)
+  ]);
+  return {
+    workspace,
+    status,
+    artifacts: artifactsPayload.artifacts || [],
+    messages: messagesPayload.messages || messagesPayload || [],
+    acceptance: acceptancePayload
+  };
+}
+
+function applyWorkspaceSurface(surface) {
+  state.workspace = surface.workspace;
+  state.status = surface.status;
+  state.messages = surface.messages;
+  applyWorkspacePreferences(surface.workspace);
   updateSettingsFields();
-  return state.workspace;
-}
-
-async function loadStatus() {
-  state.status = await api("/api/diagnostics/status");
-  updateStatusLine(state.status);
-  return state.status;
-}
-
-async function loadArtifacts() {
-  const query = state.workspace?.conversationId
-    ? `?conversationId=${encodeURIComponent(state.workspace.conversationId)}`
-    : "";
-  const payload = await api(`/api/artifacts${query}`);
-  renderArtifacts(payload.artifacts || []);
-}
-
-async function loadMessages() {
-  const payload = await api("/api/room/messages");
-  state.messages = payload.messages || payload || [];
-  renderMessages(state.messages);
+  updateStatusLine(surface.status);
+  renderArtifacts(surface.artifacts);
+  renderMessages(surface.messages);
   renderChainStatusPanel();
+  if (surface.acceptance) {
+    renderAcceptancePanel(surface.acceptance);
+  }
 }
 
 async function refreshWorkspaceSurface({ scrollToBottom = false } = {}) {
+  const projectId = state.activeProjectId;
+  if (!projectId) return false;
   const chatScrollState = captureChatScrollState();
   const previousLastMessageId = latestVisibleMessageId();
-  await loadWorkspace();
-  await Promise.all([loadStatus(), loadArtifacts()]);
-  await loadMessages();
-  await loadAcceptanceStatus();
+  const applied = await runProjectRefresh({
+    coordinator: projectRefreshCoordinator,
+    projectId,
+    getActiveProjectId: () => state.activeProjectId,
+    load: loadWorkspaceSurface,
+    apply: applyWorkspaceSurface
+  });
+  if (!applied) return false;
   updateStatusLine(state.status);
   updateSettingsFields();
   const nextLastMessageId = latestVisibleMessageId();
@@ -3038,6 +3182,7 @@ async function refreshWorkspaceSurface({ scrollToBottom = false } = {}) {
     clearBottomScrollSettle();
     restoreChatScrollState(chatScrollState);
   }
+  return true;
 }
 
 async function previewArtifact(artifactId) {
@@ -3313,13 +3458,48 @@ async function analyzeArtifact(artifactId) {
   await refreshWorkspaceSurface({ scrollToBottom: true });
 }
 
-async function retrySyncJob(syncJobId) {
-  await ensureGptActionReady();
-  await api(`/api/sync/jobs/${encodeURIComponent(syncJobId)}/retry`, {
-    method: "POST"
-  });
-  showToast("已重新发送给 GPT");
-  await refreshWorkspaceSurface({ scrollToBottom: true });
+async function retrySyncJob(syncJobId, action) {
+  if (!["capture", "resend"].includes(action) || state.retryingSyncJobIds.has(syncJobId)) return;
+  state.retryingSyncJobIds.add(syncJobId);
+  const controls = [...document.querySelectorAll("[data-sync-retry-control]")]
+    .filter(button => button.getAttribute("data-sync-retry-control") === syncJobId);
+  for (const button of controls) button.disabled = true;
+  try {
+    await ensureGptActionReady();
+    const result = await api(`/api/sync/jobs/${encodeURIComponent(syncJobId)}/retry`, {
+      method: "POST",
+      body: JSON.stringify({ captureOnly: action === "capture" })
+    });
+    showToast(result.captureOnly === true
+      ? "正在重新收取结果，不会重新发送任务"
+      : "已加入重新发送队列，等待 GPT 接收");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    state.retryingSyncJobIds.delete(syncJobId);
+    try {
+      await refreshWorkspaceSurface({ scrollToBottom: false });
+    } catch (error) {
+      showToast(`状态刷新失败：${error.message}`);
+    }
+    for (const button of controls) button.disabled = false;
+  }
+}
+
+async function recoverMissingArtifacts(syncJobId) {
+  if (state.retryingSyncJobIds.has(syncJobId)) return;
+  state.retryingSyncJobIds.add(syncJobId);
+  try {
+    await ensureGptActionReady();
+    await api(scopedProjectPath(`/api/sync/jobs/${encodeURIComponent(syncJobId)}/recover-artifacts`),{
+      method:"POST",body:JSON.stringify({captureOnly:true})
+    });
+    showToast("正在补收缺失附件，不会重新发送或生成");
+  } catch(error) { showToast(error.message); }
+  finally {
+    state.retryingSyncJobIds.delete(syncJobId);
+    try { await refreshWorkspaceSurface({scrollToBottom:false}); } catch(error) { showToast(error.message); }
+  }
 }
 
 function syncCancelControls(syncJobId, cancelling) {
@@ -3492,9 +3672,10 @@ function restoreChatScrollState(chatScrollState) {
 }
 
 async function sendMessage(text, targets, options = {}) {
-  return api("/api/room/messages", {
+  return api(scopedProjectPath("/api/room/messages"), {
     method: "POST",
     body: JSON.stringify({
+      projectId: state.activeProjectId,
       text,
       to: targets,
       inputArtifactIds: options.inputArtifactIds || undefined,
@@ -3694,7 +3875,7 @@ els.newProjectForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({
         name: els.projectNameInput.value,
-        chatgptProjectUrl: els.projectUrlInput.value,
+        chatgptProjectUrl: restoreProjectConversationUrl(els.projectUrlInput.value),
         targetRepo: els.targetRepoInput.value
       })
     });
@@ -3723,27 +3904,36 @@ els.newProjectForm.addEventListener("submit", async (event) => {
 
 els.bindingForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  const submitButton = event.submitter;
+  if (submitButton) submitButton.disabled = true;
   const patch = {
-    chatgptProjectUrl: els.settingsProjectUrlInput.value,
+    chatgptProjectUrl: restoreProjectConversationUrl(els.settingsProjectUrlInput.value),
     targetRepo: els.settingsTargetRepoInput.value
   };
 
-  const bound = await api("/api/projects/current-session", {
-    method: "POST",
-    body: JSON.stringify({
-      ...patch,
-      projectId: state.activeProjectId || undefined,
-      name: state.activeProject?.name
-    })
-  });
-  state.activeProject = bound.project;
-  state.activeProjectId = bound.activeProjectId;
+  try {
+    const bound = await saveProjectBindingForScope({
+      api,
+      currentCodexThreadId: state.currentCodexThreadId,
+      activeProjectId: state.activeProjectId,
+      activeProjectName: state.activeProject?.name,
+      patch
+    });
+    state.activeProject = bound.project;
+    state.activeProjectId = bound.activeProjectId;
 
-  await loadProjects({ autoEnter: false });
-  showChat();
-  await refreshWorkspaceSurface({ scrollToBottom: true });
-  showToast("已保存");
-  els.settingsDialog.close();
+    await loadProjects({ autoEnter: false });
+    state.activeProject = bound.project;
+    state.activeProjectId = bound.activeProjectId;
+    showChat();
+    await refreshWorkspaceSurface({ scrollToBottom: true });
+    showToast("已保存");
+    els.settingsDialog.close();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    if (submitButton) submitButton.disabled = false;
+  }
 });
 
 els.artifactImportInput.addEventListener("change", importSelectedArtifacts);
@@ -3849,7 +4039,10 @@ syncComposerSendControl();
 api("/api/config")
   .then((config) => {
     state.currentCodexThreadId = config.currentCodexThreadId || null;
-    return loadProjects({ autoEnter: true });
+    return loadProjects({
+      autoEnter: Boolean(PAGE_PROJECT_ID),
+      preferredProjectId: PAGE_PROJECT_ID
+    });
   })
   .catch((error) => {
     showProjects();

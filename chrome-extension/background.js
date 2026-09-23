@@ -4,8 +4,181 @@ if (typeof importScripts === "function") {
 
 const DEFAULT_BRIDGE_ORIGIN = String(globalThis.CODEX_BRIDGE_CONFIG?.origin || "").replace(/\/+$/, "");
 const DEFAULT_TIMEOUT_MS = 60000;
-
+const RELOAD_TABS_STORAGE_KEY = "bridge:reload-tabs";
 const watches = new Map();
+const pendingContentScriptChecks = new Set();
+const bridgeApiTokens = new Map();
+
+function bridgeContentScriptActive() {
+  return globalThis.__CODEX_GPT_BRIDGE_CONTENT_SCRIPT_ACTIVE__ === true;
+}
+
+function ensureBridgeContentScriptsInOpenTabs() {
+  if (
+    typeof chrome === "undefined" ||
+    typeof chrome.tabs?.query !== "function" ||
+    typeof chrome.scripting?.executeScript !== "function"
+  ) {
+    return;
+  }
+
+  chrome.tabs.query({ url: ["https://chatgpt.com/*"] }, (tabs = []) => {
+    if (chrome.runtime.lastError) {
+      return;
+    }
+    for (const tab of tabs) {
+      const tabId = tab?.id;
+      if (!Number.isInteger(tabId) || pendingContentScriptChecks.has(tabId)) {
+        continue;
+      }
+      pendingContentScriptChecks.add(tabId);
+      chrome.scripting.executeScript(
+        {
+          target: { tabId },
+          func: bridgeContentScriptActive
+        },
+        (results = []) => {
+          if (chrome.runtime.lastError || results.some((result) => result?.result === true)) {
+            pendingContentScriptChecks.delete(tabId);
+            return;
+          }
+          chrome.scripting.executeScript(
+            {
+              target: { tabId },
+              files: ["bridge-config.js", "content-script.js"]
+            },
+            () => {
+              void chrome.runtime.lastError;
+              pendingContentScriptChecks.delete(tabId);
+            }
+          );
+        }
+      );
+    }
+  });
+}
+
+function requireLoopbackBridgeOrigin(value = "") {
+  const origin = String(value || "").replace(/\/+$/, "");
+  const url = new URL(origin);
+  if (
+    url.protocol !== "http:" ||
+    url.hostname !== "127.0.0.1" ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("Bridge API proxy only accepts a local 127.0.0.1 origin");
+  }
+  return origin;
+}
+
+async function proxyBridgeApi(message = {}) {
+  const bridgeOrigin = requireLoopbackBridgeOrigin(message.bridgeOrigin);
+  const apiPath = String(message.path || "");
+  if (!apiPath.startsWith("/api/")) {
+    throw new Error("Bridge API proxy only accepts /api/ paths");
+  }
+
+  const requestOptions = message.options && typeof message.options === "object"
+    ? message.options
+    : {};
+  const method = String(requestOptions.method || "GET").toUpperCase();
+  const binaryResponse = requestOptions.responseType === "base64";
+  if (binaryResponse) {
+    const target = new URL(apiPath, bridgeOrigin);
+    if (method !== "GET" || requestOptions.body ||
+        !/^\/api\/artifacts\/[A-Za-z0-9_-]+\/raw$/.test(target.pathname) ||
+        !target.searchParams.get("projectId")?.trim()) {
+      throw new Error("Binary Bridge reads require a scoped GET artifact raw path");
+    }
+  }
+  const request = (token) => fetch(`${bridgeOrigin}${apiPath}`, {
+    method,
+    body: requestOptions.body,
+    cache: requestOptions.cache,
+    headers: {
+      "Content-Type": "application/json",
+      ...(requestOptions.headers || {}),
+      ...(token ? { "X-Bridge-Token": token } : {})
+    }
+  });
+
+  let token = bridgeApiTokens.get(bridgeOrigin) || "";
+  let response = await request(token);
+  if (response.status === 401 && ["POST", "PATCH", "PUT", "DELETE"].includes(method)) {
+    const configResponse = await fetch(`${bridgeOrigin}/api/config`, {
+      headers: {
+        "Content-Type": "application/json"
+      },
+      cache: "no-store"
+    });
+    if (!configResponse.ok) {
+      throw new Error(`Bridge API token bootstrap failed with status ${configResponse.status}`);
+    }
+    const config = await configResponse.json();
+    token = String(config?.apiToken || "");
+    if (!token) {
+      throw new Error("Bridge API token bootstrap returned no token");
+    }
+    bridgeApiTokens.set(bridgeOrigin, token);
+    response = await request(token);
+  }
+
+  if (binaryResponse && response.ok) {
+    return {
+      ok: true,
+      response: {
+        ok: true,
+        status: response.status,
+        contentType: response.headers?.get("content-type") || "application/octet-stream",
+        base64Data: arrayBufferToBase64(await response.arrayBuffer())
+      }
+    };
+  }
+  return {
+    ok: true,
+    response: {
+      ok: response.ok,
+      status: response.status,
+      bodyText: await response.text()
+    }
+  };
+}
+
+function refreshTabsAfterExtensionReload() {
+  if (
+    typeof chrome === "undefined" ||
+    !chrome.storage?.local ||
+    typeof chrome.storage.local.get !== "function"
+  ) {
+    return;
+  }
+
+  chrome.storage.local.get(RELOAD_TABS_STORAGE_KEY, (value = {}) => {
+    if (chrome.runtime.lastError) {
+      return;
+    }
+    const tabIds = Array.isArray(value[RELOAD_TABS_STORAGE_KEY])
+      ? [...new Set(value[RELOAD_TABS_STORAGE_KEY].filter(Number.isInteger))]
+      : [];
+    if (tabIds.length === 0) {
+      return;
+    }
+    chrome.storage.local.remove(RELOAD_TABS_STORAGE_KEY, () => {
+      for (const tabId of tabIds) {
+        chrome.tabs.reload(tabId, () => {
+          void chrome.runtime.lastError;
+        });
+      }
+    });
+  });
+}
+
+refreshTabsAfterExtensionReload();
+ensureBridgeContentScriptsInOpenTabs();
+chrome.runtime?.onInstalled?.addListener(ensureBridgeContentScriptsInOpenTabs);
+chrome.runtime?.onStartup?.addListener(ensureBridgeContentScriptsInOpenTabs);
 
 function watchId() {
   return `watch_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -25,9 +198,16 @@ function matchesExpectedFilename(item, expectedFilename) {
   }
 
   const expected = normalized(expectedFilename);
-  const actualName = normalized(basename(item.filename || ""));
-  const actualUrl = normalized(item.finalUrl || item.url || "");
-  return actualName === expected || actualName.includes(expected) || actualUrl.includes(expected);
+  const candidates = [
+    basename(item.filename || ""),
+    filenameFromUrl(item.finalUrl || item.url || "") || ""
+  ];
+  return candidates.some((value) => {
+    const actual = normalized(value);
+    // Chrome may append a numeric suffix on a local filename collision. Never
+    // accept an arbitrary substring from another filename, directory or query.
+    return actual === expected || actual.replace(/ \([1-9]\d*\)(?=\.[^.]+$|$)/, "") === expected;
+  });
 }
 
 function filenameFromUrl(value = "") {
@@ -36,12 +216,12 @@ function filenameFromUrl(value = "") {
     if (url.pathname.includes("/interpreter/download")) {
       const sandboxPath = url.searchParams.get("sandbox_path");
       if (sandboxPath) {
-        return basename(decodeURIComponent(sandboxPath));
+        return basename(sandboxPath);
       }
     }
     const fn = url.searchParams.get("fn");
     if (fn) {
-      return decodeURIComponent(fn);
+      return basename(fn);
     }
     return basename(decodeURIComponent(url.pathname));
   } catch {
@@ -123,7 +303,8 @@ async function importDownloadedItem(watch, item) {
   const response = await fetch(`${watch.bridgeOrigin}/api/downloads/import`, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      ...(watch.bridgeApiToken ? { "X-Bridge-Token": watch.bridgeApiToken } : {})
     },
     body: JSON.stringify({
       syncJobId: watch.syncJobId || null,
@@ -145,7 +326,8 @@ async function importFetchedItem(watch, item) {
   const response = await fetch(`${watch.bridgeOrigin}/api/downloads/import`, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      ...(watch.bridgeApiToken ? { "X-Bridge-Token": watch.bridgeApiToken } : {})
     },
     body: JSON.stringify({
       syncJobId: watch.syncJobId || null,
@@ -164,22 +346,32 @@ async function importFetchedItem(watch, item) {
 }
 
 async function completeDownloadWatch(watch, item) {
-  try {
-    const imported = await importDownloadedItem(watch, item);
-    await cleanupChromeDownloadHistory(watch, item);
-    finishWatch(watch, {
-      ok: true,
-      artifact: imported.artifact,
-      download: {
-        id: item.id,
-        filename: item.filename,
-        url: item.finalUrl || item.url || null
-      }
-    });
-  } catch (error) {
-    await cleanupChromeDownloadHistory(watch, item);
-    failWatch(watch, error);
+  if (watch.done) {
+    return;
   }
+  // Chrome completion events and the timeout search may observe the same item
+  // while its import is still pending. Share that import, including cleanup.
+  if (!watch.completionPromise) {
+    watch.completionPromise = (async () => {
+      try {
+        const imported = await importDownloadedItem(watch, item);
+        await cleanupChromeDownloadHistory(watch, item);
+        finishWatch(watch, {
+          ok: true,
+          artifact: imported.artifact,
+          download: {
+            id: item.id,
+            filename: item.filename,
+            url: item.finalUrl || item.url || null
+          }
+        });
+      } catch (error) {
+        await cleanupChromeDownloadHistory(watch, item);
+        failWatch(watch, error);
+      }
+    })();
+  }
+  return watch.completionPromise;
 }
 
 async function completeContentUrlWatch(watch, url) {
@@ -254,7 +446,7 @@ function claimContentUrlForWatch(tabId, url) {
 
   const filename = filenameFromUrl(url) || "";
   for (const watch of watches.values()) {
-    if (watch.done || watch.contentUrl) {
+    if (watch.done || watch.contentUrl || watch.nativeDownloadOnly) {
       continue;
     }
     if (watch.tabId && tabId && watch.tabId !== tabId) {
@@ -279,8 +471,10 @@ function startDownloadWatch(input = {}) {
   const watch = {
     id,
     bridgeOrigin: input.bridgeOrigin || DEFAULT_BRIDGE_ORIGIN,
+    bridgeApiToken: input.bridgeApiToken || null,
     syncJobId: input.syncJobId || null,
     expectedFilename: input.expectedFilename || null,
+    nativeDownloadOnly: input.nativeDownloadOnly === true,
     tabId: input.tabId || null,
     url: input.url || null,
     contentType: input.contentType || null,
@@ -519,6 +713,10 @@ async function fallbackOrFailWatch(watch, error) {
   if (watch?.done) {
     return true;
   }
+  if (watch?.nativeDownloadOnly) {
+    failWatch(watch,error);
+    return false;
+  }
 
   try {
     if (await completePageContextUrlWatch(watch, watch?.url || watch?.contentUrl || null)) {
@@ -621,17 +819,108 @@ async function downloadUrl(sender, input = {}) {
   return waitForWatch(watch);
 }
 
+const DEBUGGER_CALL_TIMEOUT_MS = 5000;
+
 function debuggerCall(method, ...args) {
   return new Promise((resolve, reject) => {
-    method(...args, (result) => {
-      const error = chrome.runtime.lastError;
-      if (error) {
-        reject(new Error(error.message));
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) {
         return;
       }
-      resolve(result);
-    });
+      settled = true;
+      clearTimeout(timeoutId);
+      callback(value);
+    };
+    const timeoutId = setTimeout(() => {
+      finish(reject, new Error("Chrome debugger command timed out"));
+    }, DEBUGGER_CALL_TIMEOUT_MS);
+    try {
+      method(...args, (result) => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          finish(reject, new Error(error.message));
+          return;
+        }
+        finish(resolve, result);
+      });
+    } catch (error) {
+      finish(reject, error);
+    }
   });
+}
+
+function attachDebugger(target) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      timedOut = true;
+      reject(new Error("Chrome debugger command timed out"));
+    }, DEBUGGER_CALL_TIMEOUT_MS);
+    try {
+      chrome.debugger.attach(target, "1.3", () => {
+        const error = chrome.runtime.lastError;
+        if (settled) {
+          // A timeout does not cancel Chrome's attach. Release only a connection
+          // this request actually acquired; never execute its expired input.
+          if (timedOut && !error) {
+            timedOut = false;
+            void debuggerCall(chrome.debugger.detach, target).catch(() => {});
+          }
+          return;
+        }
+        settled = true;
+        clearTimeout(timeoutId);
+        if (error) reject(new Error(error.message));
+        else resolve();
+      });
+    } catch (error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      reject(error);
+    }
+  });
+}
+
+function normalizedProjectTabUrl(value = "") {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "chatgpt.com" || !url.pathname.startsWith("/c/")) {
+      return null;
+    }
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return null;
+  }
+}
+
+async function openProjectTab(input = {}) {
+  const projectUrl = normalizedProjectTabUrl(input.projectUrl);
+  if (!projectUrl) {
+    throw new Error("Bridge can only open a bound ChatGPT conversation URL");
+  }
+  if (!chrome.tabs?.query || !chrome.tabs?.create) {
+    throw new Error("Chrome tabs permission is unavailable");
+  }
+  const tabs = (await debuggerCall(chrome.tabs.query, {})) || [];
+  const existing = tabs.find(
+    (tab) => normalizedProjectTabUrl(tab.url || tab.pendingUrl || "") === projectUrl
+  );
+  if (existing?.id) {
+    if (chrome.tabs.update) {
+      await debuggerCall(chrome.tabs.update, existing.id, { active: true });
+    }
+    return { ok: true, opened: false, tabId: existing.id };
+  }
+  const created = await debuggerCall(chrome.tabs.create, {
+    url: projectUrl,
+    active: true
+  });
+  return { ok: true, opened: true, tabId: created?.id || null };
 }
 
 async function trustedClick(sender, input = {}) {
@@ -655,7 +944,7 @@ async function trustedClick(sender, input = {}) {
     if (chrome.tabs?.update) {
       await debuggerCall(chrome.tabs.update, tabId, { active: true });
     }
-    await debuggerCall(chrome.debugger.attach, target, "1.3");
+    await attachDebugger(target);
     attached = true;
     await debuggerCall(chrome.debugger.sendCommand, target, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
@@ -687,6 +976,52 @@ async function trustedClick(sender, input = {}) {
         await debuggerCall(chrome.debugger.detach, target);
       } catch {
         // The click already happened; detach errors should not mask the download attempt.
+      }
+    }
+  }
+}
+
+async function trustedInsertText(sender, input = {}) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) {
+    throw new Error("No sender tab for trusted text insertion");
+  }
+  if (!chrome.debugger) {
+    throw new Error("Chrome debugger permission is unavailable");
+  }
+
+  const text = typeof input.text === "string" ? input.text : "";
+  const target = { tabId };
+  const selectAllKey = {
+    key: "a",
+    code: "KeyA",
+    modifiers: 2,
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65
+  };
+  let attached = false;
+  try {
+    if (chrome.tabs?.update) {
+      await debuggerCall(chrome.tabs.update, tabId, { active: true });
+    }
+    await attachDebugger(target);
+    attached = true;
+    await debuggerCall(chrome.debugger.sendCommand, target, "Input.dispatchKeyEvent", {
+      type: "keyDown",
+      ...selectAllKey
+    });
+    await debuggerCall(chrome.debugger.sendCommand, target, "Input.dispatchKeyEvent", {
+      type: "keyUp",
+      ...selectAllKey
+    });
+    await debuggerCall(chrome.debugger.sendCommand, target, "Input.insertText", { text });
+    return { ok: true };
+  } finally {
+    if (attached) {
+      try {
+        await debuggerCall(chrome.debugger.detach, target);
+      } catch {
+        // The text was already inserted; detach errors should not force a second insertion.
       }
     }
   }
@@ -737,6 +1072,22 @@ chrome.tabs?.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "bridge:api") {
+    proxyBridgeApi(message).then(
+      (result) => sendResponse(result),
+      (error) => sendResponse({ ok: false, error: error.message })
+    );
+    return true;
+  }
+
+  if (message?.type === "bridge:openProjectTab") {
+    openProjectTab(message).then(
+      (result) => sendResponse(result),
+      (error) => sendResponse({ ok: false, error: error.message })
+    );
+    return true;
+  }
+
   if (message?.type === "bridge:startDownloadWatch") {
     try {
       sendResponse(startDownloadWatch({ ...message, tabId: sender?.tab?.id || null }));
@@ -767,7 +1118,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "bridge:trustedInsertText") {
+    trustedInsertText(sender, message).then(
+      (result) => sendResponse(result),
+      (error) => sendResponse({ ok: false, error: error.message })
+    );
+    return true;
+  }
+
   if (message?.type === "bridge:reloadExtension") {
+    const tabId = sender?.tab?.id;
+    if (
+      Number.isInteger(tabId) &&
+      chrome.storage?.local &&
+      typeof chrome.storage.local.set === "function"
+    ) {
+      chrome.storage.local.set({
+        [RELOAD_TABS_STORAGE_KEY]: [tabId]
+      }, () => {
+        sendResponse({ ok: true });
+        chrome.runtime.reload();
+      });
+      return true;
+    }
     sendResponse({ ok: true });
     chrome.runtime.reload();
     return false;

@@ -16,6 +16,17 @@ async function tempStore() {
   return mkdtemp(path.join(tmpdir(), "bridge-inbox-"));
 }
 
+async function waitForLaterWallClock(timestamp, timeoutMs = 2_000) {
+  const baseline = Date.parse(timestamp);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= baseline && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  if (Date.now() <= baseline) {
+    throw new Error(`wall clock did not advance beyond ${timestamp} within ${timeoutMs}ms`);
+  }
+}
+
 test("createInboxItem persists a pending instruction for the current Codex thread", async () => {
   const storeRoot = await tempStore();
 
@@ -41,6 +52,7 @@ test("claimNextInboxItem claims the oldest pending instruction once", async () =
   const first = await createInboxItem(storeRoot, {
     promptText: "First instruction"
   });
+  await waitForLaterWallClock(first.createdAt);
   await createInboxItem(storeRoot, {
     promptText: "Second instruction"
   });

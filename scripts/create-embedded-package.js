@@ -75,7 +75,7 @@ async function createZipArchive(outputDir, archivePath) {
 
 async function main() {
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
-  const version = packageJson.version || "0.1.0";
+  const version = packageJson.version || "0.1.95";
   const outputRoot = path.resolve(process.argv[2] || "release");
   const packageName = `ChatGPT-Codex-Bridge-Embedded-v${version}-${timestamp()}`;
   const outputDir = path.join(outputRoot, packageName);

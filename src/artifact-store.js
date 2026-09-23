@@ -86,7 +86,11 @@ function extensionFromContentType(contentType = "") {
 }
 
 function artifactFilenamePrefix(contentType = "") {
-  return contentType.toLowerCase().startsWith("image/") ? "chatgpt-image" : "chatgpt-file";
+  return contentType.toLowerCase().startsWith("image/") ? "GPT-图片" : "GPT-文件";
+}
+
+function readableArtifactFilename(value = "") {
+  return String(value).replace(/g某t/gi, "GPT");
 }
 
 function shortArtifactId(id = "") {
@@ -107,14 +111,16 @@ function normalizeArtifactFilename(value, contentType, artifactId) {
   const inferredExtension = extensionFromContentType(contentType);
 
   if (isOpaqueExtensionlessName(filename) && inferredExtension) {
-    return `${artifactFilenamePrefix(contentType)}-${shortArtifactId(artifactId)}.${inferredExtension}`;
+    return readableArtifactFilename(
+      `${artifactFilenamePrefix(contentType)}-${shortArtifactId(artifactId)}.${inferredExtension}`
+    );
   }
 
   if (!parsed.ext && inferredExtension) {
-    return `${filename}.${inferredExtension}`;
+    return readableArtifactFilename(`${filename}.${inferredExtension}`);
   }
 
-  return filename;
+  return readableArtifactFilename(filename);
 }
 
 function normalizeStoredArtifact(artifact) {

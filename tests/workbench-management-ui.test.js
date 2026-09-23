@@ -7,6 +7,8 @@ test("workbench can manage projects and conversations without page-length drift"
   const js = await readFile("public/app.js", "utf8");
   const css = await readFile("public/styles.css", "utf8");
 
+  assert.match(html, /app\.js\?v=20260731-refresh-recovery/);
+  assert.match(html, /styles\.css\?v=20260729-safe-send-lifecycle/);
   assert.match(html, /id="clearMessagesButton"/);
   assert.match(js, /async function deleteProject/);
   assert.match(js, /\/api\/projects\/current-session/);
@@ -25,14 +27,35 @@ test("workbench can manage projects and conversations without page-length drift"
   assert.doesNotMatch(js, /button\.textContent = "删除"/);
 
   assert.match(css, /\.project-view\s*\{[\s\S]*overflow-y: auto;/);
+  assert.match(css, /\.project-view\s*\{[\s\S]*scrollbar-gutter: stable;/);
+  assert.match(css, /\.project-view\s*\{[\s\S]*scrollbar-color:/);
+  assert.match(css, /\.project-view::-webkit-scrollbar\s*\{[\s\S]*width:\s*12px;/);
+  assert.match(css, /\.project-view::-webkit-scrollbar-thumb\s*\{/);
   assert.doesNotMatch(css, /\.project-view\s*\{[^}]*overflow: hidden;/);
-  assert.match(css, /\.project-list\s*\{[\s\S]*overflow: auto;/);
-  assert.match(css, /\.project-list\s*\{[\s\S]*min-height: 0;/);
+  assert.match(css, /\.project-view\s*\{[\s\S]*grid-template-rows: auto auto auto auto;/);
+  assert.doesNotMatch(css, /\.project-view\s*\{[^}]*minmax\(0, 1fr\)/);
+  assert.match(css, /\.project-list\s*\{[\s\S]*overflow: visible;/);
   assert.match(css, /\.project-card-actions/);
   assert.match(css, /\.project-delete/);
   assert.match(css, /\.message-header-actions/);
   assert.match(css, /\.message-delete-button/);
   assert.match(css, /\.message-delete-button\s*\{[\s\S]*place-items: center;/);
+});
+
+test("a new Bridge page starts at project selection while an entered project survives refresh", async () => {
+  const js = await readFile("public/app.js", "utf8");
+
+  assert.match(js, /const PAGE_PROJECT_ID = projectIdFromPageUrl\(window\.location\.href\)/);
+  assert.match(js, /loadProjects\(\{\s*autoEnter:\s*Boolean\(PAGE_PROJECT_ID\)/);
+  assert.match(js, /withProjectIdInPageUrl/);
+  assert.match(js, /window\.history\.replaceState/);
+  assert.doesNotMatch(js, /loadProjects\(\{\s*autoEnter:\s*true\s*\}\)/);
+  assert.match(js, /function scopedProjectPath/);
+  assert.match(js, /projectId=\$\{encodeURIComponent\(projectId\)\}/);
+  assert.match(js, /projectId:\s*state\.activeProjectId/);
+  assert.match(js, /createProjectRefreshCoordinator/);
+  assert.match(js, /runProjectRefresh/);
+  assert.doesNotMatch(js, /localStorage\.setItem\("bridge-(?:mode|model)-preference"/);
 });
 
 test("project binding form works both inside and outside a scoped Codex task", async () => {
@@ -45,11 +68,15 @@ test("project binding form works both inside and outside a scoped Codex task", a
   assert.match(js, /currentCodexThreadId/);
   assert.match(js, /state\.currentCodexThreadId\s*\?\s*"\/api\/projects\/current-session"\s*:\s*"\/api\/projects"/);
   assert.match(js, /\/api\/projects\/\$\{encodeURIComponent\(project\.id\)\}\/select/);
+  assert.match(js, /selectProjectForScope/);
+  assert.match(js, /saveProjectBindingForScope/);
+  assert.match(js, /els\.bindingForm\.addEventListener\("submit", async \(event\) => \{[\s\S]*try\s*\{[\s\S]*catch \(error\)[\s\S]*showToast\(error\.message\)/);
   assert.match(js, /els\.newProjectForm\.addEventListener\("submit", async \(event\) => \{[\s\S]*try\s*\{[\s\S]*catch \(error\)[\s\S]*showToast\(error\.message\)/);
 });
 
 test("expanded long text state survives polling refreshes and manual scroll", async () => {
   const js = await readFile("public/app.js", "utf8");
+  const css = await readFile("public/styles.css", "utf8");
 
   assert.match(js, /expandedLongTextKeys: new Set\(\)/);
   assert.match(js, /longTextScrollPositions: new Map\(\)/);
@@ -74,6 +101,10 @@ test("expanded long text state survives polling refreshes and manual scroll", as
   assert.match(js, /else if \(chatScrollState\.readingLongText\)\s*\{\s*clearBottomScrollSettle\(\);/);
   assert.match(js, /pageBottomOffset/);
   assert.doesNotMatch(js, /if \(scrollToBottom \|\| chatScrollState\.nearBottom\)/);
+  assert.match(css, /\.document-preview-header\s*\{[^}]*min-width:\s*0;/);
+  assert.match(css, /\.document-preview-header strong\s*\{[^}]*min-width:\s*0;/);
+  assert.match(css, /\.document-preview-header strong\s*\{[^}]*flex:\s*1 1 auto;/);
+  assert.match(css, /\.document-preview-header \.inline-actions\s*\{[^}]*flex:\s*0 0 auto;/);
 });
 
 test("inline PDF previews survive polling refreshes without iframe reload flicker", async () => {

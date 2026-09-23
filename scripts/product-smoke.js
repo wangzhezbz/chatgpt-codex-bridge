@@ -32,6 +32,7 @@ const MOJIBAKE_PATTERN = /[�]|鍚|瀹|鐗|鏄|锛\?/;
 const SMOKE_RESULT_FILE = "PRODUCT-SMOKE-RESULT.md";
 const SMOKE_FIXTURE_DIR = ".product-smoke-fixtures";
 const SMOKE_PROJECT_URL = "https://chatgpt.com/project/product-smoke";
+const SMOKE_CODEX_THREAD_ID = "product-smoke-codex-thread";
 
 async function exists(filePath) {
   try {
@@ -756,7 +757,8 @@ async function verifyRunningService(packageDir, port, smokeRunDir) {
       ...process.env,
       BRIDGE_STORE: smokeStoreDir,
       BRIDGE_HOST: "127.0.0.1",
-      BRIDGE_PORT: String(port)
+      BRIDGE_PORT: String(port),
+      BRIDGE_CURRENT_CODEX_THREAD_ID: SMOKE_CODEX_THREAD_ID
     },
     stdio: "pipe"
   });
@@ -789,6 +791,17 @@ async function verifyRunningService(packageDir, port, smokeRunDir) {
     if (!page.includes("Bridge")) {
       throw new Error("Bridge page did not render the expected shell.");
     }
+
+    const bound = await apiJson(port, "/api/projects/current-session", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Product smoke",
+        chatgptProjectUrl: SMOKE_PROJECT_URL,
+        targetRepo: packageDir
+      })
+    }, 201);
+    ensure(bound.project?.currentCodexThreadId === SMOKE_CODEX_THREAD_ID,
+      "Product smoke project did not bind to its isolated Codex thread.");
 
     const artifactChecks = await verifyArtifactPreviewFlow(smokeRunDir, port);
     const multiImageChecks = await verifyMultiImageAcceptanceFlow(packageDir, port);

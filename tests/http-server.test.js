@@ -8,15 +8,229 @@ import { createHttpServer } from "../src/http-server.js";
 import { saveArtifactFromBase64 } from "../src/artifact-store.js";
 import { updateWorkspaceBinding } from "../src/conversation-store.js";
 import { createProject } from "../src/project-store.js";
-import { appendRoomMessage } from "../src/room-store.js";
-import { completeSyncJob, createSyncJob, failSyncJob, listSyncJobs, markSyncJobSent } from "../src/sync-store.js";
+import { EXTENSION_PROTOCOL_VERSION } from "../src/service-metadata.js";
+import { saveExtensionHeartbeat } from "../src/extension-heartbeat-store.js";
+import { appendRoomMessage, listRoomMessages } from "../src/room-store.js";
+import {
+  completeSyncJob,
+  createSyncJob,
+  failSyncJob,
+  getSyncJob,
+  listSyncJobs,
+  markSyncJobRecoveryIssued,
+  markSyncJobSent
+} from "../src/sync-store.js";
 
 async function tempStore() {
   return mkdtemp(path.join(tmpdir(), "bridge-http-"));
 }
 
+test('missing artifact recovery endpoint is scoped and preserves the original terminal job',async()=>{
+  const storeRoot=await tempStore(),thread='thread_missing';
+  const project=await createProject(storeRoot,{name:'recover',chatgptProjectUrl:'https://chatgpt.com/c/missing',targetRepo:path.join(storeRoot,'project'),currentCodexThreadId:thread});
+  await updateWorkspaceBinding(storeRoot,{projectId:project.id,conversationId:project.conversationId,chatgptProjectUrl:project.chatgptProjectUrl,targetRepo:project.targetRepo,currentCodexThreadId:thread});
+  const source=await createSyncJob(storeRoot,{kind:'chat_message',payloadText:'Generate a.txt and b.txt',projectId:project.id,conversationId:project.conversationId,codexThreadId:thread,projectUrl:project.chatgptProjectUrl,targetRepo:project.targetRepo});
+  await markSyncJobSent(storeRoot,source.id,{submittedPromptTurnId:'original-turn'});
+  await completeSyncJob(storeRoot,source.id,{replyText:'Download a.txt and b.txt',artifactErrors:[{filename:'b.txt',error:'timeout'}]});
+  const before=await getSyncJob(storeRoot,source.id);
+  await saveExtensionHeartbeat(storeRoot,{workerId:`codex-chatgpt-project-extension-${EXTENSION_PROTOCOL_VERSION}:runtime-ok:test`,href:project.chatgptProjectUrl,pageStatus:{state:'ready'}});
+  await withServer({storeRoot,runnerMode:'manual',currentCodexThreadId:thread},async baseUrl=>{
+    const endpoint=`/api/sync/jobs/${source.id}/recover-artifacts`;
+    const post=(url,body)=>fetch(baseUrl+url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    assert.equal((await post(endpoint,{captureOnly:true})).status,400);
+    const response=await post(`${endpoint}?projectId=${project.id}`,{captureOnly:true});
+    const result=await response.json();assert.equal(response.status,200,JSON.stringify(result));
+    assert.equal(result.resend,false);assert.equal(result.captureOnly,true);
+    assert.deepEqual(result.syncJob.recoveryFilenames,['b.txt']);
+    const duplicate=await (await post(`${endpoint}?projectId=${project.id}`,{captureOnly:true})).json();
+    assert.equal(duplicate.syncJob.id,result.syncJob.id);
+    const bad=await post(`/api/sync/jobs/${result.syncJob.id}/complete`,{replyText:'existing reply',artifacts:[{filename:'a.txt',contentType:'text/plain',base64Data:Buffer.from('A').toString('base64')}]});
+    assert.equal(bad.status,409);
+    const good=await post(`/api/sync/jobs/${result.syncJob.id}/complete`,{replyText:'existing reply',artifacts:[{filename:'b (2).txt',contentType:'text/plain',base64Data:Buffer.from('B').toString('base64')}]});
+    const done=await good.json();assert.equal(good.status,200,JSON.stringify(done));
+    assert.equal(done.job.status,'succeeded');assert.match(done.roomMessage.text,/补收/);
+    assert.equal(done.roomMessage.metadata.recoverySourceJobId,source.id);
+    assert.deepEqual(await getSyncJob(storeRoot,source.id),before);
+  });
+});
+
+for (const [scenario, errors, expectedStatus] of [
+  ["named-timeout", [{filename:"b.txt",error:"Timed out waiting for Chrome download b.txt"}], "failed"],
+  ["explicit-missing", [{code:"missing_download",filename:"b.txt",error:"Missing b.txt"}], "failed"],
+  ["unnamed-skipped", [{code:"download_filename_ambiguous",filename:null,error:"Skipped unresolved control"}], "succeeded"]
+]) {
+  test(`partial file completion does not turn an unresolved output into success: ${scenario}`,async()=>{
+    const storeRoot=await tempStore();
+    await withServer({storeRoot,runnerMode:"manual"},async baseUrl=>{
+      const post=(url,body,method="POST")=>fetch(baseUrl+url,{method,headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      await post('/api/workspace',{chatgptProjectUrl:'https://chatgpt.com/project/demo',targetRepo:path.join(storeRoot,'project')},'PATCH');
+      await post('/api/room/messages',{text:'Generate downloadable a.txt and b.txt',to:['gpt']});
+      const {job}=await (await post('/api/sync/jobs/claim',{projectUrl:'https://chatgpt.com/project/demo/c/abc',workerId:'test-extension'})).json();
+      const response=await fetch(`${baseUrl}/api/sync/jobs/${job.id}/complete`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({replyText:"Download a.txt and b.txt",artifacts:[{filename:"a.txt",contentType:"text/plain",base64Data:Buffer.from("A").toString("base64")}],artifactErrors:errors})});
+      const result=await response.json();
+      assert.equal(response.status,200,JSON.stringify(result));
+      assert.equal(result.job.status,expectedStatus);
+      assert.equal(result.job.artifactIds.length,1,"preserve the successfully captured partial output");
+      if(expectedStatus==="failed")assert.equal(result.job.errorCode,"missing_download");
+    });
+  });
+}
+
+test("refresh diagnostics uses a live bound future-version heartbeat instead of stale expected-version data",async()=>{
+  const storeRoot=await tempStore();const href="https://chatgpt.com/c/refresh-version";
+  await updateWorkspaceBinding(storeRoot,{chatgptProjectUrl:href,targetRepo:path.join(storeRoot,"project")});
+  const oldWorker=`codex-chatgpt-project-extension-${EXTENSION_PROTOCOL_VERSION}:runtime-ok:old`;
+  await saveExtensionHeartbeat(storeRoot,{workerId:oldWorker,href,pageStatus:{state:"ready"}});
+  const file=path.join(storeRoot,"extension","heartbeat.json");
+  const snapshot=JSON.parse(await readFile(file,"utf8"));snapshot.records[0].updatedAt=new Date(Date.now()-60000).toISOString();await writeFile(file,JSON.stringify(snapshot));
+  await withServer({storeRoot,runnerMode:"manual"},async baseUrl=>{
+    const workerId="codex-chatgpt-project-extension-v20990101-future:runtime-ok:new";
+    const response=await fetch(baseUrl+"/api/extension/heartbeat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({workerId,href,pageStatus:{state:"ready"}})});
+    const heartbeat=await response.json();
+    const status=await (await fetch(baseUrl+"/api/diagnostics/status")).json();
+    assert.equal(status.extension.workerId,workerId);
+    assert.equal(status.extension.connected,true);
+    assert.equal(status.extension.backendNeedsUpdate,true);
+    assert.equal(status.extension.needsReload,false);
+    assert.match(status.workflowStatus.title,/后端/);
+    assert.equal(status.connection.canSendToGpt,false);
+    assert.equal(heartbeat.reloadExtension,false);
+    const preflight=await (await fetch(baseUrl+"/api/gpt/preflight")).json();
+    assert.equal(preflight.action,"restart_bridge_backend");
+  });
+});
+
+test("refresh diagnostics prefers a ready bound tab over a newer loading duplicate of the same version",async()=>{
+  const storeRoot=await tempStore();const href="https://chatgpt.com/c/refresh-ready";
+  await updateWorkspaceBinding(storeRoot,{chatgptProjectUrl:href,targetRepo:path.join(storeRoot,"project")});
+  const worker=tag=>`codex-chatgpt-project-extension-${EXTENSION_PROTOCOL_VERSION}:runtime-ok:${tag}`;
+  await saveExtensionHeartbeat(storeRoot,{workerId:worker("ready"),href,pageStatus:{state:"ready",code:"ready"}});
+  await saveExtensionHeartbeat(storeRoot,{workerId:worker("loading"),href,pageStatus:{state:"warning",code:"composer_missing"}});
+  await withServer({storeRoot,runnerMode:"manual"},async baseUrl=>{
+    const status=await (await fetch(baseUrl+"/api/diagnostics/status")).json();
+    assert.equal(status.extension.workerId,worker("ready"));
+    assert.equal(status.extension.pageStatus.code,"ready");
+  });
+});
+
+test("refresh diagnostics keeps the active job owner ahead of another ready tab",async()=>{
+  const storeRoot=await tempStore();const href="https://chatgpt.com/c/refresh-owner";
+  await updateWorkspaceBinding(storeRoot,{chatgptProjectUrl:href,targetRepo:path.join(storeRoot,"project")});
+  const owner=`codex-chatgpt-project-extension-${EXTENSION_PROTOCOL_VERSION}:runtime-ok:owner`;
+  const other=`codex-chatgpt-project-extension-${EXTENSION_PROTOCOL_VERSION}:runtime-ok:other`;
+  const job=await createSyncJob(storeRoot,{kind:"chat_message",projectUrl:href,payloadText:"current"});
+  await markSyncJobSent(storeRoot,job.id,{workerId:owner});
+  await saveExtensionHeartbeat(storeRoot,{workerId:owner,href,pageStatus:{state:"working",code:"bridge_busy"}});
+  await saveExtensionHeartbeat(storeRoot,{workerId:other,href,pageStatus:{state:"ready",code:"ready"}});
+  await withServer({storeRoot,runnerMode:"manual"},async baseUrl=>{
+    const status=await (await fetch(baseUrl+"/api/diagnostics/status")).json();
+    assert.equal(status.extension.workerId,owner);
+    assert.equal(status.activeSyncJob.id,job.id);
+    assert.equal(status.connection.canSendToGpt,false);
+  });
+});
+
+for (const [reply, rejected] of [
+  ["消息流中的错误", true], ["Error in message stream", true],
+  ["消息流中的错误。 重试", true], ["Error in message stream. Try again", true],
+  ["昨天出现“消息流中的错误”，今天结果已正常返回。", false],
+  ["The label Error in message stream describes a past incident; the repair is complete.", false]
+]) test(`completion gate handles standalone stream error: ${reply}`, async () => {
+  const storeRoot = await tempStore();
+  const job = await createSyncJob(storeRoot, { kind: "chat_message", projectUrl: "https://chatgpt.com/c/stream-error", payloadText: "Answer only" });
+  await withServer({ storeRoot, runnerMode: "manual" }, async baseUrl => {
+    const response = await fetch(`${baseUrl}/api/sync/jobs/${job.id}/complete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ replyText: reply }) });
+    assert.equal(response.status, rejected ? 409 : 200);
+    if (rejected) assert.equal((await response.json()).code, "interim_chatgpt_reply");
+    const stored = await getSyncJob(storeRoot, job.id);
+    assert.equal(stored.status, rejected ? "pending" : "succeeded");
+    if (!rejected) assert.equal(stored.replyText, reply);
+  });
+});
+
+for (const captureErrorCode of ["missing_download", "client_blocked", "reply_scope_ambiguous"]) test(`explicit capture-only retry preserves a sent ${captureErrorCode} job after the page is ready`,async()=>{
+  const storeRoot=await tempStore();
+  await withServer({storeRoot,runnerMode:"manual"},async(baseUrl)=>{
+    await fetch(`${baseUrl}/api/workspace`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({chatgptProjectUrl:"https://chatgpt.com/c/office-retry"})});
+    const job=await createSyncJob(storeRoot,{kind:"user_request",projectUrl:"https://chatgpt.com/c/office-retry",payloadText:"生成Excel"});
+    await markSyncJobSent(storeRoot,job.id,{workerId:"test-extension",submittedPromptTurnIndex:5,submittedPromptTurnId:"confirmed-user-turn"});
+    const sent=await getSyncJob(storeRoot,job.id);
+    await failSyncJob(storeRoot,job.id,{error:"File was not captured",errorCode:captureErrorCode,replyText:"report.xlsx"});
+    await fetch(`${baseUrl}/api/extension/heartbeat`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({href:"https://chatgpt.com/c/office-retry",workerId:"test-extension",pageStatus:{state:"ready",code:"ready"}})});
+    const response=await fetch(`${baseUrl}/api/sync/jobs/${job.id}/retry`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({captureOnly:true})});
+    assert.equal(response.status,200);
+    const result=await response.json();
+    assert.equal(result.captureOnly,true);
+    assert.equal(result.resend,false);
+    assert.equal(result.syncJob.id,job.id);
+    assert.equal(result.syncJob.sentAt,sent.sentAt);
+    assert.equal(result.syncJob.submittedPromptTurnIndex,5);
+    assert.equal(result.syncJob.submittedPromptTurnId,"confirmed-user-turn");
+    assert.equal((await listSyncJobs(storeRoot)).length,1);
+  });
+});
+
+test("ambiguous reply without a confirmed turn ID cannot be reopened for capture",async()=>{
+  const storeRoot=await tempStore();
+  await withServer({storeRoot,runnerMode:"manual"},async baseUrl=>{
+    const href="https://chatgpt.com/c/no-identity";
+    await updateWorkspaceBinding(storeRoot,{chatgptProjectUrl:href});
+    const job=await createSyncJob(storeRoot,{kind:"user_request",projectUrl:href,payloadText:"one image"});
+    await markSyncJobSent(storeRoot,job.id,{workerId:"test-extension",submittedPromptTurnIndex:5});
+    await failSyncJob(storeRoot,job.id,{error:"ambiguous",errorCode:"reply_scope_ambiguous"});
+    await saveExtensionHeartbeat(storeRoot,{workerId:"test-extension",href,pageStatus:{state:"ready",code:"ready"}});
+    const response=await fetch(`${baseUrl}/api/sync/jobs/${job.id}/retry`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({captureOnly:true})});
+    assert.equal(response.status,409);
+    assert.equal((await getSyncJob(storeRoot,job.id)).status,"failed");
+    assert.equal((await listSyncJobs(storeRoot)).length,1);
+  });
+});
+
+test("preference failure tells the user to review model settings instead of recapturing files", async () => {
+  const storeRoot = await tempStore();
+  const job = await createSyncJob(storeRoot, {kind:"chat_message",projectUrl:"https://chatgpt.com/c/preference-fixture",conversationId:"preference-fixture",payloadText:"hello"});
+  await withServer({storeRoot,runnerMode:"manual"}, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/sync/jobs/${job.id}/fail`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({errorCode:"preference_not_applied",error:"model not available",recoveryAction:"review_preferences"})});
+    assert.equal(response.status,200);
+    const result=await response.json();
+    assert.equal(result.job.status,"failed");
+    assert.equal(result.job.errorCode,"preference_not_applied");
+    assert.match(result.roomMessage.text,/模型|思考强度/);
+    assert.doesNotMatch(result.roomMessage.text,/文件|刷新/);
+  });
+});
+
+for (const [kind,prompt,reply,status] of [
+  ["chat_message","读取 input.zip 里的 manifest.txt 并计算校验值，不生成附件。","MARKER|42|hash","succeeded"],
+  ["user_request","读取 input.zip 里的 manifest.txt 并计算校验值，不生成附件。","MARKER|42|hash","succeeded"],
+  ["codex_file_analysis","读取 input.zip 里的 manifest.txt 并计算校验值，不生成附件。","MARKER|42|hash","succeeded"],
+  ["chat_message","Read manifest.txt in input.zip; do not generate attachments.","MARKER|42|hash","succeeded"],
+  ["chat_message","Inspect manifest.txt inside input.zip.","The input file manifest.txt contains the marker.","succeeded"],
+  ["user_request","Read manifest.txt in input.zip and generate report.csv. Do not generate images.","Done.","failed"],
+  ["image_request","Use input.zip to generate poster.png.","Done.","failed"]
+]) {
+  test(`input file references are not outputs: ${kind} ${prompt}`,async()=>{
+    const storeRoot=await tempStore();
+    const job=await createSyncJob(storeRoot,{kind,projectUrl:"https://chatgpt.com/c/read-input",
+      conversationId:"read-input",userText:prompt,payloadText:prompt,
+      inputArtifacts:[{id:"artifact_input",filename:"input.zip",contentType:"application/zip"}]});
+    await withServer({storeRoot,runnerMode:"manual"},async(baseUrl)=>{
+      const response=await fetch(`${baseUrl}/api/sync/jobs/${job.id}/complete`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({replyText:reply})});
+      assert.equal(response.status,200);
+      const completed=await response.json();
+      assert.equal(completed.job.status,status);
+      if(status==="succeeded"){
+        assert.deepEqual(completed.job.artifactErrors,[]);
+        assert.equal(completed.job.replyText,reply);
+      }else{
+        assert.equal(completed.job.errorCode,"missing_download");
+      }
+    });
+  });
+}
+
 async function withServer(options, fn) {
-  const server = createHttpServer(options);
+  const server = createHttpServer({ env: {}, ...options });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   try {
@@ -137,7 +351,11 @@ test("POST /api/tasks with run=true uses manual runner and exposes result", asyn
 test("GET /api/config exposes runner mode and current Codex thread", async () => {
   const storeRoot = await tempStore();
 
-  await withServer({ storeRoot, runnerMode: "manual", currentCodexThreadId: "thread_current" }, async (baseUrl) => {
+  await withServer({
+    storeRoot,
+    runnerMode: "manual",
+    currentCodexThreadId: "thread_current"
+  }, async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/config`);
     assert.equal(response.status, 200);
 
@@ -147,6 +365,24 @@ test("GET /api/config exposes runner mode and current Codex thread", async () =>
     assert.equal(config.currentCodexThreadId, "thread_current");
     assert.match(config.extensionSourceDir, /chrome-extension$/);
     assert.match(config.expectedExtensionVersion, /^v20\d{6}-/);
+  });
+});
+
+test("GET /api/config inherits the current Codex thread from CODEX_THREAD_ID", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({
+    storeRoot,
+    runnerMode: "manual",
+    env: {
+      CODEX_THREAD_ID: "thread-from-codex-window"
+    }
+  }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/config`);
+    assert.equal(response.status, 200);
+
+    const config = await response.json();
+    assert.equal(config.currentCodexThreadId, "thread-from-codex-window");
   });
 });
 
@@ -334,6 +570,74 @@ test("room APIs do not read or write a workspace bound to another Codex thread",
     assert.equal(sendResponse.status, 409);
     const rejected = await sendResponse.json();
     assert.match(rejected.error, /current Codex session is not bound/i);
+  });
+});
+
+test("room APIs keep each browser page scoped to its explicit project id", async () => {
+  const storeRoot = await tempStore();
+  const projectA = await createProject(storeRoot, {
+    name: "page A",
+    chatgptProjectUrl: "https://chatgpt.com/c/page-a",
+    targetRepo: "F:/game_code/page-a",
+    currentCodexThreadId: "thread_current"
+  });
+  const projectB = await createProject(storeRoot, {
+    name: "page B",
+    chatgptProjectUrl: "https://chatgpt.com/c/page-b",
+    targetRepo: "F:/game_code/page-b",
+    currentCodexThreadId: "thread_current"
+  });
+  await appendRoomMessage(storeRoot, {
+    conversationId: projectA.conversationId,
+    from: "gpt",
+    to: ["user"],
+    text: "message only for A"
+  });
+  await appendRoomMessage(storeRoot, {
+    conversationId: projectB.conversationId,
+    from: "gpt",
+    to: ["user"],
+    text: "message only for B"
+  });
+  await updateWorkspaceBinding(storeRoot, {
+    projectId: projectB.id,
+    chatgptProjectUrl: projectB.chatgptProjectUrl,
+    targetRepo: projectB.targetRepo,
+    conversationId: projectB.conversationId
+  });
+
+  await withServer({ storeRoot, runnerMode: "manual", currentCodexThreadId: "thread_current" }, async (baseUrl) => {
+    const pageAResponse = await fetch(
+      `${baseUrl}/api/room/messages?projectId=${encodeURIComponent(projectA.id)}`
+    );
+    const pageBResponse = await fetch(
+      `${baseUrl}/api/room/messages?projectId=${encodeURIComponent(projectB.id)}`
+    );
+    const pageA = await pageAResponse.json();
+    const pageB = await pageBResponse.json();
+
+    assert.deepEqual(pageA.messages.map((message) => message.text), ["message only for A"]);
+    assert.deepEqual(pageB.messages.map((message) => message.text), ["message only for B"]);
+
+    const sendToAResponse = await fetch(`${baseUrl}/api/room/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: projectA.id,
+        text: "new message for A",
+        to: ["codex"]
+      })
+    });
+    assert.equal(sendToAResponse.status, 201);
+
+    const refreshedA = await (
+      await fetch(`${baseUrl}/api/room/messages?projectId=${encodeURIComponent(projectA.id)}`)
+    ).json();
+    const refreshedB = await (
+      await fetch(`${baseUrl}/api/room/messages?projectId=${encodeURIComponent(projectB.id)}`)
+    ).json();
+    assert.equal(refreshedA.messages.some((message) => message.text === "new message for A"), true);
+    assert.equal(refreshedB.messages.some((message) => message.text === "new message for A"), false);
   });
 });
 
@@ -829,7 +1133,7 @@ test("POST /api/preferences/sync stores preferences without queuing a ChatGPT me
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/project/demo/c/abc",
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
     assert.equal(heartbeatResponse.status, 200);
@@ -844,6 +1148,137 @@ test("POST /api/preferences/sync stores preferences without queuing a ChatGPT me
     const roomResponse = await fetch(`${baseUrl}/api/room/messages`);
     const room = await roomResponse.json();
     assert.equal(room.messages.length, 0);
+  });
+});
+
+test("preference sync keeps model and mode settings isolated by explicit project id", async () => {
+  const storeRoot = await tempStore();
+  const projectA = await createProject(storeRoot, {
+    name: "page A",
+    chatgptProjectUrl: "https://chatgpt.com/c/page-a",
+    targetRepo: "F:/game_code/page-a"
+  });
+  const projectB = await createProject(storeRoot, {
+    name: "page B",
+    chatgptProjectUrl: "https://chatgpt.com/c/page-b",
+    targetRepo: "F:/game_code/page-b"
+  });
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    const syncPreference = (projectId, modePreference, modelPreference) =>
+      fetch(`${baseUrl}/api/preferences/sync?projectId=${encodeURIComponent(projectId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId, modePreference, modelPreference })
+      });
+
+    assert.equal((await syncPreference(projectA.id, "high", "gpt-5.6-sol")).status, 201);
+    assert.equal((await syncPreference(projectB.id, "pro", "gpt-5.5")).status, 201);
+
+    const workspaceA = await (
+      await fetch(`${baseUrl}/api/workspace?projectId=${encodeURIComponent(projectA.id)}`)
+    ).json();
+    const workspaceB = await (
+      await fetch(`${baseUrl}/api/workspace?projectId=${encodeURIComponent(projectB.id)}`)
+    ).json();
+
+    assert.equal(workspaceA.projectId, projectA.id);
+    assert.equal(workspaceA.modePreference, "high");
+    assert.equal(workspaceA.modelPreference, "gpt-5.6-sol");
+    assert.equal(workspaceB.projectId, projectB.id);
+    assert.equal(workspaceB.modePreference, "pro");
+    assert.equal(workspaceB.modelPreference, "gpt-5.5");
+  });
+});
+
+test("extension heartbeat controls the project bound to its own GPT page instead of the globally active project", async () => {
+  const storeRoot = await tempStore();
+  const projectA = await createProject(storeRoot, {
+    name: "page A",
+    chatgptProjectUrl: "https://chatgpt.com/c/page-a",
+    targetRepo: "F:/game_code/page-a",
+    currentCodexThreadId: "thread-a",
+    modePreference: "high",
+    modelPreference: "gpt-5.6-sol"
+  });
+  const projectB = await createProject(storeRoot, {
+    name: "page B",
+    chatgptProjectUrl: "https://chatgpt.com/c/page-b",
+    targetRepo: "F:/game_code/page-b",
+    currentCodexThreadId: "thread-b",
+    modePreference: "pro",
+    modelPreference: "gpt-5.5"
+  });
+  await updateWorkspaceBinding(storeRoot, {
+    projectId: projectB.id,
+    chatgptProjectUrl: projectB.chatgptProjectUrl,
+    targetRepo: projectB.targetRepo,
+    conversationId: projectB.conversationId,
+    currentCodexThreadId: projectB.currentCodexThreadId,
+    modePreference: projectB.modePreference,
+    modelPreference: projectB.modelPreference
+  });
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    const heartbeatResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: projectA.chatgptProjectUrl,
+        href: projectA.chatgptProjectUrl,
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
+      })
+    });
+    assert.equal(heartbeatResponse.status, 200);
+    const heartbeat = await heartbeatResponse.json();
+
+    assert.equal(heartbeat.controlsCurrentPage, true);
+    assert.equal(heartbeat.projectUrl, projectA.chatgptProjectUrl);
+    assert.deepEqual(heartbeat.preferences, {
+      projectUrl: projectA.chatgptProjectUrl,
+      modePreference: "high",
+      modelPreference: "gpt-5.6-sol",
+      updatedAt: projectA.preferenceUpdatedAt
+    });
+  });
+});
+
+test("extension heartbeat offers a new tab for a fresh pending job bound to another GPT conversation", async () => {
+  const storeRoot = await tempStore();
+  const currentProject = await createProject(storeRoot, {
+    name: "current page",
+    chatgptProjectUrl: "https://chatgpt.com/c/current-page",
+    targetRepo: "F:/game_code/current-page"
+  });
+  const waitingProject = await createProject(storeRoot, {
+    name: "waiting page",
+    chatgptProjectUrl: "https://chatgpt.com/c/waiting-page",
+    targetRepo: "F:/game_code/waiting-page"
+  });
+  const waitingJob = await createSyncJob(storeRoot, {
+    kind: "chat_message",
+    projectUrl: waitingProject.chatgptProjectUrl,
+    conversationId: waitingProject.conversationId,
+    payloadText: "Start the newly routed task."
+  });
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    const heartbeatResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        href: currentProject.chatgptProjectUrl,
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab-current"
+      })
+    });
+    assert.equal(heartbeatResponse.status, 200);
+    const heartbeat = await heartbeatResponse.json();
+
+    assert.deepEqual(heartbeat.openTarget, {
+      action: "open_project_tab",
+      jobId: waitingJob.id,
+      projectUrl: waitingProject.chatgptProjectUrl
+    });
   });
 });
 
@@ -883,7 +1318,7 @@ test("extension heartbeat preference timestamp ignores unrelated workspace updat
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
     const heartbeat = await heartbeatResponse.json();
@@ -921,7 +1356,7 @@ test("extension heartbeat does not resend already applied preferences", async ()
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         preferenceStatus: {
           state: "applied",
           modePreference: "high",
@@ -967,7 +1402,7 @@ test("extension heartbeat resends failed preferences so the page can recheck vis
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         preferenceStatus: {
           state: "failed",
           modePreference: "high",
@@ -1013,7 +1448,7 @@ test("extension heartbeat preserves applied preferences across extension reloads
       })
     });
     const created = await response.json();
-    const workerId = "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:stable-tab";
+    const workerId = "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:stable-tab";
 
     await fetch(`${baseUrl}/api/extension/heartbeat`, {
       method: "POST",
@@ -1080,7 +1515,7 @@ test("POST /api/preferences/sync drops retired ChatGPT models that are no longer
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
     const heartbeat = await heartbeatResponse.json();
@@ -1126,7 +1561,7 @@ test("POST /api/preferences/sync coerces unsupported mode preferences for limite
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
     const heartbeat = await heartbeatResponse.json();
@@ -1174,7 +1609,7 @@ test("extension heartbeat only sends preferences to the current extension versio
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
     const currentHeartbeat = await currentResponse.json();
@@ -1207,14 +1642,14 @@ test("extension heartbeat asks stale extension versions to reload themselves", a
     assert.equal(response.status, 200);
     const heartbeat = await response.json();
     assert.equal(heartbeat.reloadExtension, true);
-    assert.equal(heartbeat.expectedExtensionVersion, "v20260712-preference-verify");
+    assert.equal(heartbeat.expectedExtensionVersion, "v20260923-missing-recovery");
     assert.equal(heartbeat.controlsCurrentPage, false);
     assert.equal(heartbeat.preferences, null);
     assert.equal(heartbeat.recovery, null);
   });
 });
 
-test("extension heartbeat stores preference application status for diagnostics", async () => {
+test("extension heartbeat stores preference and reply-capture status for diagnostics", async () => {
   const storeRoot = await tempStore();
 
   await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
@@ -1235,7 +1670,7 @@ test("extension heartbeat stores preference application status for diagnostics",
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         preferenceStatus: {
           state: "failed",
           modePreference: "balanced",
@@ -1243,6 +1678,14 @@ test("extension heartbeat stores preference application status for diagnostics",
           modeSynced: true,
           modelSynced: false,
           error: "model preference was not applied"
+        },
+        captureStatus: {
+          jobId: "sync_capture",
+          state: "reply_not_final",
+          replyLength: 120,
+          interim: false,
+          possiblyStreaming: true,
+          updatedAt: "2026-07-28T10:50:00.000Z"
         }
       })
     });
@@ -1257,6 +1700,14 @@ test("extension heartbeat stores preference application status for diagnostics",
       modeSynced: true,
       modelSynced: false,
       error: "model preference was not applied"
+    });
+    assert.deepEqual(diagnostics.extension.heartbeat.captureStatus, {
+      jobId: "sync_capture",
+      state: "reply_not_final",
+      replyLength: 120,
+      interim: false,
+      possiblyStreaming: true,
+      updatedAt: "2026-07-28T10:50:00.000Z"
     });
   });
 });
@@ -1280,7 +1731,7 @@ test("extension heartbeat does not navigate wrong ChatGPT pages when no job is a
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
 
@@ -1330,14 +1781,14 @@ test("extension heartbeat only sends control instructions to the bound ChatGPT p
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/bound-chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound"
       })
     });
     await fetch(`${baseUrl}/api/sync/jobs/${created.syncJob.id}/sent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound"
       })
     });
 
@@ -1353,7 +1804,7 @@ test("extension heartbeat only sends control instructions to the bound ChatGPT p
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_other"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_other"
       })
     });
     const wrongPageHeartbeat = await wrongPageResponse.json();
@@ -1366,12 +1817,12 @@ test("extension heartbeat only sends control instructions to the bound ChatGPT p
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound"
       })
     });
     const boundPageHeartbeat = await boundPageResponse.json();
     assert.equal(boundPageHeartbeat.preferences.modelPreference, "gpt-5.6-sol");
-    assert.equal(boundPageHeartbeat.recovery.action, "reload");
+    assert.equal(boundPageHeartbeat.recovery.action, "capture_existing_reply");
     assert.equal(boundPageHeartbeat.recovery.job.id, created.syncJob.id);
   });
 });
@@ -1395,7 +1846,7 @@ test("diagnostics prefers the bound ChatGPT heartbeat when other ChatGPT tabs ar
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound"
       })
     });
     await fetch(`${baseUrl}/api/extension/heartbeat`, {
@@ -1404,7 +1855,7 @@ test("diagnostics prefers the bound ChatGPT heartbeat when other ChatGPT tabs ar
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_other"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_other"
       })
     });
 
@@ -1445,7 +1896,7 @@ test("diagnostics scopes active sync jobs to the current workspace", async () =>
       body: JSON.stringify({
         href: "https://chatgpt.com/c/current-chat",
         title: "Current chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_current"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_current"
       })
     });
 
@@ -1508,7 +1959,7 @@ test("diagnostics reports actionable workflow status for stale extensions and cu
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         preferenceStatus: {
           state: "failed",
           modePreference: "high",
@@ -1680,7 +2131,7 @@ test("diagnostics treats unrelated busy GPT page state as ready when no Bridge j
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "working",
           code: "active_generation",
@@ -1728,7 +2179,7 @@ test("diagnostics connection checks use product Chinese copy", async () => {
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -1774,7 +2225,7 @@ test("sync progress uses GPT wording instead of ChatGPT wording", async () => {
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -1835,7 +2286,7 @@ test("diagnostics ignores legacy preference sync jobs when reporting latest user
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
 
@@ -1844,7 +2295,7 @@ test("diagnostics ignores legacy preference sync jobs when reporting latest user
     assert.equal(status.latestSyncJob.id, visible.id);
     assert.notEqual(status.latestSyncJob.id, legacyPreference.id);
     assert.equal(status.activeSyncJob.id, visible.id);
-    assert.equal(status.extension.version, "v20260712-preference-verify");
+    assert.equal(status.extension.version, "v20260923-missing-recovery");
     assert.equal(status.extension.needsReload, false);
   });
 });
@@ -1868,7 +2319,7 @@ test("diagnostics prefers a current extension heartbeat over a newer old tab hea
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Current tab",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
     await fetch(`${baseUrl}/api/extension/heartbeat`, {
@@ -1883,7 +2334,7 @@ test("diagnostics prefers a current extension heartbeat over a newer old tab hea
 
     const statusResponse = await fetch(`${baseUrl}/api/diagnostics/status`);
     const status = await statusResponse.json();
-    assert.equal(status.extension.version, "v20260712-preference-verify");
+    assert.equal(status.extension.version, "v20260923-missing-recovery");
     assert.equal(status.extension.needsReload, false);
     assert.equal(status.extension.title, "Current tab");
   });
@@ -1915,7 +2366,7 @@ test("diagnostics does not treat a historical failed sync as the active job", as
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
 
@@ -1925,6 +2376,7 @@ test("diagnostics does not treat a historical failed sync as the active job", as
     assert.equal(status.latestSyncJob.status, "failed");
     assert.equal(status.activeSyncJob, null);
     assert.equal(status.status.state, "idle");
+    assert.doesNotMatch(status.status.reason, /暂无同步记录/);
     assert.equal(status.extension.connected, true);
     assert.equal(status.extension.projectMatches, true);
   });
@@ -1960,7 +2412,7 @@ test("diagnostics does not block on a structured failed job after the ChatGPT pa
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -1998,7 +2450,7 @@ test("diagnostics does not treat unrelated page generation as an active Bridge t
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "working",
           code: "active_generation",
@@ -2039,7 +2491,7 @@ test("diagnostics marks a stale sent sync as retryable instead of active process
       payloadText: "Ask GPT to generate a poster."
     });
     await markSyncJobSent(storeRoot, job.id, {
-      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${job.id}.json`);
@@ -2054,7 +2506,7 @@ test("diagnostics marks a stale sent sync as retryable instead of active process
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2096,7 +2548,7 @@ test("diagnostics short-circuits a sent sync when the GPT page is already ready"
       payloadText: "Ask GPT to create a tiny txt file."
     });
     await markSyncJobSent(storeRoot, job.id, {
-      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${job.id}.json`);
@@ -2112,7 +2564,7 @@ test("diagnostics short-circuits a sent sync when the GPT page is already ready"
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2156,7 +2608,7 @@ test("ready-page stale sent sync jobs are retryable from the room timeline", asy
     const created = await createResponse.json();
 
     await markSyncJobSent(storeRoot, created.syncJob.id, {
-      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
@@ -2172,7 +2624,7 @@ test("ready-page stale sent sync jobs are retryable from the room timeline", asy
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2219,7 +2671,7 @@ test("diagnostics keeps image generation running when the GPT page becomes ready
       payloadText: "Generate 3 separate downloadable images about a futuristic AI workspace."
     });
     await markSyncJobSent(storeRoot, job.id, {
-      workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+      workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
     });
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${job.id}.json`);
@@ -2235,7 +2687,7 @@ test("diagnostics keeps image generation running when the GPT page becomes ready
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2274,7 +2726,7 @@ test("diagnostics explains when the bound ChatGPT page heartbeat is stale", asyn
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound"
       })
     });
 
@@ -2283,7 +2735,7 @@ test("diagnostics explains when the bound ChatGPT page heartbeat is stale", asyn
         {
           href: "https://chatgpt.com/c/bound-chat",
           title: "Bound chat",
-          workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+          workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
           updatedAt: new Date(Date.now() - 45000).toISOString()
         }
       ]
@@ -2297,15 +2749,145 @@ test("diagnostics explains when the bound ChatGPT page heartbeat is stale", asyn
     const statusResponse = await fetch(`${baseUrl}/api/diagnostics/status`);
     const status = await statusResponse.json();
     assert.equal(status.workflowStatus.level, "blocked");
-    assert.equal(status.workflowStatus.title, "\u7ed1\u5b9a\u7684 GPT \u9875\u9762\u5df2\u65ad\u5f00");
+    assert.equal(status.workflowStatus.title, "暂时无法确认绑定的 GPT 页面状态");
+    assert.equal(status.extension.connectionState, "unknown");
+    assert.equal(status.connection.label, "连接待确认");
+    assert.equal(status.connection.canSendToGpt, false);
     assert.equal(status.extension.projectMatches, true);
     assert.equal(status.extension.connected, false);
     assert.equal(status.connection.checks.find((check) => check.id === "extension-connected").state, "blocked");
     const visibleStatus = JSON.stringify(status);
     assert.match(visibleStatus, /\u79d2\u524d|\u5206\u949f\u524d|\u5c0f\u65f6\u524d/);
-    assert.match(status.workflowStatus.nextStep, /Bridge \u4e0d\u4f1a\u7ee7\u7eed\u81ea\u52a8\u5237\u65b0/);
+    assert.match(status.workflowStatus.nextStep, /重新检测/);
+    assert.doesNotMatch(status.workflowStatus.nextStep, /关闭拦截|白名单/);
     assert.doesNotMatch(visibleStatus, /ERR_BLOCKED_BY_CLIENT/);
     assert.doesNotMatch(visibleStatus, /\b\d+[smh] ago\b|unknown time/);
+  });
+});
+
+test("diagnostics keeps an owned running GPT job connected when its heartbeat is delayed before or during busy state", async () => {
+  const storeRoot = await tempStore();
+  const workerId =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_busy_generation";
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    const createdResponse = await fetch(`${baseUrl}/api/room/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: "Generate the current-stage poster image.",
+        to: ["gpt"]
+      })
+    });
+    const created = await createdResponse.json();
+
+    await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/bound-chat",
+        workerId
+      })
+    });
+    await fetch(`${baseUrl}/api/sync/jobs/${created.syncJob.id}/sent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workerId })
+    });
+
+    await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Bound chat generating an image",
+        workerId,
+        pageStatus: {
+          state: "working",
+          code: "bridge_busy",
+          message: "Bridge is processing the current GPT job."
+        }
+      })
+    });
+
+    const delayedHeartbeat = {
+      records: [
+        {
+          href: "https://chatgpt.com/c/bound-chat",
+          title: "Bound chat generating an image",
+          workerId,
+          updatedAt: new Date(Date.now() - 60_000).toISOString(),
+          pageStatus: {
+            state: "working",
+            code: "bridge_busy",
+            message: "Bridge is processing the current GPT job."
+          }
+        }
+      ]
+    };
+    await writeFile(
+      path.join(storeRoot, "extension", "heartbeat.json"),
+      `${JSON.stringify(delayedHeartbeat, null, 2)}\n`,
+      "utf8"
+    );
+
+    const statusResponse = await fetch(`${baseUrl}/api/diagnostics/status`);
+    const status = await statusResponse.json();
+    const preflightResponse = await fetch(`${baseUrl}/api/gpt/preflight`);
+    const preflight = await preflightResponse.json();
+    const extensionCheck = status.connection.checks.find((check) => check.id === "extension-connected");
+
+    assert.equal(status.activeSyncJob.id, created.syncJob.id);
+    assert.equal(status.workflowStatus.level, "working");
+    assert.equal(status.workflowStatus.title, "GPT 正在处理");
+    assert.equal(status.extension.connected, true);
+    assert.equal(status.extension.rawConnected, false);
+    assert.equal(status.extension.heartbeatDelayed, true);
+    assert.equal(extensionCheck.state, "working");
+    assert.equal(preflight.action, "wait_active_sync");
+    assert.doesNotMatch(JSON.stringify(status), /绑定的 GPT 页面已断开|Bridge 扩展未连接/);
+
+    delayedHeartbeat.records[0].pageStatus = {
+      state: "ready",
+      code: "ready",
+      message: "GPT page was ready immediately before the submitted job started generating."
+    };
+    await writeFile(
+      path.join(storeRoot, "extension", "heartbeat.json"),
+      `${JSON.stringify(delayedHeartbeat, null, 2)}\n`,
+      "utf8"
+    );
+
+    const preBusyResponse = await fetch(`${baseUrl}/api/diagnostics/status`);
+    const preBusy = await preBusyResponse.json();
+    assert.equal(preBusy.activeSyncJob.id, created.syncJob.id);
+    assert.equal(preBusy.workflowStatus.level, "working");
+    assert.equal(preBusy.workflowStatus.title, "GPT 正在处理");
+    assert.equal(preBusy.extension.connected, true);
+    assert.equal(preBusy.extension.rawConnected, false);
+    assert.equal(preBusy.extension.heartbeatDelayed, true);
+    assert.doesNotMatch(JSON.stringify(preBusy), /绑定的 GPT 页面已断开|Bridge 扩展未连接/);
+
+    const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
+    const otherWorkerJob = JSON.parse(await readFile(jobPath, "utf8"));
+    otherWorkerJob.workerId = `${workerId}:other`;
+    await writeFile(jobPath, `${JSON.stringify(otherWorkerJob, null, 2)}\n`, "utf8");
+
+    const mismatchedResponse = await fetch(`${baseUrl}/api/diagnostics/status`);
+    const mismatched = await mismatchedResponse.json();
+    assert.equal(mismatched.extension.connected, false);
+    assert.equal(mismatched.extension.heartbeatDelayed, false);
+    assert.equal(mismatched.extension.connectionState, "unknown");
+    assert.equal(mismatched.workflowStatus.title, "暂时无法确认绑定的 GPT 页面状态");
   });
 });
 
@@ -2328,7 +2910,7 @@ test("diagnostics surfaces blocker state reported by the bound ChatGPT page hear
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         pageStatus: {
           state: "blocked",
           code: "human_verification",
@@ -2366,7 +2948,7 @@ test("diagnostics names client-side GPT blocking instead of generic action requi
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         pageStatus: {
           state: "blocked",
           code: "client_blocked",
@@ -2404,7 +2986,7 @@ test("GPT preflight blocks sending when the active ChatGPT page is not the bound
       body: JSON.stringify({
         href: "https://chatgpt.com/c/other-chat",
         title: "Other chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_other"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_other"
       })
     });
 
@@ -2527,6 +3109,79 @@ test("sync retry refuses to create another GPT job when the loaded extension ver
   });
 });
 
+test("sync retry replaces a stale unsent job after a healthy replacement tab connects", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    const originalJob = await createSyncJob(storeRoot, {
+      kind: "chat_message",
+      projectUrl: "https://chatgpt.com/c/bound-chat",
+      targetRepo: "F:/game_code/demo",
+      conversationId: "default",
+      userText: "retry stale unsent job",
+      payloadText: "retry stale unsent job"
+    });
+
+    const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/bound-chat",
+        workerId:
+          "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_original"
+      })
+    });
+    assert.equal(claimResponse.status, 200);
+
+    const jobPath = path.join(storeRoot, "sync", "jobs", `${originalJob.id}.json`);
+    const staleJob = JSON.parse(await readFile(jobPath, "utf8"));
+    const staleAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    staleJob.claimedAt = staleAt;
+    staleJob.updatedAt = staleAt;
+    await writeFile(jobPath, `${JSON.stringify(staleJob, null, 2)}\n`, "utf8");
+
+    await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Bound chat",
+        workerId:
+          "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_replacement",
+        pageStatus: {
+          state: "ready",
+          code: "ready",
+          message: "ChatGPT page can receive Bridge messages."
+        }
+      })
+    });
+
+    const retryResponse = await fetch(`${baseUrl}/api/sync/jobs/${originalJob.id}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(retryResponse.status, 201);
+    const retried = await retryResponse.json();
+    assert.equal(retried.retriedSyncJobId, originalJob.id);
+    assert.equal(retried.syncJob.status, "pending");
+    assert.notEqual(retried.syncJob.id, originalJob.id);
+
+    const jobs = await listSyncJobs(storeRoot);
+    assert.equal(jobs.length, 2);
+    assert.equal(jobs.find((job) => job.id === originalJob.id)?.status, "failed");
+  });
+});
+
 test("GPT preflight allows sending when only ChatGPT preference sync failed", async () => {
   const storeRoot = await tempStore();
 
@@ -2548,7 +3203,7 @@ test("GPT preflight allows sending when only ChatGPT preference sync failed", as
       body: JSON.stringify({
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         pageStatus: {
           state: "ready",
           code: "ready",
@@ -2710,7 +3365,9 @@ test("room route preview returns the same automatic target before sending", asyn
 test("delegate API keeps Codex-only requests out of the GPT queue", async () => {
   const storeRoot = await tempStore();
 
-  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+  await withServer(
+    { storeRoot, runnerMode: "manual", routerV2Enabled: false },
+    async (baseUrl) => {
     await fetch(`${baseUrl}/api/workspace`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -2737,7 +3394,93 @@ test("delegate API keeps Codex-only requests out of the GPT queue", async () => 
 
     const jobs = await listSyncJobs(storeRoot);
     assert.equal(jobs.length, 0);
-  });
+    }
+  );
+});
+
+test("delegate API enables semantic routing by default and returns conflict for cross-project scope", async () => {
+  const storeRoot = await tempStore();
+  const targetRepo = await tempStore();
+
+  await withServer(
+    {
+      storeRoot,
+      runnerMode: "manual",
+      currentCodexThreadId: "semantic-http-thread",
+      routerV2Enabled: true,
+      gptTransportId: "mock"
+    },
+    async (baseUrl) => {
+      const bindResponse = await fetch(`${baseUrl}/api/projects/current-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Semantic HTTP project",
+          chatgptProjectUrl: "https://chatgpt.com/c/semantic-http",
+          targetRepo
+        })
+      });
+      assert.equal(bindResponse.status, 201);
+      const bound = await bindResponse.json();
+
+      const delegatedResponse = await fetch(`${baseUrl}/api/delegate/current-request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: bound.project.id,
+          conversationId: bound.project.conversationId,
+          text: "Analyze this code for concurrency bugs",
+          waitForGpt: false,
+          routingProposal: {
+            version: "1",
+            routeKind: "codex_only",
+            confidence: 0.96
+          }
+        })
+      });
+      assert.equal(delegatedResponse.status, 201);
+      const delegated = await delegatedResponse.json();
+      assert.equal(delegated.action, "codex_only");
+      assert.equal(delegated.route.decisionSource, "semantic_proposal");
+
+      const crossScopeResponse = await fetch(`${baseUrl}/api/delegate/current-request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: bound.project.id,
+          conversationId: "another-project-conversation",
+          text: "写一篇发布文案",
+          waitForGpt: false,
+          routingProposal: {
+            version: "1",
+            routeKind: "gpt_only",
+            confidence: 0.99
+          }
+        })
+      });
+      assert.equal(crossScopeResponse.status, 409);
+      assert.match((await crossScopeResponse.json()).error, /scope mismatch/i);
+
+      const crossThreadResponse = await fetch(`${baseUrl}/api/delegate/current-request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: bound.project.id,
+          conversationId: bound.project.conversationId,
+          currentCodexThreadId: "another-codex-thread",
+          text: "Analyze this code for concurrency bugs",
+          waitForGpt: false,
+          routingProposal: {
+            version: "1",
+            routeKind: "codex_only",
+            confidence: 0.99
+          }
+        })
+      });
+      assert.equal(crossThreadResponse.status, 409);
+      assert.match((await crossThreadResponse.json()).error, /scope mismatch|another Codex thread/i);
+    }
+  );
 });
 
 test("delegate API queues local files from Codex for GPT analysis", async () => {
@@ -2746,7 +3489,12 @@ test("delegate API queues local files from Codex for GPT analysis", async () => 
   const imagePath = path.join(projectRoot, "desktop-shot.png");
   await writeFile(imagePath, Buffer.from("fake image bytes", "utf8"));
 
-  await withServer({ storeRoot, runnerMode: "manual", currentCodexThreadId: "thread_current" }, async (baseUrl) => {
+  await withServer({
+    storeRoot,
+    runnerMode: "manual",
+    currentCodexThreadId: "thread_current",
+    routerV2Enabled: false
+  }, async (baseUrl) => {
     await fetch(`${baseUrl}/api/workspace`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -3046,7 +3794,7 @@ test("sync API lets the user cancel a stuck ChatGPT job", async () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3116,7 +3864,7 @@ test("extension heartbeat stops GPT generation after cancelling an unclaimed Bri
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3182,7 +3930,7 @@ test("extension heartbeat stops a manually cancelled GPT generation before a que
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3200,7 +3948,7 @@ test("extension heartbeat stops a manually cancelled GPT generation before a que
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3263,7 +4011,7 @@ test("extension heartbeat can stop orphan GPT generation after a failed Bridge j
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3306,7 +4054,7 @@ test("extension heartbeat stops orphan generation after missing download capture
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/project/demo",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound"
       })
     });
     const claimed = await claimResponse.json();
@@ -3315,6 +4063,7 @@ test("extension heartbeat stops orphan generation after missing download capture
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         replyText: "Download bridge-regression.pdf",
         artifacts: [],
         artifactIds: [],
@@ -3336,7 +4085,7 @@ test("extension heartbeat stops orphan generation after missing download capture
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_bound",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_bound",
         href: "https://chatgpt.com/project/demo",
         title: "Demo",
         pageStatus: {
@@ -3406,6 +4155,16 @@ test("diagnostics and room messages expose precise GPT sync progress timing", as
     job.thoughtDurationMs = 12000;
     await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`, "utf8");
 
+    await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        href: "https://chatgpt.com/project/demo",
+        title: "Bound chat",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
+      })
+    });
+
     const statusResponse = await fetch(`${baseUrl}/api/diagnostics/status`);
     const status = await statusResponse.json();
 
@@ -3421,8 +4180,12 @@ test("diagnostics and room messages expose precise GPT sync progress timing", as
       preSendMs: 2000,
       responseMs: 15000,
       totalMs: 20000,
+      recoveryMs: null,
       gptThoughtMs: 12000
     });
+    assert.equal(status.status.state, "idle");
+    assert.match(status.status.reason, /已完成|已返回|已捕获/);
+    assert.doesNotMatch(status.status.reason, /暂无同步记录/);
 
     const roomResponse = await fetch(`${baseUrl}/api/room/messages`);
     const room = await roomResponse.json();
@@ -3647,7 +4410,7 @@ test("diagnostics reports extension heartbeat and project page mismatch", async 
     assert.equal(status.extension.connected, true);
     assert.equal(status.extension.href, "https://chatgpt.com/c/other-chat");
     assert.equal(status.extension.version, "v20260625-clean-capture-6");
-    assert.equal(status.extension.expectedVersion, "v20260712-preference-verify");
+    assert.equal(status.extension.expectedVersion, "v20260923-missing-recovery");
     assert.equal(status.extension.needsReload, true);
     assert.match(status.extension.sourceDir, /chrome-extension$/);
     assert.match(status.status.reason, /\u4e0d\u662f\u7ed1\u5b9a\u4f1a\u8bdd/);
@@ -3655,7 +4418,7 @@ test("diagnostics reports extension heartbeat and project page mismatch", async 
   });
 });
 
-test("extension heartbeat asks ChatGPT page to reload when a sent sync is stale", async () => {
+test("extension heartbeat captures a ready sent sync before trying a reload", async () => {
   const storeRoot = await tempStore();
 
   await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
@@ -3702,15 +4465,29 @@ test("extension heartbeat asks ChatGPT page to reload when a sent sync is stale"
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
-        title: "Bound chat"
+        title: "Bound chat",
+        pageStatus: {
+          state: "ready",
+          code: "ready"
+        }
       })
     });
     const heartbeat = await heartbeatResponse.json();
-    assert.equal(heartbeat.recovery.action, "reload");
+    assert.equal(heartbeat.recovery.action, "capture_existing_reply");
     assert.equal(heartbeat.recovery.job.id, created.syncJob.id);
     assert.equal(heartbeat.recovery.resendIfPromptMissing, false);
+    assert.equal(
+      heartbeat.recovery.workerId,
+      "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
+    );
+
+    const recoveredJob = JSON.parse(await readFile(jobPath, "utf8"));
+    assert.equal(
+      recoveredJob._bridgeRecoveryWorkerId,
+      "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
+    );
   });
 });
 
@@ -3756,7 +4533,7 @@ test("extension heartbeat asks ChatGPT page to reload when a claimed sync was ne
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat"
       })
@@ -3769,7 +4546,187 @@ test("extension heartbeat asks ChatGPT page to reload when a claimed sync was ne
   });
 });
 
-test("extension heartbeat does not repeatedly reload the same stale sync", async () => {
+test("extension heartbeat does not assign recovery to a duplicate tab while the owner is connected", async () => {
+  const storeRoot = await tempStore();
+  const ownerWorker =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_owner";
+  const duplicateWorker =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_duplicate";
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+    const createdResponse = await fetch(`${baseUrl}/api/room/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: "Keep this job on its owner tab.",
+        to: ["gpt"]
+      })
+    });
+    const created = await createdResponse.json();
+    await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/bound-chat",
+        workerId: ownerWorker
+      })
+    });
+    await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId: ownerWorker,
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Owner tab",
+        pageStatus: { state: "working", code: "bridge_busy" }
+      })
+    });
+
+    const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
+    const job = JSON.parse(await readFile(jobPath, "utf8"));
+    job.claimedAt = "2026-06-27T10:00:00.000Z";
+    job.updatedAt = "2026-06-27T10:00:00.000Z";
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`, "utf8");
+
+    const duplicateResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId: duplicateWorker,
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Duplicate tab",
+        pageStatus: { state: "ready", code: "ready" }
+      })
+    });
+    const duplicateHeartbeat = await duplicateResponse.json();
+
+    assert.equal(duplicateHeartbeat.recovery, null);
+    const saved = JSON.parse(await readFile(jobPath, "utf8"));
+    assert.equal(saved.workerId, ownerWorker);
+    assert.equal(saved._bridgeRecoveryIssued, undefined);
+  });
+});
+
+test("extension heartbeat does not start recovery for a freshly sent busy job", async () => {
+  const storeRoot = await tempStore();
+  const workerId =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_fresh_job";
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    const created = await createSyncJob(storeRoot, {
+      kind: "chat_message",
+      projectUrl: "https://chatgpt.com/c/bound-chat",
+      payloadText: "Return a short answer."
+    });
+    await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/bound-chat",
+        workerId
+      })
+    });
+    await markSyncJobSent(storeRoot, created.id, { workerId });
+
+    const heartbeatResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId,
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Bound chat",
+        pageStatus: {
+          state: "working",
+          code: "bridge_busy",
+          message: "Bridge is processing the current GPT job."
+        }
+      })
+    });
+    const heartbeat = await heartbeatResponse.json();
+    const saved = await getSyncJob(storeRoot, created.id);
+
+    assert.equal(heartbeat.recovery, null);
+    assert.equal(Boolean(saved._bridgeRecoveryIssued), false);
+    assert.equal(Number(saved._bridgeRecoveryAttempts || 0), 0);
+  });
+});
+
+test("extension heartbeat does not probe capture while GPT is actively generating", async () => {
+  const storeRoot = await tempStore();
+  const workerId =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_generating";
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    const created = await createSyncJob(storeRoot, {
+      kind: "chat_message",
+      projectUrl: "https://chatgpt.com/c/bound-chat",
+      payloadText: "Write a long report."
+    });
+    await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/bound-chat",
+        workerId
+      })
+    });
+    await markSyncJobSent(storeRoot, created.id, { workerId });
+    const jobPath = path.join(storeRoot, "sync", "jobs", `${created.id}.json`);
+    const stored = JSON.parse(await readFile(jobPath, "utf8"));
+    stored.sentAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    await writeFile(jobPath, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
+
+    const heartbeatResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId,
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Bound chat",
+        pageStatus: {
+          state: "working",
+          code: "active_generation",
+          recoveryAction: "wait_for_generation",
+          message: "GPT is still generating."
+        }
+      })
+    });
+    const heartbeat = await heartbeatResponse.json();
+    const saved = await getSyncJob(storeRoot, created.id);
+
+    assert.equal(heartbeat.recovery, null);
+    assert.equal(Boolean(saved._bridgeRecoveryIssued), false);
+    assert.equal(Number(saved._bridgeRecoveryAttempts || 0), 0);
+  });
+});
+
+test("extension heartbeat rate limits capture checks for a sent job", async () => {
   const storeRoot = await tempStore();
 
   await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
@@ -3816,19 +4773,20 @@ test("extension heartbeat does not repeatedly reload the same stale sync", async
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat"
       })
     });
     const first = await firstResponse.json();
-    assert.equal(first.recovery.action, "reload");
+    assert.equal(first.recovery.action, "capture_existing_reply");
+    assert.equal(first.recovery.resendIfPromptMissing, false);
 
     const secondResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok",
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
         href: "https://chatgpt.com/c/bound-chat",
         title: "Bound chat"
       })
@@ -3838,6 +4796,94 @@ test("extension heartbeat does not repeatedly reload the same stale sync", async
 
     const updatedJob = JSON.parse(await readFile(jobPath, "utf8"));
     assert.equal(updatedJob._bridgeRecoveryIssued, true);
+    assert.equal(updatedJob._bridgeRecoveryAction, "capture_existing_reply");
+    assert.equal(updatedJob._bridgeRecoveryAttempts, 1);
+    updatedJob._bridgeRecoveryIssuedAt = "2026-06-27T10:00:00.000Z";
+    await writeFile(jobPath, `${JSON.stringify(updatedJob, null, 2)}\n`, "utf8");
+
+    const thirdResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Bound chat",
+        pageStatus: {
+          state: "ready",
+          code: "ready"
+        }
+      })
+    });
+    const third = await thirdResponse.json();
+    assert.equal(third.recovery.action, "capture_existing_reply");
+    assert.equal(third.recovery.job.id, created.syncJob.id);
+  });
+});
+
+test("extension heartbeat checks for a finished reply even while the original waiter reports busy", async () => {
+  const storeRoot = await tempStore();
+  const workerId =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_ready_capture";
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/bound-chat",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    const created = await createSyncJob(storeRoot, {
+      kind: "chat_message",
+      projectUrl: "https://chatgpt.com/c/bound-chat",
+      payloadText: "Return a finished answer."
+    });
+    await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/bound-chat",
+        workerId
+      })
+    });
+    await markSyncJobSent(storeRoot, created.id, {
+      workerId,
+      submittedPromptTurnIndex: 6
+    });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await markSyncJobRecoveryIssued(storeRoot, created.id, {
+        workerId,
+        action: "reload"
+      });
+    }
+    const jobPath = path.join(storeRoot, "sync", "jobs", `${created.id}.json`);
+    const recoveryDueJob = JSON.parse(await readFile(jobPath, "utf8"));
+    recoveryDueJob.sentAt = "2026-06-27T09:59:30.000Z";
+    recoveryDueJob._bridgeRecoveryIssuedAt = "2026-06-27T10:00:00.000Z";
+    await writeFile(jobPath, `${JSON.stringify(recoveryDueJob, null, 2)}\n`, "utf8");
+
+    const heartbeatResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId,
+        href: "https://chatgpt.com/c/bound-chat",
+        title: "Bound chat",
+        pageStatus: {
+          state: "working",
+          code: "bridge_busy",
+          message: "Bridge is processing the current GPT job."
+        }
+      })
+    });
+    const heartbeat = await heartbeatResponse.json();
+
+    assert.equal(heartbeat.recovery.action, "capture_existing_reply");
+    assert.equal(heartbeat.recovery.job.id, created.id);
+    assert.equal(heartbeat.recovery.job.submittedPromptTurnIndex, 6);
+    assert.equal(heartbeat.recovery.resendIfPromptMissing, false);
   });
 });
 
@@ -3880,8 +4926,9 @@ test("sync claim does not hand a navigation recovery job to the wrong ChatGPT pa
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
     const storedJob = JSON.parse(await readFile(jobPath, "utf8"));
-    storedJob.sentAt = "2026-06-27T10:00:00.000Z";
-    storedJob.updatedAt = "2026-06-27T10:00:00.000Z";
+    const staleSentAt = new Date(Date.now() - 7 * 60 * 1000).toISOString();
+    storedJob.sentAt = staleSentAt;
+    storedJob.updatedAt = staleSentAt;
     await writeFile(jobPath, `${JSON.stringify(storedJob, null, 2)}\n`, "utf8");
 
     const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
@@ -3898,7 +4945,7 @@ test("sync claim does not hand a navigation recovery job to the wrong ChatGPT pa
     assert.equal(claim.resume, false);
 
     const after = JSON.parse(await readFile(jobPath, "utf8"));
-    assert.equal(after.sentAt, "2026-06-27T10:00:00.000Z");
+    assert.equal(after.sentAt, staleSentAt);
   });
 });
 
@@ -4271,8 +5318,9 @@ test("sync claim returns a reload recovery job when an old extension resumes a s
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
     const storedJob = JSON.parse(await readFile(jobPath, "utf8"));
-    storedJob.sentAt = "2026-06-27T10:00:00.000Z";
-    storedJob.updatedAt = "2026-06-27T10:00:00.000Z";
+    const staleSentAt = new Date(Date.now() - 7 * 60 * 1000).toISOString();
+    storedJob.sentAt = staleSentAt;
+    storedJob.updatedAt = staleSentAt;
     await writeFile(jobPath, `${JSON.stringify(storedJob, null, 2)}\n`, "utf8");
 
     const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
@@ -4317,7 +5365,7 @@ test("sync claim resumes a stale sent sync for the current extension without res
     });
     const created = await response.json();
 
-    const currentWorkerId = "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok:tab_current";
+    const currentWorkerId = "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_current";
     await fetch(`${baseUrl}/api/sync/jobs/claim`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4334,8 +5382,9 @@ test("sync claim resumes a stale sent sync for the current extension without res
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
     const storedJob = JSON.parse(await readFile(jobPath, "utf8"));
-    storedJob.sentAt = "2026-06-27T10:00:00.000Z";
-    storedJob.updatedAt = "2026-06-27T10:00:00.000Z";
+    const staleSentAt = new Date(Date.now() - 7 * 60 * 1000).toISOString();
+    storedJob.sentAt = staleSentAt;
+    storedJob.updatedAt = staleSentAt;
     await writeFile(jobPath, `${JSON.stringify(storedJob, null, 2)}\n`, "utf8");
 
     const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
@@ -4350,7 +5399,7 @@ test("sync claim resumes a stale sent sync for the current extension without res
     const claim = await claimResponse.json();
     assert.equal(claim.resume, true);
     assert.equal(claim.job.id, created.syncJob.id);
-    assert.equal(claim.job.sentAt, "2026-06-27T10:00:00.000Z");
+    assert.equal(claim.job.sentAt, staleSentAt);
     assert.equal(claim.job.projectUrl, "https://chatgpt.com/c/bound-chat");
     assert.equal(claim.job._bridgeResendIfPromptMissing, undefined);
   });
@@ -4390,8 +5439,9 @@ test("sync claim returns a reload recovery job for a stale claimed-but-unsent sy
 
     const jobPath = path.join(storeRoot, "sync", "jobs", `${created.syncJob.id}.json`);
     const storedJob = JSON.parse(await readFile(jobPath, "utf8"));
-    storedJob.claimedAt = "2026-06-27T10:00:00.000Z";
-    storedJob.updatedAt = "2026-06-27T10:00:00.000Z";
+    const staleClaimedAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    storedJob.claimedAt = staleClaimedAt;
+    storedJob.updatedAt = staleClaimedAt;
     await writeFile(jobPath, `${JSON.stringify(storedJob, null, 2)}\n`, "utf8");
 
     const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
@@ -4749,6 +5799,269 @@ test("sync API can retry a failed ChatGPT room message", async () => {
     const room = await roomResponse.json();
     assert.equal(room.messages.length, 3);
     assert.equal(room.messages[2].metadata.syncStatus, "pending");
+  });
+});
+
+test("sync retry reopens a sent reply timeout for capture without resending the GPT prompt", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/project/demo",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    const createResponse = await fetch(`${baseUrl}/api/room/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: "Design the first three episodes.",
+        to: ["gpt"]
+      })
+    });
+    const created = await createResponse.json();
+
+    const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/project/demo/c/abc",
+        workerId: "test-extension"
+      })
+    });
+    const claimed = await claimResponse.json();
+    await fetch(`${baseUrl}/api/sync/jobs/${claimed.job.id}/sent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId: "test-extension",
+        previousAssistantText: "Older reply"
+      })
+    });
+    await fetch(`${baseUrl}/api/sync/jobs/${claimed.job.id}/fail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        error: "Timed out waiting for GPT reply",
+        errorCode: "reply_timeout",
+        recoveryAction: "refresh_bound_page"
+      })
+    });
+
+    const retryResponse = await fetch(`${baseUrl}/api/sync/jobs/${claimed.job.id}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(retryResponse.status, 200);
+    const retried = await retryResponse.json();
+
+    assert.equal(retried.captureOnly, true);
+    assert.equal(retried.retriedSyncJobId, claimed.job.id);
+    assert.equal(retried.syncJob.id, claimed.job.id);
+    assert.equal(retried.syncJob.status, "running");
+    assert.ok(retried.syncJob.sentAt);
+    assert.equal(retried.syncJob.previousAssistantText, "Older reply");
+    assert.equal(retried.message, null);
+
+    const jobs = await listSyncJobs(storeRoot);
+    assert.equal(jobs.length, 1);
+    const roomResponse = await fetch(`${baseUrl}/api/room/messages`);
+    const room = await roomResponse.json();
+    assert.equal(room.messages.length, 2);
+    assert.equal(room.messages[0].id, created.message.id);
+  });
+});
+
+test("sync retry captures an already-started generation after pre-send confirmation expired", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/already-generating",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+    const job = await createSyncJob(storeRoot, {
+      kind: "user_request",
+      projectUrl: "https://chatgpt.com/c/already-generating",
+      targetRepo: "F:/game_code/demo",
+      payloadText: "Write the detailed first episode."
+    });
+    const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: job.projectUrl,
+        workerId: "test-extension"
+      })
+    });
+    const { job: claimed } = await claimResponse.json();
+    await failSyncJob(storeRoot, job.id, {
+      error: "GPT generation started but prompt confirmation expired.",
+      errorCode: "pre_send_expired",
+      recoveryAction: "retry"
+    });
+    await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        href: job.projectUrl,
+        workerId: "test-extension",
+        pageStatus: {
+          state: "working",
+          code: "active_generation",
+          message: "GPT is still generating."
+        }
+      })
+    });
+
+    const retryResponse = await fetch(`${baseUrl}/api/sync/jobs/${job.id}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(retryResponse.status, 200);
+    const retried = await retryResponse.json();
+
+    assert.equal(retried.captureOnly, true);
+    assert.equal(retried.resend, false);
+    assert.equal(retried.syncJob.id, job.id);
+    assert.equal(retried.syncJob.status, "running");
+    assert.ok(retried.syncJob.sentAt);
+    assert.equal(retried.syncJob.claimedAt, claimed.claimedAt);
+    assert.equal((await listSyncJobs(storeRoot)).length, 1);
+  });
+});
+
+test("sync retry reopens an unconfirmed sent job under the same id for a real resend", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/repeated-poster",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+    const job = await createSyncJob(storeRoot, {
+      kind: "image_request",
+      projectUrl: "https://chatgpt.com/c/repeated-poster",
+      targetRepo: "F:/game_code/demo",
+      payloadText: "只生成一张竖版中文小说海报。"
+    });
+    await markSyncJobSent(storeRoot, job.id, {
+      workerId: "test-extension",
+      submittedPromptTurnIndex: 8
+    });
+    await failSyncJob(storeRoot, job.id, {
+      error: "GPT 点击发送后没有显示本次新增的提示。",
+      errorCode: "send_not_confirmed",
+      recoveryAction: "retry_send"
+    });
+    await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        href: "https://chatgpt.com/c/repeated-poster",
+        workerId: "test-extension",
+        pageStatus: { state: "ready", code: "ready", message: "GPT page is ready." }
+      })
+    });
+
+    const retryResponse = await fetch(`${baseUrl}/api/sync/jobs/${job.id}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(retryResponse.status, 200);
+    const retried = await retryResponse.json();
+
+    assert.equal(retried.captureOnly, false);
+    assert.equal(retried.resend, true);
+    assert.equal(retried.syncJob.id, job.id);
+    assert.equal(retried.syncJob.status, "pending");
+    assert.equal(retried.syncJob.sentAt, null);
+    assert.equal(retried.syncJob.submittedPromptTurnIndex, null);
+    assert.equal((await listSyncJobs(storeRoot)).length, 1);
+  });
+});
+
+test("sync retry uses the explicit project scope instead of the globally active project", async () => {
+  const storeRoot = await tempStore();
+  const projectA = await createProject(storeRoot, {
+    name: "project A",
+    chatgptProjectUrl: "https://chatgpt.com/c/project-a",
+    targetRepo: "F:/game_code/project-a"
+  });
+  const projectB = await createProject(storeRoot, {
+    name: "project B",
+    chatgptProjectUrl: "https://chatgpt.com/c/project-b",
+    targetRepo: "F:/game_code/project-b"
+  });
+  await updateWorkspaceBinding(storeRoot, {
+    projectId: projectB.id,
+    chatgptProjectUrl: projectB.chatgptProjectUrl,
+    targetRepo: projectB.targetRepo,
+    conversationId: projectB.conversationId
+  });
+  const job = await createSyncJob(storeRoot, {
+    kind: "image_request",
+    projectUrl: projectA.chatgptProjectUrl,
+    targetRepo: projectA.targetRepo,
+    conversationId: projectA.conversationId,
+    payloadText: "Generate the project A poster."
+  });
+  await markSyncJobSent(storeRoot, job.id, {
+    workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab-a"
+  });
+  await failSyncJob(storeRoot, job.id, {
+    error: "Timed out waiting for GPT reply",
+    errorCode: "reply_timeout",
+    recoveryAction: "refresh_bound_page"
+  });
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    const heartbeatResponse = await fetch(`${baseUrl}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        href: projectA.chatgptProjectUrl,
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab-a",
+        pageStatus: {
+          state: "ready",
+          code: "ready",
+          message: "GPT page is ready."
+        }
+      })
+    });
+    assert.equal(heartbeatResponse.status, 200);
+
+    const retryResponse = await fetch(
+      `${baseUrl}/api/sync/jobs/${job.id}/retry?projectId=${encodeURIComponent(projectA.id)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      }
+    );
+    assert.equal(retryResponse.status, 200);
+    const retried = await retryResponse.json();
+    assert.equal(retried.captureOnly, true);
+    assert.equal(retried.syncJob.id, job.id);
+
+    const workspaceResponse = await fetch(`${baseUrl}/api/workspace`);
+    const workspace = await workspaceResponse.json();
+    assert.equal(workspace.projectId, projectB.id);
   });
 });
 
@@ -5284,7 +6597,7 @@ test("product artifact APIs expose diagnostics, preview, save and Codex analysis
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           projectUrl: "https://chatgpt.com/project/demo/c/abc",
-          workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+          workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
         })
       });
       const claimed = await claimResponse.json();
@@ -5293,7 +6606,7 @@ test("product artifact APIs expose diagnostics, preview, save and Codex analysis
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+          workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
         })
       });
 
@@ -5301,6 +6614,7 @@ test("product artifact APIs expose diagnostics, preview, save and Codex analysis
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok",
           replyText: "Here is notes.txt.",
           artifacts: [
             {
@@ -5367,8 +6681,8 @@ test("product artifact APIs expose diagnostics, preview, save and Codex analysis
       assert.equal(status.workspace.targetRepo, projectRoot);
       assert.equal(status.latestSyncJob.id, claimed.job.id);
       assert.equal(status.latestSyncJob.status, "succeeded");
-      assert.equal(status.extension.workerId, "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok");
-      assert.equal(status.extension.version, "v20260712-preference-verify");
+      assert.equal(status.extension.workerId, "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok");
+      assert.equal(status.extension.version, "v20260923-missing-recovery");
       assert.equal(status.artifactCount, 1);
     }
   );
@@ -5757,20 +7071,21 @@ test("local file wait API returns the ChatGPT reply without external polling", a
         contentType: "image/png",
         note: "Please identify this screenshot.",
         from: "codex",
-        timeoutMs: 1000,
+        timeoutMs: 5000,
         pollMs: 10
       })
     });
 
     let job;
-    for (let index = 0; index < 20 && !job; index += 1) {
+    const jobDeadline = Date.now() + 5000;
+    while (!job && Date.now() < jobDeadline) {
       const jobs = await listSyncJobs(storeRoot);
       job = jobs.find((candidate) => candidate.kind === "codex_file_analysis");
       if (!job) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
-    assert.ok(job);
+    assert.ok(job, "file analysis job must be published within 5 seconds");
     await completeSyncJob(storeRoot, job.id, {
       replyText: "#### ChatGPT says:\n\nGPT says this is a desktop shortcut."
     });
@@ -5815,20 +7130,22 @@ test("local file analysis does not treat the uploaded input file as a missing ge
         contentType: "image/png",
         note: "Please identify this screenshot. Do not generate a file.",
         from: "codex",
-        timeoutMs: 1000,
+        // This test checks input/output classification, not a 1-second deadline.
+        timeoutMs: 10000,
         pollMs: 10
       })
     });
 
     let job;
-    for (let index = 0; index < 20 && !job; index += 1) {
+    const jobReadyDeadline = Date.now() + 5000;
+    while (!job && Date.now() < jobReadyDeadline) {
       const jobs = await listSyncJobs(storeRoot);
       job = jobs.find((candidate) => candidate.kind === "codex_file_analysis");
       if (!job) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
-    assert.ok(job);
+    assert.ok(job, "input-analysis job should become observable before the fixture deadline");
     await fetch(`${baseUrl}/api/sync/jobs/claim`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -5932,7 +7249,9 @@ test("local file wait API accepts a sent GPT reply during timeout grace", async 
         note: "Please identify this file.",
         from: "codex",
         timeoutMs: 80,
-        timeoutGraceMs: 300,
+        // Keep the reply beyond the initial 80 ms, but allow real filesystem
+        // scheduling delays on Windows. This is not a 300 ms latency benchmark.
+        timeoutGraceMs: 5000,
         pollMs: 10
       })
     });
@@ -5993,20 +7312,21 @@ test("local file wait API accepts a queued GPT reply during timeout grace", asyn
         note: "Please identify this file.",
         from: "codex",
         timeoutMs: 30,
-        timeoutGraceMs: 300,
+        timeoutGraceMs: 5000,
         pollMs: 10
       })
     });
 
     let job;
-    for (let index = 0; index < 20 && !job; index += 1) {
+    const publishDeadline = Date.now() + 5000;
+    while (!job && Date.now() < publishDeadline) {
       const jobs = await listSyncJobs(storeRoot);
       job = jobs.find((candidate) => candidate.kind === "codex_file_analysis");
       if (!job) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
-    assert.ok(job);
+    assert.ok(job, "queued file job must be published within 5 seconds");
 
     const lateComplete = new Promise((resolve, reject) => {
       setTimeout(async () => {
@@ -6471,6 +7791,79 @@ test("sync API fails an image request when no real image artifact was captured",
     assert.equal(completed.job.errorCode, "missing_download");
     assert.equal(completed.job.artifactIds.length, 0);
     assert.equal(completed.job.artifactErrors.length, 1);
+    assert.equal(completed.job.artifactErrors[0].code, "missing_download");
+  });
+});
+
+test("sync API honors an explicit no-poster stage even if its stored kind was incorrectly image_request", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await updateWorkspaceBinding(storeRoot, {
+      chatgptProjectUrl: "https://chatgpt.com/c/demo",
+      targetRepo: "F:/game_code/demo",
+      conversationId: "novel-room"
+    });
+    const job = await createSyncJob(storeRoot, {
+      kind: "image_request",
+      projectUrl: "https://chatgpt.com/c/demo",
+      targetRepo: "F:/game_code/demo",
+      conversationId: "novel-room",
+      userText:
+        "请先设计小说前3集。当前阶段只完成前3集设计，不要提前写第一集完整内容，也不制作海报。",
+      payloadText:
+        "请先设计小说前3集。当前阶段只完成前3集设计，不要提前写第一集完整内容，也不制作海报。"
+    });
+
+    const completeResponse = await fetch(`${baseUrl}/api/sync/jobs/${job.id}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replyText: "小说前3集的世界观、人物、冲突和结尾悬念已经设计完成。",
+        artifacts: [],
+        artifactIds: [],
+        artifactErrors: []
+      })
+    });
+    assert.equal(completeResponse.status, 200);
+    const completed = await completeResponse.json();
+
+    assert.equal(completed.job.status, "succeeded");
+    assert.deepEqual(completed.job.artifactIds, []);
+    assert.deepEqual(completed.job.artifactErrors, []);
+  });
+});
+
+test("sync API requires the requested image when the prompt only forbids duplicates", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    const prompt =
+      "请生成且只生成1张正方形极简验收图片。不要生成多张，不要引用或重复本会话以前的图片。";
+    const job = await createSyncJob(storeRoot, {
+      kind: "image_request",
+      projectUrl: "https://chatgpt.com/c/demo",
+      conversationId: "novel-room",
+      userText: prompt,
+      payloadText: prompt
+    });
+
+    const completeResponse = await fetch(`${baseUrl}/api/sync/jobs/${job.id}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replyText: "GPT generated an image.",
+        artifacts: [],
+        artifactIds: [],
+        artifactErrors: []
+      })
+    });
+    assert.equal(completeResponse.status, 200);
+    const completed = await completeResponse.json();
+
+    assert.equal(completed.job.status, "failed");
+    assert.equal(completed.job.errorCode, "missing_download");
+    assert.equal(completed.job.artifactIds.length, 0);
     assert.equal(completed.job.artifactErrors[0].code, "missing_download");
   });
 });
@@ -7803,6 +9196,134 @@ test("sync API does not infer missing artifacts from example filenames in normal
   });
 });
 
+test("sync API does not turn GPT file-organization suggestions into a missing-download requirement", async () => {
+  const storeRoot = await tempStore();
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/project/demo",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    await fetch(`${baseUrl}/api/room/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: "请设计小说前三集，只返回文字内容。",
+        to: ["gpt"]
+      })
+    });
+
+    const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/project/demo/c/abc",
+        workerId: "test-extension"
+      })
+    });
+    const claimed = await claimResponse.json();
+
+    const completeResponse = await fetch(`${baseUrl}/api/sync/jobs/${claimed.job.id}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replyText: [
+          "小说前三集设计已经完成。",
+          "建议步骤：将上述内容拆分进对应的 Markdown 文件。",
+          "可按 novel_overview.md、characters.md、episodes_01_03.md 的结构整理。"
+        ].join("\n")
+      })
+    });
+    assert.equal(completeResponse.status, 200);
+    const completed = await completeResponse.json();
+
+    assert.equal(completed.job.status, "succeeded");
+    assert.deepEqual(completed.job.artifactIds, []);
+    assert.deepEqual(completed.job.artifactErrors, []);
+  });
+});
+
+test("sync API can reprocess a captured reply that previously failed only because of missing-download inference", async () => {
+  const storeRoot = await tempStore();
+  const replyText = [
+    "小说前三集设计已经完成。",
+    "建议将内容拆分整理为 Markdown 文件。",
+    "可按 novel_overview.md、characters.md、episodes_01_03.md 的结构整理。"
+  ].join("\n");
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/project/demo",
+        targetRepo: "F:/game_code/demo"
+      })
+    });
+
+    const created = await createSyncJob(storeRoot, {
+      kind: "user_request",
+      projectUrl: "https://chatgpt.com/project/demo",
+      conversationId: "captured-recovery",
+      userText: "请设计小说前三集，只返回文字内容。",
+      payloadText: "请设计小说前三集，只返回文字内容。"
+    });
+    await failSyncJob(storeRoot, created.id, {
+      error: "GPT 提到了可下载文件，但 Bridge 没有捕获到真实文件",
+      errorCode: "missing_download",
+      replyText,
+      artifactErrors: [
+        {
+          code: "missing_download",
+          filename: "novel_overview.md",
+          error: "missing"
+        }
+      ]
+    });
+    const failureMessage = await appendRoomMessage(storeRoot, {
+      conversationId: created.conversationId,
+      from: "gpt",
+      to: ["user"],
+      text: "文件没有捕获成功",
+      metadata: {
+        syncJobId: created.id,
+        syncStatus: "failed"
+      }
+    });
+
+    const completeResponse = await fetch(`${baseUrl}/api/sync/jobs/${created.id}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replyText,
+        artifacts: [],
+        artifactIds: [],
+        artifactErrors: []
+      })
+    });
+    assert.equal(completeResponse.status, 200);
+    const completed = await completeResponse.json();
+
+    assert.equal(completed.job.status, "succeeded");
+    assert.equal(completed.job.replyText, replyText);
+    assert.deepEqual(completed.job.artifactErrors, []);
+    const visibleMessages = await listRoomMessages(storeRoot, {
+      conversationId: created.conversationId
+    });
+    assert.equal(visibleMessages.some((message) => message.id === failureMessage.id), false);
+    const allMessages = await listRoomMessages(storeRoot, {
+      conversationId: created.conversationId,
+      includeHidden: true
+    });
+    assert.equal(allMessages.some((message) => message.id === failureMessage.id), true);
+  });
+});
+
 test("sync API completes a normal chat reply without creating a Codex inbox item", async () => {
   const storeRoot = await tempStore();
 
@@ -8114,7 +9635,7 @@ test("acceptance API summarizes captured GPT data scenarios for the active room"
       body: JSON.stringify({
         href: "https://chatgpt.com/project/demo/c/abc",
         title: "Current extension",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:runtime-ok"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok"
       })
     });
 
@@ -8267,5 +9788,152 @@ test("chat reply API can create a Codex task from a pasted ChatGPT response", as
     assert.equal(imported.message.role, "chatgpt");
     assert.equal(imported.task.title, "GPT \u89c4\u5212\u6267\u884c");
     assert.equal(imported.task.status, "queued");
+  });
+});
+
+test("current extension sync lifecycle mutations only accept the claimed worker", async () => {
+  const storeRoot = await tempStore();
+  const ownerWorker =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_owner_worker";
+  const otherWorker =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_other_worker";
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/worker-owner",
+        targetRepo: "F:/game_code/worker-owner"
+      })
+    });
+    const queuedResponse = await fetch(`${baseUrl}/api/room/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: "Return one private owner result.",
+        to: ["gpt"]
+      })
+    });
+    const queued = await queuedResponse.json();
+    const claimResponse = await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/worker-owner",
+        workerId: ownerWorker
+      })
+    });
+    assert.equal(claimResponse.status, 200);
+    assert.equal((await claimResponse.json()).job.workerId, ownerWorker);
+
+    for (const [action, payload] of [
+      ["sent", {}],
+      ["pre-send-refresh", {}],
+      ["fail", { error: "wrong worker failure" }]
+    ]) {
+      const response = await fetch(`${baseUrl}/api/sync/jobs/${queued.syncJob.id}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...payload,
+          workerId: otherWorker
+        })
+      });
+      assert.equal(response.status, 409, `${action} must reject a non-owner worker`);
+      assert.equal((await response.json()).code, "sync_job_worker_mismatch");
+    }
+
+    const missingWorkerResponse = await fetch(
+      `${baseUrl}/api/sync/jobs/${queued.syncJob.id}/complete`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ replyText: "missing worker result" })
+      }
+    );
+    assert.equal(missingWorkerResponse.status, 409);
+    assert.equal((await missingWorkerResponse.json()).code, "sync_job_worker_mismatch");
+
+    const otherWorkerResponse = await fetch(
+      `${baseUrl}/api/sync/jobs/${queued.syncJob.id}/complete`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workerId: otherWorker,
+          replyText: "wrong worker result"
+        })
+      }
+    );
+    assert.equal(otherWorkerResponse.status, 409);
+    assert.equal((await otherWorkerResponse.json()).code, "sync_job_worker_mismatch");
+    assert.equal((await listSyncJobs(storeRoot)).find((job) => job.id === queued.syncJob.id).status, "running");
+
+    const ownerResponse = await fetch(`${baseUrl}/api/sync/jobs/${queued.syncJob.id}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workerId: ownerWorker,
+        replyText: "owner worker result"
+      })
+    });
+    assert.equal(ownerResponse.status, 200);
+    assert.equal((await ownerResponse.json()).job.status, "succeeded");
+  });
+});
+
+test("current extension sync completion accepts the explicitly assigned recovery worker", async () => {
+  const storeRoot = await tempStore();
+  const ownerWorker =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_recovery_owner";
+  const recoveryWorker =
+    "codex-chatgpt-project-extension-v20260923-missing-recovery:runtime-ok:tab_recovery_worker";
+
+  await withServer({ storeRoot, runnerMode: "manual" }, async (baseUrl) => {
+    await fetch(`${baseUrl}/api/workspace`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatgptProjectUrl: "https://chatgpt.com/c/recovery-owner",
+        targetRepo: "F:/game_code/recovery-owner"
+      })
+    });
+    const queued = await (
+      await fetch(`${baseUrl}/api/room/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: "Return one recovery result.",
+          to: ["gpt"]
+        })
+      })
+    ).json();
+    await fetch(`${baseUrl}/api/sync/jobs/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectUrl: "https://chatgpt.com/c/recovery-owner",
+        workerId: ownerWorker
+      })
+    });
+    await markSyncJobRecoveryIssued(storeRoot, queued.syncJob.id, {
+      action: "capture_existing_reply",
+      workerId: recoveryWorker
+    });
+
+    const recoveryResponse = await fetch(
+      `${baseUrl}/api/sync/jobs/${queued.syncJob.id}/complete`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workerId: recoveryWorker,
+          replyText: "recovered by the assigned tab"
+        })
+      }
+    );
+    assert.equal(recoveryResponse.status, 200);
+    assert.equal((await recoveryResponse.json()).job.status, "succeeded");
   });
 });

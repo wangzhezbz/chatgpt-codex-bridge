@@ -1,213 +1,297 @@
-# Codex 工作台
+<p align="center">
+  <img src="assets/codexbridge-hero.svg" alt="CodexBridge — Codex + GPT. One workflow." width="100%" />
+</p>
 
-这是一个本地原型，用来验证这个产品形态：
+<p align="center">
+  <a href="https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/wangzhezbz/chatgpt-codex-bridge?style=flat-square&color=111827" /></a>
+  <img alt="Node.js 20+" src="https://img.shields.io/badge/Node.js-20%2B-339933?style=flat-square&logo=node.js&logoColor=white" />
+  <img alt="Windows verified" src="https://img.shields.io/badge/Windows-verified-2563EB?style=flat-square&logo=windows11&logoColor=white" />
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-111827?style=flat-square" /></a>
+</p>
 
-```text
-Codex 是主工作台。
-页面是一个 ChatGPT Project 风格的聊天窗口。
-用户像聊天一样发任务。绑定 ChatGPT Project 后，底层会把上下文发给真实 ChatGPT Project；ChatGPT 回复后，本地桥会把“给 Codex 的指令”放入 Codex 收件箱，等待 Codex 侧领取执行。执行结果默认只写回本地，只有显式确认时才同步给 ChatGPT 分析。
+<p align="center">
+  <strong>让 Codex 负责执行，让 GPT 负责高成本内容工作。</strong><br />
+  一个本地运行、按项目隔离、支持文件与失败恢复的 Codex × GPT 协作桥。
+</p>
+
+<p align="center">
+  <a href="#为什么需要-codexbridge">为什么</a> ·
+  <a href="#核心能力">核心能力</a> ·
+  <a href="#工作原理">工作原理</a> ·
+  <a href="#安装">安装</a> ·
+  <a href="#使用">使用</a> ·
+  <a href="#故障排查">故障排查</a> ·
+  <a href="#开发与验证">开发</a>
+</p>
+
+<table>
+  <tr>
+    <td width="33%" align="center"><strong>▣ Windows</strong><br /><sub>已完成真实环境验收</sub></td>
+    <td width="33%" align="center"><strong>◇ macOS</strong><br /><sub>源码可运行 · 尚未完整验收</sub></td>
+    <td width="33%" align="center"><strong>⌁ Linux</strong><br /><sub>源码可运行 · 尚未完整验收</sub></td>
+  </tr>
+</table>
+
+> 当前版本：**0.1.95**。这是早期版本，ChatGPT 网页结构变化可能影响自动同步；Bridge 会在版本不匹配时停止领取任务，避免误发。
+
+## 为什么需要 CodexBridge
+
+Codex 擅长读取项目、修改代码、运行命令和验证结果；GPT 更适合长文、策划、视觉判断、图片与 Office 文件生成。问题在于它们通常分处两个会话：上下文要手动复制，附件要反复上传，失败后也难以确认任务究竟有没有发送。
+
+CodexBridge 在本机建立一条明确的协作链路：
+
+- **Codex 优先处理本地工作**：代码、文件、终端、测试、部署。
+- **GPT 处理高成本内容任务**：长文、设计、图片、Office/PDF、复杂附件理解。
+- **Router 自动选择执行者**：也支持用户明确指定“交给 GPT”或“只让 Codex 做”。
+- **结果回到同一个项目**：文字、图片和文件都带有任务、项目和会话归属。
+- **失败可恢复**：支持只重新收取结果、补收缺失附件，不必重复生成或重新发送。
+
+## 核心能力
+
+| 能力 | 说明 |
+|---|---|
+| 项目级绑定 | 每个 Bridge 项目绑定自己的 GPT 会话、Codex 任务和本地目录 |
+| 自动路由 | 区分 Codex-only、GPT-only、GPT → Codex 多阶段任务 |
+| 文件双向传递 | 支持文本、图片、PDF、DOCX、XLSX、PPTX、ZIP 等常见文件 |
+| 真实产物验证 | 只有捕获到真实文件后才将文件任务视为成功 |
+| 多附件与补收 | 多文件逐个收取；遗漏时只补收缺失文件，不重发原任务 |
+| 稳定回复定位 | 使用稳定消息标识，不依赖相同文案或易变化的数组位置 |
+| 断线恢复 | 本地服务短暂重启后，可继续等待原 GPT 任务 |
+| 本地持久化 | 项目、消息、任务和产物保存在用户自己的数据目录 |
+| 安全边界 | 仅控制绑定的 GPT 页面；版本、项目和线程不匹配时失败关闭 |
+
+## 工作原理
+
+```mermaid
+flowchart LR
+    U[用户] --> C[Codex]
+    C --> R{Bridge Router}
+    R -->|代码 / 本地执行| C
+    R -->|内容 / 图片 / Office| Q[本地任务队列]
+    Q --> E[Chrome 扩展]
+    E --> G[绑定的 GPT 会话]
+    G --> E
+    E --> A[本地产物库]
+    A --> C
 ```
 
-当前版本已经不再显示任务板。它只保留一个用户面对的聊天窗口：
+CodexBridge 由四部分组成：
 
-- 顶部：绑定真实 ChatGPT Project URL 和本地项目目录。
-- 中间：聊天记录，包括 ChatGPT 回复、Codex 收件箱状态、Codex 执行结果。
-- 底部：输入任务并发送。
+1. **本地服务**：默认监听 `127.0.0.1:4317`，保存项目、消息、任务和文件。
+2. **Chrome 扩展**：只在绑定的 `chatgpt.com` 会话中发送任务、等待回复并收取产物。
+3. **MCP 服务**：让当前 Codex 任务调用 Bridge，并强制携带项目、GPT 会话和 Codex 线程作用域。
+4. **Bridge 工作台**：查看三方消息、连接状态、产物和恢复操作。
 
-后台会保存 ChatGPT 同步 payload、Codex 收件箱项、执行结果和可选回传任务，但这些不再作为任务板暴露给用户。
+所有组件都在本机运行。CodexBridge 不要求导出 ChatGPT Cookie，也不会把本地项目上传到第三方 Bridge 服务器。
 
-## 启动
+## 安装
+
+### 环境要求
+
+- Windows 10/11（当前完整验收平台）
+- [Node.js](https://nodejs.org/) 20 或更新版本
+- Codex 桌面版或 Codex CLI
+- Chrome / Edge Chromium 浏览器
+- 已登录的 ChatGPT 网页会话
+
+### 方式一：下载用户包（推荐）
+
+1. 打开 [Releases](https://github.com/wangzhezbz/chatgpt-codex-bridge/releases/latest)，下载 `CodexBridge-User-Package-v0.1.95-*.zip`。
+2. 解压到固定目录，例如 `D:\Apps\CodexBridge`。更新时不要把数据目录放进安装目录。
+3. 先阅读包内的 `INSTALL-CodexBridge.md`；发布前验收依据见 `ACCEPTANCE-CHECKLIST.md` 和 `REAL-BROWSER-ACCEPTANCE.md`。
+4. 双击 `Start-CodexBridge.cmd`。首次运行会安装依赖，完成后访问：
+
+   ```text
+   http://127.0.0.1:4317/
+   ```
+
+### 方式二：从源码安装
 
 ```powershell
-$env:BRIDGE_RUNNER="codex"
+git clone https://github.com/wangzhezbz/chatgpt-codex-bridge.git
+cd chatgpt-codex-bridge
+npm install
 npm start
 ```
 
-打开：
+源码安装适合开发者。普通用户优先使用 Release 用户包。
 
-```text
-http://127.0.0.1:4317
-```
+### 加载 Chrome 扩展
 
-当前绑定 ChatGPT Project 后不会让网页桥自动运行 Codex；`BRIDGE_RUNNER` 只影响未绑定 Project 时的本地 fallback 和旧任务接口。
+1. 打开 `chrome://extensions/`。
+2. 开启“开发者模式”。
+3. 点击“加载已解压的扩展程序”。
+4. 选择安装目录中的 `chrome-extension` 文件夹。
+5. 打开准备绑定的 ChatGPT 会话，并保持该页面存在。
 
-```powershell
-$env:BRIDGE_RUNNER="manual"
-npm start
-```
+扩展卡片应显示 `Codex GPT Bridge 0.1.95`。更新后，在扩展页面点击一次“重新加载”。
 
-## 当前使用流程
+### 配置 Codex MCP
 
-1. 在 `ChatGPT Project` 区域填入真实项目 URL。
-2. 填入本地项目目录，例如 `F:/game_code/project`。
-3. 点击 `保存绑定`。
-4. 在聊天窗口输入你要做的事。
-5. 点击 `发送`。
-6. 如果已绑定 ChatGPT Project，消息会先进入 ChatGPT 同步队列。
-7. Chrome 扩展在真实 ChatGPT Project 页面领取消息、发送给 ChatGPT，并把回复写回本地。
-8. 本地收到 ChatGPT 回复后，创建一条 `Codex 收件箱` 待办，不会自动跑后台子进程。
-9. 当前 Codex 线程通过 MCP 工具或本地 API 领取收件箱项，执行后把结果写回本地。
-10. 需要 ChatGPT 继续分析时，再显式创建回传同步任务。
+用户包内提供 `codex-mcp-config.toml`、`.mcp.json` 和 `Start-CodexBridge-MCP.cmd`。
 
-如果没有绑定 ChatGPT Project，会 fallback 到本地 Codex 直接执行。
+配置模板中的入口写作 `<CodexBridge 安装目录>/src/mcp-server.js`；下面以 `D:/Apps/CodexBridge` 为例。
 
-## Chrome 自动同步扩展
-
-开发环境扩展目录：
-
-```text
-<当前 CodexBridge 项目目录>/chrome-extension
-```
-
-安装方式：
-
-1. 打开 Chrome 的 `chrome://extensions/`。
-2. 开启开发者模式。
-3. 点击 `Load unpacked` / `加载已解压的扩展程序`。
-4. 选择当前 CodexBridge 目录里的 `chrome-extension` 文件夹。
-5. 打开你绑定的 ChatGPT Project 页面，并保持本地服务运行。
-
-扩展会在 `chatgpt.com` 页面后台轮询 `http://127.0.0.1:4317/api/sync/jobs/claim`。有待同步消息时，它会自动填入 ChatGPT 输入框、点击发送、等待回复稳定，再回写到本地。
-
-这一层依赖 ChatGPT 网页结构，属于第一版可验证原型；后续需要继续加选择器兼容和可见连接状态。
-
-## API
-
-- `GET /api/workspace`：读取 ChatGPT Project 绑定。
-- `PATCH /api/workspace`：保存 `chatgptProjectUrl` 和 `targetRepo`。
-- `GET /api/chat/messages`：读取聊天记录。
-- `POST /api/chat/turns`：写入用户消息；有绑定 Project 时创建同步任务，未绑定时 fallback 到 Codex。
-- `POST /api/chat/replies`：兼容旧流程的导入接口，当前 UI 不再使用。
-- `POST /api/sync/jobs/claim`：Chrome 扩展领取待同步任务。
-- `POST /api/sync/jobs/:id/complete`：Chrome 扩展回写 ChatGPT 回复；如果是用户请求，会创建 Codex 收件箱项。
-- `POST /api/sync/jobs/:id/fail`：Chrome 扩展回写同步失败。
-- `GET /api/codex-inbox`：读取 Codex 收件箱项。
-- `POST /api/codex-inbox/next`：当前 Codex 侧领取下一条待执行指令。
-- `POST /api/codex-inbox/:id/complete`：当前 Codex 侧写回执行结果；传 `syncToChatGpt: true` 时才创建回传同步任务。
-- `POST /api/codex-inbox/:id/fail`：当前 Codex 侧写回执行失败。
-- `GET /api/tasks`：读取 Codex 任务队列。
-- `POST /api/tasks/:id/run`：运行一个 Codex 任务。
-
-## MCP 服务
-
-启动 stdio MCP 服务：
-
-```powershell
-npm run mcp
-```
-
-本地 MCP 配置示例：
+把下面配置加入 Codex 的 `~/.codex/config.toml`，并把路径替换为你的实际安装目录：
 
 ```toml
-[mcp_servers.chatgpt_codex_bridge]
+[mcp_servers.chatgpt-codex-bridge]
 command = "node"
-args = ["<CodexBridge 安装目录>/src/mcp-server.js"]
+args = ["D:/Apps/CodexBridge/src/mcp-server.js"]
+enabled = true
+
+[mcp_servers.chatgpt-codex-bridge.env]
+BRIDGE_DATA_DIR = "D:/CodexBridgeData"
+BRIDGE_STORE = "D:/CodexBridgeData"
+BRIDGE_ROUTER_V2 = "1"
+BRIDGE_GPT_TRANSPORT = "web-sync"
 ```
 
-把 `<CodexBridge 安装目录>` 替换成你实际解压或克隆后的完整路径。
+建议把数据目录放在安装目录之外。这样升级、回滚或卸载程序时，不会删除项目和聊天记录。
 
-当前 MCP 工具：
-
-- `create_task`
-- `list_tasks`
-- `get_task_status`
-- `get_task_result`
-- `request_revision`
-- `list_codex_inbox`
-- `claim_next_codex_inbox_item`
-- `complete_codex_inbox_item`
-- `fail_codex_inbox_item`
-
-## 数据位置
-
-运行数据保存在：
-
-```text
-.bridge/
-  workspace.json
-  chat/messages.ndjson
-  sync/jobs/<sync_job_id>.json
-  codex-inbox/items/<inbox_item_id>.json
-  tasks/<task_id>/
-    task.json
-    PROMPT.md
-    RESULT.md
-    events.ndjson
-```
-
-## 验证
+保存后，在 Codex 的插件/MCP 设置中关闭再开启 `chatgpt-codex-bridge`。可用以下命令核对有效配置：
 
 ```powershell
+codex mcp get chatgpt-codex-bridge --json
+```
+
+### 建立第一个绑定
+
+1. 在 Codex 中打开你的本地项目。
+2. 打开 Bridge 工作台 `http://127.0.0.1:4317/`。
+3. 填写项目名称、目标 ChatGPT 会话链接和本地项目目录。
+4. 点击“绑定当前会话并进入”。
+5. 确认顶部状态为：**GPT 已绑定 / 连接就绪 / 规则已写入**。
+
+## 使用
+
+### 普通对话
+
+直接在 Bridge 输入框发消息。Bridge 会根据内容选择 Codex 或 GPT，并在右侧显示真实执行状态。
+
+### 让 GPT 分析本地文件
+
+```text
+把这个 PDF 交给 GPT 分析，列出关键问题。
+```
+
+Bridge 会上传本次指定文件，等待绑定的 GPT 会话返回，再把结果交回当前 Codex 任务。
+
+### 让 GPT 生成文件
+
+```text
+让 GPT 根据这份数据生成一个 Excel，并保存到当前项目。
+```
+
+Bridge 只把实际捕获到的文件算作成功。如果 GPT 只写了文件名但没有真实下载，任务会显示失败而不是伪成功。
+
+### 多阶段任务
+
+```text
+先让 GPT 设计三集小说大纲，再写第一章，最后生成海报；每次只推进一个阶段。
+```
+
+Router 会保留同一个运行记录，按依赖逐步提交。不会一次把所有阶段塞进同一条 GPT 请求。
+
+### 明确指定执行者
+
+```text
+不要交给 GPT，这个修改由 Codex 本地完成。
+```
+
+```text
+把这份文案交给 GPT 重写，不修改本地代码。
+```
+
+### 失败恢复
+
+- **重新收取结果**：GPT 已经完成，只重新检查原回复，不重新发送。
+- **补收缺失附件**：保留已收文件，只下载遗漏文件。
+- **重新发送**：仅用于系统确认原请求没有真正发送的情况。
+- **停止**：停止当前 Bridge 任务；后续恢复不会自动重发已取消流程。
+
+## 数据、隐私与安全
+
+- 默认数据目录由 `BRIDGE_DATA_DIR` / `BRIDGE_STORE` 决定。
+- 项目、GPT 会话、Codex 线程三重作用域不匹配时，请求会被拒绝。
+- 扩展只领取与当前绑定 GPT 页面匹配的任务。
+- 用户上传文件和 GPT 生成文件使用不同的捕获范围，避免把输入附件当成输出。
+- 状态文件采用带锁原子写入和备份，避免进程重启时写坏项目列表。
+- 不要公开 `/api/config` 返回的 `apiToken`，不要把包含真实数据目录或凭据的本机配置提交到仓库。
+
+## 更新、回滚与卸载
+
+### 更新
+
+1. 备份现有安装目录；数据目录保持不动。
+2. 下载并解压新版本到新目录。
+3. 修改 MCP 配置中的脚本路径。
+4. 在 Chrome 扩展页重新加载新目录的 `chrome-extension`。
+5. 重载 MCP，确认 Bridge、扩展和 MCP 版本一致。
+
+### 回滚
+
+把 MCP 和 Chrome 扩展路径切回旧安装目录，继续使用同一个外部数据目录。不要用旧版本覆盖或删除数据目录。
+
+### 卸载
+
+1. 停止 Bridge 本地服务。
+2. 在 Chrome 扩展页移除 Codex GPT Bridge。
+3. 从 Codex 配置中移除 `mcp_servers.chatgpt-codex-bridge`。
+4. 删除程序安装目录。
+5. 仅在确定不再需要项目、聊天和产物时，单独处理数据目录。
+
+## 故障排查
+
+| 现象 | 处理方式 |
+|---|---|
+| 页面打不开 | 确认本地服务正在运行，端口 `4317` 未被其他程序占用 |
+| 一直“等待扩展” | 确认扩展已启用，绑定的 ChatGPT 页面已打开，扩展版本与 HTTP 版本一致 |
+| 刷新后回到项目列表 | 从项目列表重新进入；项目数据不会因此删除 |
+| GPT 已完成但 Bridge 没结果 | 先使用“重新收取结果”，不要直接重新生成 |
+| 只收到部分文件 | 使用“补收缺失附件”；已收文件和原任务记录会保留 |
+| MCP 找不到项目 | 对比 HTTP 与 MCP 的 `dataRootId`、协议版本和当前项目作用域 |
+| 显示版本不匹配 | 更新并重载本地服务、Chrome 扩展和 MCP，三端必须来自同一版本 |
+| GPT 网页提示错误 | 先确认该 GPT 会话本身可正常使用，再刷新绑定页面 |
+
+## 开发与验证
+
+```powershell
+npm install
 npm test
-```
-
-## 生成用户安装包
-
-开发者可以生成一个普通用户可解压使用的便携包：
-
-```powershell
-npm run package:user
-```
-
-默认输出到 `release/CodexBridge-User-Package-v<version>-<time>/`。包内包含：
-
-- `Start-CodexBridge.cmd`：启动本地服务，首次运行会安装依赖。
-- `Start-CodexBridge-MCP.cmd`：启动 MCP 服务。
-- `INSTALL-CodexBridge.md`：给普通用户看的安装说明。
-- `PRODUCT-READINESS-20-STEPS.md`：逐条对照 20 步产品目标和验收证据。
-- `REAL-BROWSER-ACCEPTANCE.md`：真实 Chrome + ChatGPT 页面体验记录表。
-- `codex-mcp-config.toml`：可复制到 Codex MCP 配置里的示例。
-- `chrome-extension/`：需要在 Chrome 扩展页加载的 Bridge 扩展。
-- `.codex-plugin/plugin.json` 和 `.mcp.json`：Codex 插件与 MCP 元数据。
-
-这个包不会携带 `.bridge/` 运行数据、`node_modules/`、`.git/` 或本地输出目录，避免把用户历史、登录状态或测试垃圾一起打进去。
-
-生成后可以跑一遍产品冒烟，模拟普通用户从包目录启动服务并检查关键入口：
-
-```powershell
-npm run smoke:product -- release/CodexBridge-User-Package-v<version>-<time>
-```
-
-冒烟会检查安装说明、标准验收清单、20 步产品就绪报告、真实浏览器体验记录表、Chrome 扩展、MCP 配置、本地服务、首页、验收报告接口和当前状态版真实体验记录接口。它还会在包目录生成一组小型本机测试文件，自动验证 `txt`、`json`、`xlsx`、`pptx`、`docx`、`pdf`、`zip`、`png` 的导入、预览、给 GPT 上传用 raw 链路和用户下载链路，并模拟一次 GPT 同步返回 3 张图片，确认多图能进入 artifact 列表、房间消息和标准验收。默认用 `4318` 端口，不影响当前开发服务。通过后会在包目录写入 `PRODUCT-SMOKE-RESULT.md`，记录自动检查结果和后续需要人工真实浏览器复查的项目。
-
-包内还会包含 `ACCEPTANCE-CHECKLIST.md`，用于从零安装后人工复查真实产品链路：发图片、发 zip、发 docx、生成 xlsx、文件没捕获、生成多图、GPT 卡住、扩展重载、旧任务重试，以及 `png`、`jpg`、`pdf`、`docx`、`xlsx`、`pptx`、`zip`、`txt`、`md`、`json` 的格式展示。`REAL-BROWSER-ACCEPTANCE.md` 用来记录真实 Chrome + ChatGPT 体验结果和半成品问题；运行服务时也可以打开 `/api/acceptance/real-browser-record` 导出一份按当前房间状态预填的 Markdown 记录。`PRODUCT-READINESS-20-STEPS.md` 则用来确认这 20 步目标每一项都有对应的自动或人工验收依据。
-
-开发时可以先跑验收合同，确认隐藏验收台和标准用例没有漂移：
-
-```powershell
 npm run acceptance:contract
+npm run smoke:product -- <用户包目录>
+npm run package:user
+npm run package:embedded
 ```
 
-## CodexBridge delegation bootstrap
-
-每个项目第一次绑定或第一次通过 MCP/本地 API 使用 Bridge 时，会自动在目标项目根目录写入两份说明：
-
-- `BRIDGE.md`：面向产品和用户的分工规则。
-- `AGENTS.md`：面向当前 Codex 线程的执行规则。
-
-`AGENTS.md` 会被追加一个 `CODEXBRIDGE CODEX DELEGATION` 标记块，不会覆盖项目里已有的说明。这个块会要求 Codex 在以下场景优先调用 `delegate_current_request`：
-
-- 用户把图片、截图、附件、PDF、Word、PPT、Excel、PSD 等文件直接发给 Codex。
-- 用户要做图片生成、视觉方案、文案、长文、调研、头脑风暴、Office 文件或压缩包生成。
-- 用户的问题明显适合先由 GPT 分析、设计或生成，再由 Codex 使用结果落地。
-
-默认规则是：除非用户明确说“让 Codex 做”“不要交给 GPT”“你直接处理”“本地执行”，否则上面这些高成本分析/生成任务先交给 GPT。Codex 拿到 GPT 的 `replyText`、文件或图片后，只消费结果，不重复分析一遍。
-
-MCP 推荐入口：
+当前完整回归包含路由、项目隔离、锁、原子存储、扩展心跳、文件上传/下载、多附件、补收、取消和恢复测试。
 
 ```text
-delegate_current_request
+chrome-extension/   ChatGPT 网页同步扩展
+public/             Bridge 工作台
+src/                HTTP、MCP、Router 与持久化
+scripts/            打包和产品冒烟
+tests/              自动化回归
 ```
 
-常见调用形态：
+## 路线图
 
-```json
-{
-  "text": "请分析这张图片是什么，并用中文回答。",
-  "localPath": "C:/path/to/image.png",
-  "contentType": "image/png",
-  "waitForGpt": true
-}
-```
+- [x] 项目 / GPT 会话 / Codex 线程隔离
+- [x] 自动路由与多阶段 Router
+- [x] 图片、Office、PDF、ZIP 和文本产物
+- [x] 多附件、缺失附件补收与短暂断线恢复
+- [x] 便携用户包、升级、回滚和卸载验收
+- [ ] macOS / Linux 完整验收
+- [ ] Chrome Web Store 或签名安装器
+- [ ] 更稳定的官方 ChatGPT 集成接口（如未来开放）
 
-如果返回 `action: "codex_only"`，当前 Codex 线程直接执行本地任务；如果返回 `gpt_only` 或 `gpt_then_codex`，优先使用 GPT 返回的结果继续回复用户或落地到项目。
+## 贡献
+
+欢迎提交 Issue 和 Pull Request。报告网页兼容问题时，请提供 CodexBridge 版本、浏览器版本、ChatGPT 页面语言、Bridge 错误提示，以及任务是否涉及文字、图片或文件。
+
+请勿提交账号 Cookie、API Token、私有项目文件或完整聊天记录。
+
+## License
+
+[MIT](LICENSE) © 2026 CodexBridge contributors

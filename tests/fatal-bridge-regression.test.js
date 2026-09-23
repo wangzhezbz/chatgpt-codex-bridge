@@ -252,7 +252,7 @@ test("sync completion rejects interrupted ChatGPT text as still streaming", asyn
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test"
       })
     });
     const claimed = await claimResponse.json();
@@ -261,6 +261,7 @@ test("sync completion rejects interrupted ChatGPT text as still streaming", asyn
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test",
         replyText: "Connection interrupted. Waiting for the complete reply.",
         thoughtDurationMs: 500
       })
@@ -301,7 +302,7 @@ test("sync completion saves captured image artifacts into the bound project and 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test"
       })
     });
     const claimed = await claimResponse.json();
@@ -310,6 +311,7 @@ test("sync completion saves captured image artifacts into the bound project and 
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test",
         replyText: "ChatGPT is still processing this request. Bridge has not received the final usable reply.",
         artifacts: [
           {
@@ -363,7 +365,7 @@ test("multi-step image batch saves every visible image artifact into the bound p
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test"
       })
     });
     const firstClaim = await firstClaimResponse.json();
@@ -372,6 +374,7 @@ test("multi-step image batch saves every visible image artifact into the bound p
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test",
         replyText: "Generated the first image.",
         artifacts: [
           {
@@ -390,7 +393,7 @@ test("multi-step image batch saves every visible image artifact into the bound p
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectUrl: "https://chatgpt.com/c/demo",
-        workerId: "codex-chatgpt-project-extension-v20260712-preference-verify:test"
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test"
       })
     });
     const secondClaim = await secondClaimResponse.json();
@@ -399,6 +402,7 @@ test("multi-step image batch saves every visible image artifact into the bound p
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        workerId: "codex-chatgpt-project-extension-v20260923-missing-recovery:test",
         replyText: "Generated the second image.",
         artifacts: [
           {

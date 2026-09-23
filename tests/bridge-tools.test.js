@@ -9,12 +9,24 @@ import { saveArtifactFromBase64 } from "../src/artifact-store.js";
 import { updateWorkspaceBinding } from "../src/conversation-store.js";
 import { createGptTransportRegistry } from "../src/gpt-transports/transport-registry.js";
 import { createMockGptTransport } from "../src/gpt-transports/mock-transport.js";
-import { createProject, selectProject } from "../src/project-store.js";
+import { createProject, selectProject, updateProject } from "../src/project-store.js";
 import { appendRoomMessage, createCodexTask } from "../src/room-store.js";
 import { completeSyncJob, createSyncJob, listSyncJobs } from "../src/sync-store.js";
 
 async function tempStore() {
   return mkdtemp(path.join(tmpdir(), "bridge-tools-"));
+}
+
+async function waitForValue(check, label, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await check();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`${label} was not observed within ${timeoutMs}ms`);
 }
 
 test("bridge tools create, list, and read task results", async () => {
@@ -169,6 +181,27 @@ test("bridge tools default room claims to the configured current Codex thread", 
   assert.equal(claimed.currentThreadId, "thread-current");
 });
 
+test("bridge tools inherit the current Codex thread from CODEX_THREAD_ID", async () => {
+  const storeRoot = await tempStore();
+  const targetRepo = await tempStore();
+  const tools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    env: {
+      CODEX_THREAD_ID: "thread-from-codex-window"
+    }
+  });
+
+  const bound = await tools.bindCurrentCodexSession({
+    name: "Current Codex window",
+    chatgptProjectUrl: "https://chatgpt.com/c/current-window",
+    targetRepo
+  });
+
+  assert.equal(bound.project.currentCodexThreadId, "thread-from-codex-window");
+  assert.equal(bound.workspace.currentCodexThreadId, "thread-from-codex-window");
+});
+
 test("bridge tools let the current Codex thread ask the bound ChatGPT project", async () => {
   const storeRoot = await tempStore();
   await updateWorkspaceBinding(storeRoot, {
@@ -196,6 +229,118 @@ test("bridge tools let the current Codex thread ask the bound ChatGPT project", 
   assert.equal(answer.job.status, "pending");
 });
 
+test("bridge direct text and artifact metadata cannot override the authoritative workspace", async () => {
+  const storeRoot = await tempStore();
+  const targetRepo = await tempStore();
+  const sourcePath = path.join(targetRepo, "scope-authority.txt");
+  await writeFile(sourcePath, "scope authority", "utf8");
+  const project = await createProject(storeRoot, {
+    name: "Bridge metadata authority",
+    chatgptProjectUrl: "https://chatgpt.com/c/bridge-metadata-authority",
+    targetRepo,
+    conversationId: "bridge-metadata-authority-conversation",
+    currentCodexThreadId: "bridge-metadata-authority-thread"
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    currentCodexThreadId: "bridge-metadata-authority-thread"
+  });
+
+  await assert.rejects(
+    () => tools.askChatGptProject({
+      projectId: project.id,
+      conversationId: project.conversationId,
+      text: "reject a conflicting target",
+      metadata: { targetRepo: path.join(targetRepo, "other") }
+    }),
+    /scope mismatch.*targetRepo/i
+  );
+  await assert.rejects(
+    () => tools.sendLocalFileToChatGptProject({
+      projectId: project.id,
+      conversationId: project.conversationId,
+      localPath: sourcePath,
+      metadata: { chatgptProjectUrl: "https://chatgpt.com/c/another-conversation" }
+    }),
+    /scope mismatch.*chatgptProjectUrl/i
+  );
+
+  const equivalentMetadata = {
+    projectId: project.id,
+    conversationId: project.conversationId,
+    currentCodexThreadId: "bridge-metadata-authority-thread",
+    targetRepo: `${targetRepo}${path.sep}.`,
+    chatgptProjectUrl: `${project.chatgptProjectUrl}/?ignored=1#ignored`
+  };
+  const textResult = await tools.askChatGptProject({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "accept normalized equivalent metadata",
+    metadata: equivalentMetadata
+  });
+  const fileResult = await tools.sendLocalFileToChatGptProject({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    localPath: sourcePath,
+    metadata: equivalentMetadata
+  });
+  for (const message of [textResult.message, fileResult.message]) {
+    assert.equal(message.metadata.projectId, project.id);
+    assert.equal(message.metadata.conversationId, project.conversationId);
+    assert.equal(message.metadata.currentCodexThreadId, "bridge-metadata-authority-thread");
+    assert.equal(message.metadata.targetRepo, project.targetRepo);
+    assert.equal(message.metadata.chatgptProjectUrl, project.chatgptProjectUrl);
+  }
+
+  const caseSensitiveTools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    currentCodexThreadId: "bridge-metadata-authority-thread",
+    platform: "linux"
+  });
+  await assert.rejects(
+    () => caseSensitiveTools.askChatGptProject({
+      projectId: project.id,
+      conversationId: project.conversationId,
+      text: "preserve non-Windows path case",
+      metadata: { targetRepo: project.targetRepo.toUpperCase() }
+    }),
+    /scope mismatch.*targetRepo/i
+  );
+});
+
+test("bridge tools reject text request id reuse after the project directory changes", async () => {
+  const storeRoot = await tempStore();
+  const firstTargetRepo = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Text request target guard",
+    chatgptProjectUrl: "https://chatgpt.com/c/text-target-guard",
+    targetRepo: firstTargetRepo,
+    conversationId: "text-target-guard-conversation",
+    currentCodexThreadId: "thread-current"
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    currentCodexThreadId: "thread-current"
+  });
+  const input = {
+    requestId: "sync_text_target_guard",
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "Keep this text request scoped to one target directory."
+  };
+
+  await tools.askChatGptProject(input);
+  await updateProject(storeRoot, project.id, { targetRepo: await tempStore() });
+
+  await assert.rejects(
+    () => tools.askChatGptProject(input),
+    /different payload/i
+  );
+});
+
 test("bridge tools delegate Codex-only work without creating a GPT sync job", async () => {
   const storeRoot = await tempStore();
   await updateWorkspaceBinding(storeRoot, {
@@ -203,7 +348,11 @@ test("bridge tools delegate Codex-only work without creating a GPT sync job", as
     targetRepo: "F:/game_code/demo",
     conversationId: "room-1"
   });
-  const tools = createBridgeTools({ storeRoot, runnerMode: "manual" });
+  const tools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    routerV2Enabled: false
+  });
 
   const delegated = await tools.delegateCurrentRequest({
     text: "Please run npm test locally and do not send this to GPT."
@@ -254,7 +403,7 @@ test("bridge tools refuse GPT delegation without an explicit project or conversa
   assert.equal(delegated.scopeRequired, true);
   assert.equal(delegated.message, null);
   assert.equal(delegated.syncJob, null);
-  assert.match(delegated.error, /conversationId or projectId/);
+  assert.match(delegated.error, /both projectId and conversationId/);
   assert.equal((await listSyncJobs(storeRoot)).length, 0);
 });
 
@@ -279,7 +428,8 @@ test("bridge tools route explicit conversation scope instead of the active works
   const tools = createBridgeTools({
     storeRoot,
     runnerMode: "manual",
-    currentCodexThreadId: "thread-current"
+    currentCodexThreadId: "thread-current",
+    routerV2Enabled: false
   });
 
   const delegated = await tools.delegateCurrentRequest({
@@ -312,7 +462,8 @@ test("bridge tools reject an explicit conversation bound to another Codex thread
   const tools = createBridgeTools({
     storeRoot,
     runnerMode: "manual",
-    currentCodexThreadId: "thread-current"
+    currentCodexThreadId: "thread-current",
+    routerV2Enabled: false
   });
 
   await assert.rejects(
@@ -335,7 +486,11 @@ test("bridge tools delegate text work to GPT and can wait for the result", async
     targetRepo: "F:/game_code/demo",
     conversationId: "room-1"
   });
-  const tools = createBridgeTools({ storeRoot, runnerMode: "manual" });
+  const tools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    routerV2Enabled: false
+  });
 
   const pending = tools.delegateCurrentRequest({
     text: "Please analyze this screenshot and explain what it is.",
@@ -345,15 +500,10 @@ test("bridge tools delegate text work to GPT and can wait for the result", async
     pollMs: 10
   });
 
-  let job;
-  for (let index = 0; index < 20 && !job; index += 1) {
+  const job = await waitForValue(async () => {
     const jobs = await listSyncJobs(storeRoot);
-    job = jobs.find((candidate) => candidate.kind === "chat_message");
-    if (!job) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  assert.ok(job);
+    return jobs.find((candidate) => candidate.kind === "chat_message");
+  }, "delegated text sync job");
   await completeSyncJob(storeRoot, job.id, {
     replyText: "GPT result: this is a desktop shortcut icon."
   });
@@ -376,7 +526,11 @@ test("bridge tools wait for GPT-routed text work by default", async () => {
     targetRepo: "F:/game_code/demo",
     conversationId: "room-1"
   });
-  const tools = createBridgeTools({ storeRoot, runnerMode: "manual" });
+  const tools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    routerV2Enabled: false
+  });
 
   const pending = tools.delegateCurrentRequest({
     text: "请帮我写一个长篇小说大纲。",
@@ -384,15 +538,10 @@ test("bridge tools wait for GPT-routed text work by default", async () => {
     pollMs: 10
   });
 
-  let job;
-  for (let index = 0; index < 20 && !job; index += 1) {
+  const job = await waitForValue(async () => {
     const jobs = await listSyncJobs(storeRoot);
-    job = jobs.find((candidate) => candidate.kind === "chat_message");
-    if (!job) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  assert.ok(job);
+    return jobs.find((candidate) => candidate.kind === "chat_message");
+  }, "default delegated text sync job");
   await completeSyncJob(storeRoot, job.id, {
     replyText: "GPT result: novel outline."
   });
@@ -412,7 +561,11 @@ test("bridge tools send only the first stage for multi-step creative delegation"
     targetRepo: projectRoot,
     conversationId: "room-1"
   });
-  const tools = createBridgeTools({ storeRoot, runnerMode: "manual" });
+  const tools = createBridgeTools({
+    storeRoot,
+    runnerMode: "manual",
+    routerV2Enabled: false
+  });
 
   const delegated = await tools.delegateCurrentRequest({
     text: "我要写一篇玄幻穿越小说，你来协助我。先帮我设计前十集的大纲，再帮我写第一章内容，最后帮我生成一张小说海报。",
@@ -446,7 +599,8 @@ test("bridge tools delegate local files from Codex to GPT without waiting when r
   const tools = createBridgeTools({
     storeRoot,
     runnerMode: "manual",
-    currentCodexThreadId: "thread-current"
+    currentCodexThreadId: "thread-current",
+    routerV2Enabled: false
   });
 
   const delegated = await tools.delegateCurrentRequest({
@@ -490,7 +644,8 @@ test("bridge tools wait for GPT by default when delegating Codex-attached local 
   const tools = createBridgeTools({
     storeRoot,
     runnerMode: "manual",
-    currentCodexThreadId: "thread-current"
+    currentCodexThreadId: "thread-current",
+    routerV2Enabled: false
   });
 
   const pending = tools.delegateCurrentRequest({
@@ -501,15 +656,10 @@ test("bridge tools wait for GPT by default when delegating Codex-attached local 
     pollMs: 10
   });
 
-  let job;
-  for (let index = 0; index < 20 && !job; index += 1) {
+  const job = await waitForValue(async () => {
     const jobs = await listSyncJobs(storeRoot);
-    job = jobs.find((candidate) => candidate.kind === "codex_file_analysis");
-    if (!job) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  assert.ok(job);
+    return jobs.find((candidate) => candidate.kind === "codex_file_analysis");
+  }, "local file analysis sync job");
   await completeSyncJob(storeRoot, job.id, {
     replyText: "GPT 结果：这是 Godot v4 的桌面快捷方式。"
   });
@@ -588,15 +738,10 @@ test("bridge tools can send a local file and wait for the ChatGPT result in one 
     pollMs: 10
   });
 
-  let job;
-  for (let index = 0; index < 20 && !job; index += 1) {
+  const job = await waitForValue(async () => {
     const jobs = await listSyncJobs(storeRoot);
-    job = jobs.find((candidate) => candidate.kind === "codex_file_analysis");
-    if (!job) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  assert.ok(job);
+    return jobs.find((candidate) => candidate.kind === "codex_file_analysis");
+  }, "one-call local file analysis sync job");
   await completeSyncJob(storeRoot, job.id, {
     replyText: "GPT 识别结果：这是剪映专业版快捷方式。"
   });
@@ -634,15 +779,10 @@ test("bridge tools reuse a successful GPT file analysis for the same local file"
     pollMs: 10
   });
 
-  let firstJob;
-  for (let index = 0; index < 20 && !firstJob; index += 1) {
+  const firstJob = await waitForValue(async () => {
     const jobs = await listSyncJobs(storeRoot);
-    firstJob = jobs.find((candidate) => candidate.kind === "codex_file_analysis");
-    if (!firstJob) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  assert.ok(firstJob);
+    return jobs.find((candidate) => candidate.kind === "codex_file_analysis");
+  }, "reusable local file analysis sync job");
   await completeSyncJob(storeRoot, firstJob.id, {
     replyText: "GPT 缓存结果：这是同一张图片。"
   });
@@ -679,7 +819,8 @@ test("bridge tools fail a default delegated file wait when ChatGPT never returns
   const tools = createBridgeTools({
     storeRoot,
     runnerMode: "manual",
-    currentCodexThreadId: "thread-current"
+    currentCodexThreadId: "thread-current",
+    routerV2Enabled: false
   });
 
   const delegated = await tools.delegateCurrentRequest({
@@ -799,6 +940,268 @@ test("bridge tools keep the complete legacy delegation path when Router V2 is di
   assert.equal((await listSyncJobs(storeRoot)).length, 1);
 });
 
+test("bridge tools enable semantic routing from the environment without a second model request", async () => {
+  const storeRoot = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Environment semantic project",
+    chatgptProjectUrl: "https://chatgpt.com/c/semantic-routing",
+    targetRepo: await tempStore(),
+    conversationId: "semantic-routing",
+    currentCodexThreadId: "semantic-routing-thread"
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "semantic-routing-thread",
+    env: {
+      BRIDGE_DATA_DIR: storeRoot,
+      BRIDGE_SEMANTIC_ROUTER: "1",
+      BRIDGE_SEMANTIC_ROUTER_MIN_CONFIDENCE: "0.7"
+    }
+  });
+
+  const delegated = await tools.delegateCurrentRequest({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "Analyze this code for concurrency bugs",
+    waitForGpt: false,
+    routingProposal: {
+      version: "1",
+      routeKind: "codex_only",
+      confidence: 0.93,
+      reason: "Requires local code inspection"
+    }
+  });
+
+  assert.equal(delegated.action, "codex_only");
+  assert.equal(delegated.route.decisionSource, "semantic_proposal");
+  assert.equal(delegated.route.confidence, 0.93);
+  assert.equal((await listSyncJobs(storeRoot)).length, 0);
+});
+
+test("bridge tools enable semantic routing by default for an exactly scoped bound project", async () => {
+  const storeRoot = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Default semantic project",
+    chatgptProjectUrl: "https://chatgpt.com/c/default-semantic",
+    targetRepo: await tempStore(),
+    conversationId: "default-semantic-conversation",
+    currentCodexThreadId: "default-semantic-thread"
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "default-semantic-thread"
+  });
+
+  const delegated = await tools.delegateCurrentRequest({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "Analyze this code for concurrency bugs",
+    waitForGpt: false,
+    routingProposal: {
+      version: "1",
+      routeKind: "codex_only",
+      confidence: 0.94,
+      reason: "Requires local code inspection"
+    }
+  });
+
+  assert.equal(delegated.action, "codex_only");
+  assert.equal(delegated.route.decisionSource, "semantic_proposal");
+  assert.equal((await listSyncJobs(storeRoot)).length, 0);
+});
+
+test("bridge tools reject semantic proposals without the exact bound project scope", async () => {
+  const storeRoot = await tempStore();
+  const first = await createProject(storeRoot, {
+    name: "Semantic scope owner",
+    chatgptProjectUrl: "https://chatgpt.com/c/semantic-scope-owner",
+    targetRepo: await tempStore(),
+    conversationId: "semantic-scope-owner",
+    currentCodexThreadId: "semantic-scope-thread"
+  });
+  const second = await createProject(storeRoot, {
+    name: "Other semantic project",
+    chatgptProjectUrl: "https://chatgpt.com/c/semantic-scope-other",
+    targetRepo: await tempStore(),
+    conversationId: "semantic-scope-other",
+    currentCodexThreadId: "semantic-scope-thread"
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "semantic-scope-thread"
+  });
+  const routingProposal = {
+    version: "1",
+    routeKind: "gpt_only",
+    confidence: 0.95,
+    reason: "Creative generation"
+  };
+
+  await assert.rejects(
+    () =>
+      tools.delegateCurrentRequest({
+        projectId: first.id,
+        text: "写一篇发布文案",
+        waitForGpt: false,
+        routingProposal
+      }),
+    /Semantic Router requires both projectId and conversationId/
+  );
+  await assert.rejects(
+    () =>
+      tools.delegateCurrentRequest({
+        projectId: first.id,
+        conversationId: second.conversationId,
+        text: "写一篇发布文案",
+        waitForGpt: false,
+        routingProposal
+      }),
+    /Router V2 scope mismatch/
+  );
+  assert.equal((await listSyncJobs(storeRoot)).length, 0);
+});
+
+test("bridge tools allow an explicit semantic router opt-out", async () => {
+  const storeRoot = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Semantic opt-out project",
+    chatgptProjectUrl: "https://chatgpt.com/c/semantic-opt-out",
+    targetRepo: await tempStore(),
+    conversationId: "semantic-opt-out",
+    currentCodexThreadId: "semantic-opt-out-thread"
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "semantic-opt-out-thread",
+    semanticRouterEnabled: false
+  });
+
+  const delegated = await tools.delegateCurrentRequest({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "写一篇产品发布文案",
+    waitForGpt: false,
+    routingProposal: {
+      version: "1",
+      routeKind: "codex_only",
+      confidence: 0.99
+    }
+  });
+
+  assert.equal(delegated.action, "gpt_only");
+  assert.equal(delegated.route.decisionSource, undefined);
+  assert.equal((await listSyncJobs(storeRoot)).length, 1);
+});
+
+test("bridge tools persist model-proposed GPT stages in Router V2", async () => {
+  const storeRoot = await tempStore();
+  const projectRoot = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Semantic Router project",
+    chatgptProjectUrl: "https://chatgpt.com/c/semantic-router-v2",
+    targetRepo: projectRoot,
+    conversationId: "semantic-router-v2",
+    currentCodexThreadId: "semantic-router-thread"
+  });
+  const mock = createMockGptTransport();
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "semantic-router-thread",
+    routerV2Enabled: true,
+    semanticRouterEnabled: true,
+    gptTransportRegistry: createGptTransportRegistry({
+      transports: [mock],
+      defaultTransportId: "mock",
+      env: {}
+    }),
+    gptTransportId: "mock"
+  });
+
+  const delegated = await tools.delegateCurrentRequest({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "先设计故事大纲，再写第一章",
+    waitForGpt: false,
+    routingProposal: {
+      version: "1",
+      routeKind: "gpt_only",
+      confidence: 0.98,
+      stages: [
+        {
+          id: "outline",
+          title: "设计故事大纲",
+          actor: "gpt",
+          payloadText: "只设计故事大纲。"
+        },
+        {
+          id: "chapter",
+          title: "写第一章",
+          actor: "gpt",
+          dependsOn: "outline",
+          instruction: "使用大纲结果写第一章。"
+        }
+      ]
+    }
+  });
+
+  assert.equal(delegated.route.decisionSource, "semantic_proposal");
+  assert.deepEqual(
+    delegated.routerRun.stages.map((stage) => stage.id),
+    ["outline", "chapter"]
+  );
+  assert.equal(delegated.routerRun.stages[0].status, "queued");
+  assert.equal(delegated.routerRun.stages[1].status, "pending");
+  assert.equal(mock.submissions.length, 1);
+  assert.equal(mock.submissions[0].payload.payloadText, "只设计故事大纲。");
+});
+
+test("bridge tools enable Router V2 by default for an exactly scoped project", async () => {
+  const storeRoot = await tempStore();
+  const projectRoot = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Router default-on project",
+    chatgptProjectUrl: "https://chatgpt.com/c/router-default-on",
+    targetRepo: projectRoot,
+    conversationId: "router-default-on-conversation",
+    currentCodexThreadId: "thread-default-on"
+  });
+  const mock = createMockGptTransport({
+    responses: { gpt: { replyText: "Default Router reply" } }
+  });
+  const registry = createGptTransportRegistry({
+    transports: [mock],
+    defaultTransportId: "mock",
+    env: {}
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "thread-default-on",
+    gptTransportRegistry: registry,
+    gptTransportId: "mock",
+    env: {}
+  });
+
+  const delegated = await tools.delegateCurrentRequest({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "请给当前项目整理一份创作大纲。",
+    routingProposal: {
+      version: "1",
+      routeKind: "gpt_only",
+      confidence: 0.99
+    },
+    waitForGpt: true,
+    timeoutMs: 10,
+    pollMs: 1
+  });
+
+  assert.equal(delegated.routerRun?.projectId, project.id);
+  assert.equal(delegated.routerRun?.conversationId, project.conversationId);
+  assert.equal(delegated.routerRun?.codexThreadId, "thread-default-on");
+  assert.equal(delegated.replyText, "Default Router reply");
+  assert.equal(mock.submissions.length, 1);
+});
+
 test("bridge tools enable Router V2 from the environment and preserve compatible fields with Mock", async (t) => {
   const originalFlag = process.env.BRIDGE_ROUTER_V2;
   process.env.BRIDGE_ROUTER_V2 = "1";
@@ -914,12 +1317,130 @@ test("bridge tools Router V2 wraps the existing web sync queue without changing 
   assert.equal(delegated.syncJob.status, "pending");
   assert.equal(delegated.syncJob.kind, "chat_message");
   assert.equal(delegated.syncJob.conversationId, project.conversationId);
+  assert.equal(delegated.syncJob.projectId, project.id);
+  assert.equal(delegated.syncJob.codexThreadId, "thread-current");
+  assert.equal(delegated.syncJob.routerTerminalSignalRequired, true);
+  assert.equal(delegated.syncJob.routerRunId, delegated.routerRun.id);
   assert.equal(
     delegated.syncJob.id,
     `sync_router_${delegated.routerRun.id}_${delegated.routerRun.stages[0].id}`
   );
   assert.equal(delegated.transportResult.raw.syncJob.id, delegated.syncJob.id);
   assert.equal((await listSyncJobs(storeRoot)).length, 1);
+});
+
+test("bridge tools Router V2 leaves a live web-sync job running without reporting an observation timeout as failure", async () => {
+  const storeRoot = await tempStore();
+  const projectRoot = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Router timeout project",
+    chatgptProjectUrl: "https://chatgpt.com/c/router-timeout",
+    targetRepo: projectRoot,
+    conversationId: "router-timeout-conversation",
+    currentCodexThreadId: "thread-current"
+  });
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "thread-current",
+    routerV2Enabled: true
+  });
+
+  const delegated = await tools.delegateCurrentRequest({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "请写一个需要较长时间思考的完整小说方案。",
+    waitForGpt: true,
+    timeoutMs: 1,
+    timeoutGraceMs: 0,
+    pollMs: 1
+  });
+  const [job] = await listSyncJobs(storeRoot);
+
+  assert.equal(delegated.timedOut, false);
+  assert.equal(delegated.transportResult.raw.waited.observationTimedOut, true);
+  assert.equal(delegated.transportResult.raw.waited.stillRunning, true);
+  assert.equal(delegated.observationState, "still_running");
+  assert.deepEqual(delegated.nextAction, {
+    tool: "continue_router_run",
+    runId: delegated.routerRun.id,
+    projectId: project.id,
+    conversationId: project.conversationId,
+    waitForGpt: true
+  });
+  assert.equal(delegated.routerRun.status, "queued");
+  assert.equal(delegated.routerRun.stages[0].status, "queued");
+  assert.equal(job.status, "pending");
+  assert.equal(job.errorCode, null);
+  assert.equal(job.recoveryAction, null);
+
+  const continued = await tools.continueRouterRun({
+    runId: delegated.routerRun.id,
+    projectId: project.id,
+    conversationId: project.conversationId,
+    waitForGpt: true,
+    timeoutMs: 1,
+    pollMs: 1
+  });
+  assert.equal(continued.observationState, "still_running");
+  assert.deepEqual(continued.nextAction, {
+    tool: "continue_router_run",
+    runId: delegated.routerRun.id,
+    projectId: project.id,
+    conversationId: project.conversationId,
+    waitForGpt: true
+  });
+});
+
+test("bridge tools keep one delegated call inside the Codex host observation budget", async () => {
+  const storeRoot = await tempStore();
+  const project = await createProject(storeRoot, {
+    name: "Router observation budget",
+    chatgptProjectUrl: "https://chatgpt.com/c/router-observation-budget",
+    targetRepo: await tempStore(),
+    conversationId: "router-observation-budget",
+    currentCodexThreadId: "thread-current"
+  });
+  let receivedInput = null;
+  const tools = createBridgeTools({
+    storeRoot,
+    currentCodexThreadId: "thread-current",
+    routerV2Enabled: true,
+    routerOrchestrator: {
+      async startRouterRun(input) {
+        receivedInput = input;
+        return {
+          routerRun: {
+            id: "router-budget-run",
+            status: "queued",
+            stages: [{ id: "outline", status: "queued", replyText: null }],
+            projectArtifactPaths: []
+          },
+          transportResult: {
+            transportId: "web-sync",
+            requestId: "sync-budget",
+            status: "queued",
+            replyText: null,
+            artifacts: [],
+            error: null,
+            raw: null
+          },
+          projectArtifactPaths: []
+        };
+      }
+    }
+  });
+
+  await tools.delegateCurrentRequest({
+    projectId: project.id,
+    conversationId: project.conversationId,
+    text: "先设计前三集，再写第一集，最后生成海报。",
+    waitForGpt: true,
+    timeoutMs: 900_000
+  });
+
+  assert.equal(receivedInput.waitOptions.timeoutMs, 240_000);
+  assert.equal(receivedInput.waitOptions.timeoutGraceMs, 0);
+  assert.equal(receivedInput.waitOptions.failOnTimeout, false);
 });
 
 test("bridge tools Router V2 gives web-sync file jobs the persisted Router request id", async () => {
@@ -954,6 +1475,10 @@ test("bridge tools Router V2 gives web-sync file jobs the persisted Router reque
   assert.equal(delegated.routerRun.stages[0].transportRequestId, jobs[0].id);
   assert.equal(delegated.routerRun.stages[0].submissionState, "submitted");
   assert.match(jobs[0].id, /^sync_router_/);
+  assert.equal(jobs[0].routerTerminalSignalRequired, true);
+  assert.equal(jobs[0].routerRunId, delegated.routerRun.id);
+  assert.equal(jobs[0].projectId, project.id);
+  assert.equal(jobs[0].codexThreadId, "thread-current");
 });
 
 test("bridge tools Router V2 preserves image generation semantics for a local reference image", async () => {
@@ -1063,7 +1588,7 @@ test("bridge file queue retries reuse the Router request without duplicating roo
     currentCodexThreadId: "thread-current"
   });
   const input = {
-    requestId: "sync_router_file_retry",
+    requestId: "sync_custom_file_retry",
     projectId: project.id,
     conversationId: project.conversationId,
     localPath: sourcePath,
@@ -1072,17 +1597,72 @@ test("bridge file queue retries reuse the Router request without duplicating roo
   };
 
   const first = await tools.sendLocalFileToChatGptProject(input);
-  const second = await tools.sendLocalFileToChatGptProject(input);
+  const legacyJobPath = path.join(storeRoot, "sync", "jobs", `${first.syncJob.id}.json`);
+  const legacyJob = JSON.parse(await readFile(legacyJobPath, "utf8"));
+  delete legacyJob.projectId;
+  delete legacyJob.codexThreadId;
+  await writeFile(legacyJobPath, `${JSON.stringify(legacyJob, null, 2)}\n`, "utf8");
+  const second = await tools.sendLocalFileToChatGptProject({
+    ...input,
+    metadata: { routerRunId: "router-file-retry-run" }
+  });
   const messages = await tools.listRoomMessages({ conversationId: project.conversationId });
   const artifacts = await tools.listArtifacts({ conversationId: project.conversationId });
 
   assert.equal(first.syncJob.id, input.requestId);
+  assert.equal(first.syncJob.routerTerminalSignalRequired, false);
   assert.equal(second.syncJob.id, input.requestId);
+  assert.equal(second.syncJob.routerTerminalSignalRequired, true);
+  assert.equal(second.syncJob.routerRunId, "router-file-retry-run");
+  assert.equal(second.syncJob.projectId, project.id);
+  assert.equal(second.syncJob.codexThreadId, "thread-current");
   assert.equal(second.message, null);
   assert.equal(messages.length, 1);
   assert.equal((await listSyncJobs(storeRoot)).length, 1);
   assert.equal(artifacts.length, 1);
 });
+
+for (const changedField of ["targetRepo", "chatgptProjectUrl"]) {
+  test(`bridge file retry rejects an existing request from another ${changedField}`, async () => {
+    const storeRoot = await tempStore();
+    const projectRoot = await tempStore();
+    const sourcePath = path.join(projectRoot, "scoped-retry.txt");
+    await writeFile(sourcePath, "scoped retry input", "utf8");
+    const project = await createProject(storeRoot, {
+      name: `Router file ${changedField} guard`,
+      chatgptProjectUrl: "https://chatgpt.com/c/router-file-scope-original",
+      targetRepo: projectRoot,
+      conversationId: `router-file-${changedField}-conversation`,
+      currentCodexThreadId: "thread-current"
+    });
+    const tools = createBridgeTools({
+      storeRoot,
+      currentCodexThreadId: "thread-current"
+    });
+    const input = {
+      requestId: `sync_custom_file_${changedField.toLowerCase()}_guard`,
+      projectId: project.id,
+      conversationId: project.conversationId,
+      localPath: sourcePath,
+      contentType: "text/plain",
+      note: "same scoped payload"
+    };
+
+    await tools.sendLocalFileToChatGptProject(input);
+    await updateProject(
+      storeRoot,
+      project.id,
+      changedField === "targetRepo"
+        ? { targetRepo: await tempStore() }
+        : { chatgptProjectUrl: "https://chatgpt.com/c/router-file-scope-other" }
+    );
+
+    await assert.rejects(
+      () => tools.sendLocalFileToChatGptProject(input),
+      /different payload/i
+    );
+  });
+}
 
 test("bridge tools Router V2 rejects mixed project and conversation scope before submission", async () => {
   const storeRoot = await tempStore();
@@ -1228,6 +1808,7 @@ test("bridge tools Router V2 requires a configured current Codex thread", async 
   const mock = createMockGptTransport({ responses: { gpt: { replyText: "unused" } } });
   const tools = createBridgeTools({
     storeRoot,
+    env: {},
     routerV2Enabled: true,
     gptTransportRegistry: createGptTransportRegistry({
       transports: [mock],

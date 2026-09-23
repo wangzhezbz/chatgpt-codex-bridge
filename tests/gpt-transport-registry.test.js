@@ -103,6 +103,7 @@ test("web-sync transport normalizes existing sync jobs without leaking private f
     resolveArtifacts: async (artifactIds) =>
       artifactIds.map((id) => ({ id, filename: `${id}.png` }))
   });
+  assert.equal(transport.preservesConversationContext, true);
 
   const queued = await transport.submitText({
     stageId: "outline",
@@ -213,16 +214,27 @@ test("web-sync default adapters create a sync job with the prepared Router reque
     stageId: "gpt",
     kind: "chat_message",
     payloadText: "default adapter payload",
+    metadata: {
+      routerRunId: "router-run-default-adapter",
+      projectId: "default-adapter-project",
+      currentCodexThreadId: "default-adapter-thread"
+    },
     workspace: {
+      projectId: "default-adapter-project",
       chatgptProjectUrl: "https://chatgpt.com/c/default-adapter",
       targetRepo: storeRoot,
-      conversationId: "default-adapter-conversation"
+      conversationId: "default-adapter-conversation",
+      currentCodexThreadId: "default-adapter-thread"
     }
   });
 
   assert.equal(queued.requestId, requestId);
   assert.equal(queued.status, "queued");
   assert.equal(queued.raw.syncJob.id, requestId);
+  assert.equal(queued.raw.syncJob.routerTerminalSignalRequired, true);
+  assert.equal(queued.raw.syncJob.routerRunId, "router-run-default-adapter");
+  assert.equal(queued.raw.syncJob.projectId, "default-adapter-project");
+  assert.equal(queued.raw.syncJob.codexThreadId, "default-adapter-thread");
 });
 
 test("web-sync default artifact adapter keeps every submitted attachment", async () => {
@@ -232,22 +244,143 @@ test("web-sync default artifact adapter keeps every submitted attachment", async
     requestId: "sync_router_default_artifacts",
     stageId: "gpt",
     payloadText: "analyze both",
+    metadata: {
+      routerRunId: "router-run-default-artifacts",
+      projectId: "default-artifacts-project",
+      currentCodexThreadId: "default-artifacts-thread"
+    },
     artifacts: [
       { id: "artifact-a", filename: "a.txt", contentType: "text/plain", sizeBytes: 1 },
       { id: "artifact-b", filename: "b.txt", contentType: "text/plain", sizeBytes: 1 }
     ],
     workspace: {
+      projectId: "default-artifacts-project",
       chatgptProjectUrl: "https://chatgpt.com/c/default-artifacts",
       targetRepo: storeRoot,
-      conversationId: "default-artifacts-conversation"
+      conversationId: "default-artifacts-conversation",
+      currentCodexThreadId: "default-artifacts-thread"
     }
   });
 
   assert.equal(queued.status, "queued");
+  assert.equal(queued.raw.syncJob.routerTerminalSignalRequired, true);
+  assert.equal(queued.raw.syncJob.routerRunId, "router-run-default-artifacts");
+  assert.equal(queued.raw.syncJob.projectId, "default-artifacts-project");
+  assert.equal(queued.raw.syncJob.codexThreadId, "default-artifacts-thread");
   assert.deepEqual(
     queued.raw.syncJob.inputArtifacts.map((artifact) => artifact.id),
     ["artifact-a", "artifact-b"]
   );
+});
+
+test("web-sync rejects Router metadata that contradicts the authoritative workspace scope", async () => {
+  const storeRoot = await mkdtemp(path.join(tmpdir(), "bridge-web-sync-scope-authority-"));
+  const transport = createWebSyncTransport({ storeRoot });
+  const workspace = {
+    projectId: "workspace-project",
+    conversationId: "workspace-conversation",
+    currentCodexThreadId: "workspace-thread",
+    chatgptProjectUrl: "https://chatgpt.com/c/workspace-scope",
+    targetRepo: storeRoot
+  };
+
+  await assert.rejects(
+    () => transport.submitText({
+      requestId: "sync_router_scope_authority_text",
+      payloadText: "scope authority text",
+      workspace,
+      metadata: {
+        routerRunId: "router-run-scope-authority-text",
+        projectId: "metadata-project",
+        currentCodexThreadId: "workspace-thread"
+      }
+    }),
+    /scope mismatch.*projectId/i
+  );
+  await assert.rejects(
+    () => transport.submitArtifacts({
+      requestId: "sync_router_scope_authority_file",
+      payloadText: "scope authority file",
+      workspace,
+      artifacts: [
+        { id: "artifact-scope", filename: "scope.txt", contentType: "text/plain", sizeBytes: 1 }
+      ],
+      metadata: {
+        routerRunId: "router-run-scope-authority-file",
+        projectId: "workspace-project",
+        currentCodexThreadId: "metadata-thread"
+      }
+    }),
+    /scope mismatch.*codexThreadId/i
+  );
+  await assert.rejects(
+    () => transport.submitText({
+      requestId: "sync_router_scope_authority_target",
+      payloadText: "scope authority target",
+      workspace,
+      metadata: {
+        routerRunId: "router-run-scope-authority-target",
+        targetRepo: path.join(storeRoot, "other")
+      }
+    }),
+    /scope mismatch.*targetRepo/i
+  );
+  await assert.rejects(
+    () => transport.submitArtifacts({
+      requestId: "sync_router_scope_authority_url",
+      payloadText: "scope authority URL",
+      workspace,
+      artifacts: [
+        { id: "artifact-url-scope", filename: "scope.txt", contentType: "text/plain", sizeBytes: 1 }
+      ],
+      metadata: {
+        routerRunId: "router-run-scope-authority-url",
+        chatgptProjectUrl: "https://chatgpt.com/c/another-conversation"
+      }
+    }),
+    /scope mismatch.*chatgptProjectUrl/i
+  );
+
+  const normalized = await transport.submitText({
+    requestId: "sync_router_scope_authority_normalized",
+    payloadText: "normalized equivalent scope",
+    workspace,
+    metadata: {
+      routerRunId: "router-run-scope-authority-normalized",
+      projectId: workspace.projectId,
+      conversationId: workspace.conversationId,
+      currentCodexThreadId: workspace.currentCodexThreadId,
+      targetRepo: `${storeRoot}${path.sep}.`,
+      chatgptProjectUrl: `${workspace.chatgptProjectUrl}/?ignored=1#ignored`
+    }
+  });
+  assert.equal(normalized.raw.syncJob.targetRepo, workspace.targetRepo);
+  assert.equal(normalized.raw.syncJob.projectUrl, workspace.chatgptProjectUrl);
+});
+
+test("web-sync preserves case-sensitive targetRepo comparison off Windows", async () => {
+  let submissions = 0;
+  const transport = createWebSyncTransport({
+    platform: "linux",
+    enqueueText: async () => {
+      submissions += 1;
+      return { syncJob: { id: "sync_case_sensitive_web", status: "pending" } };
+    },
+    enqueueArtifacts: async () => ({ syncJob: { id: "unused", status: "pending" } }),
+    waitJob: async () => null,
+    getJob: async () => null,
+    cancelJob: async () => null
+  });
+  await assert.rejects(
+    () => transport.submitText({
+      requestId: "sync_case_sensitive_web",
+      payloadText: "case-sensitive scope",
+      workspace: { targetRepo: "F:/Game_Code/CaseSensitive" },
+      metadata: { targetRepo: "F:/game_code/casesensitive" }
+    }),
+    /scope mismatch.*targetRepo/i
+  );
+  assert.equal(submissions, 0);
 });
 
 test("web-sync default artifact adapter preserves image generation kind and payload", async () => {

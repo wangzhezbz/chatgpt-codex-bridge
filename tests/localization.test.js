@@ -128,10 +128,13 @@ test("local workbench looks like a product chat surface instead of a debug panel
   assert.match(modeSelect, /value="high"/);
   assert.match(modeSelect, /value="pro">Pro<\/option>/);
   assert.doesNotMatch(modeSelect, /value="gpt-5\.5"/);
-  assert.match(modelSelect, /value="gpt-5\.6-sol">GPT-5\.6 Sol<\/option>/);
-  assert.match(modelSelect, /value="gpt-5\.5"/);
+  assert.match(modelSelect, /value="gpt-5\.6-sol">5\.6 Sol<\/option>/);
+  assert.match(modelSelect, /value="gpt-5\.5">5\.5<\/option>/);
+  assert.match(modelSelect, /value="gpt-5\.4">5\.4<\/option>/);
+  assert.match(modelSelect, /value="gpt-5\.3">5\.3<\/option>/);
   assert.doesNotMatch(modelSelect, /value="gpt-4\.5"/);
-  assert.match(modelSelect, /value="o3"/);
+  assert.match(modelSelect, /value="o3">o3<\/option>/);
+  assert.doesNotMatch(modelSelect, /GPT-/);
   assert.doesNotMatch(modelSelect, /value="balanced"/);
   assert.doesNotMatch(html, /本机文件给 GPT/);
   assert.doesNotMatch(html, /input-row/);
@@ -332,8 +335,6 @@ test("local workbench frontend supports projects, themes and rich GPT-like messa
   assert.match(js, /durations\.gptThoughtMs/);
   assert.match(js, /function reliableGptThoughtMs/);
   assert.match(js, /thoughtMs > responseMs \+ 5000/);
-  assert.match(js, /GPT 用时 \$\{formatDurationMs\(thoughtMs\)\}/);
-  assert.match(js, /Bridge 捕获 \$\{formatDurationMs\(durations\.responseMs\)\}/);
   assert.match(js, /metadata\.syncProgress/);
   assert.match(js, /metadata\.syncStatus === "succeeded"/);
   assert.match(js, /function friendlyErrorMessage\(input = ""\)/);
@@ -640,7 +641,14 @@ test("local workbench frontend supports projects, themes and rich GPT-like messa
   assert.match(css, /@media \(max-width: 720px\)/);
 });
 
-test("sync status distinguishes GPT thinking time from Bridge capture time", async () => {
+test("connection badge distinguishes stale evidence from no extension", async () => {
+  const js = await readFile("public/app.js", "utf8");
+  const label = new Function(`${functionSource(js, "connectionChipLevel")}\n${functionSource(js, "connectionChipLabel")}\nreturn connectionChipLabel;`)();
+  assert.equal(label({connection:{level:"blocked",canSendToGpt:false,label:"连接待确认"},extension:{connected:false,connectionState:"unknown"}}), "连接待确认");
+  assert.equal(label({connection:{level:"blocked",canSendToGpt:false,label:"等待扩展"},extension:{connected:false,connectionState:"disconnected"}}), "等待扩展");
+});
+
+test("sync status labels measured thinking separately from send-to-result elapsed time", async () => {
   const js = await readFile("public/app.js", "utf8");
   const formatSyncProgressDuration = new Function(
     `${functionSource(js, "formatDurationMs")}
@@ -657,6 +665,19 @@ return formatSyncProgressDuration;`
         gptThoughtMs: 19_000
       }
     }),
-    "GPT 用时 19 秒 · Bridge 捕获 33 秒"
+    "网页思考 19 秒 · 发送至收取 33 秒"
   );
+});
+
+test("missing or invalid GPT thinking measurements never become a fake sub-second duration", async () => {
+  const js = await readFile("public/app.js", "utf8");
+  const format = new Function(`${functionSource(js, "formatDurationMs")}\n${functionSource(js, "reliableGptThoughtMs")}\n${functionSource(js, "formatSyncProgressDuration")}\nreturn formatSyncProgressDuration;`)();
+  for (const value of [null, undefined, "", " ", false, true, [], {}, NaN, Infinity, -1, 0, "0", 39000]) {
+    assert.equal(format({ stage: "completed", durations: { responseMs: 33000, gptThoughtMs: value } }),
+      "发送至收取 33 秒", `invalid thought duration: ${String(value)}`);
+  }
+  assert.equal(format({ stage: "completed", durations: { gptThoughtMs: null, responseMs: null } }), "");
+  assert.equal(format({ stage: "completed", durations: { gptThoughtMs: 19000, responseMs: null } }), "网页思考 19 秒");
+  assert.equal(format({ stage: "completed", durations: { gptThoughtMs: "19000", responseMs: 33000 } }), "网页思考 19 秒 · 发送至收取 33 秒");
+  assert.equal(format({ stage: "completed", durations: { gptThoughtMs: 500, responseMs: 1000 } }), "网页思考 不到 1 秒 · 发送至收取 1 秒");
 });

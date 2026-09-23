@@ -49,6 +49,32 @@ test("project store creates selectable ChatGPT/Codex workspaces", async () => {
   assert.equal(workspace.projectId, first.id);
 });
 
+test("project store restores model and mode preferences independently for each project", async () => {
+  const storeRoot = await tempStore();
+  const first = await createProject(storeRoot, {
+    name: "project one",
+    chatgptProjectUrl: "https://chatgpt.com/c/project-one",
+    targetRepo: "F:/game_code/one",
+    modePreference: "balanced",
+    modelPreference: "gpt-5.6-sol"
+  });
+  const second = await createProject(storeRoot, {
+    name: "project two",
+    chatgptProjectUrl: "https://chatgpt.com/c/project-two",
+    targetRepo: "F:/game_code/two",
+    modePreference: "pro",
+    modelPreference: "gpt-5.5"
+  });
+
+  const selectedFirst = await selectProject(storeRoot, first.id);
+  assert.equal(selectedFirst.workspace.modePreference, "balanced");
+  assert.equal(selectedFirst.workspace.modelPreference, "gpt-5.6-sol");
+
+  const selectedSecond = await selectProject(storeRoot, second.id);
+  assert.equal(selectedSecond.workspace.modePreference, "pro");
+  assert.equal(selectedSecond.workspace.modelPreference, "gpt-5.5");
+});
+
 test("ensureProjectForWorkspace imports the existing single binding as a project", async () => {
   const storeRoot = await tempStore();
   const workspace = await updateWorkspaceBinding(storeRoot, {

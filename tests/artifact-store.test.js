@@ -48,7 +48,7 @@ test("saveArtifactFromBase64 persists downloaded ChatGPT files for Codex post-pr
   assert.equal(text.text, "hello from gpt");
 });
 
-test("saveArtifactFromBase64 gives generic ChatGPT images readable filenames", async () => {
+test("saveArtifactFromBase64 gives generic images readable GPT filenames", async () => {
   const storeRoot = await tempStore();
 
   const artifact = await saveArtifactFromBase64(storeRoot, {
@@ -60,8 +60,8 @@ test("saveArtifactFromBase64 gives generic ChatGPT images readable filenames", a
     base64Data: Buffer.from("fake image bytes", "utf8").toString("base64")
   });
 
-  assert.match(artifact.filename, /^chatgpt-image-[a-f0-9]{6}\.png$/);
-  assert.match(artifact.filePath, /chatgpt-image-[a-f0-9]{6}\.png$/);
+  assert.match(artifact.filename, /^GPT-图片-[a-f0-9]{6}\.png$/);
+  assert.match(artifact.filePath, /GPT-图片-[a-f0-9]{6}\.png$/);
 });
 
 test("saveArtifactFromBase64 appends content-type extensions to extensionless files", async () => {
@@ -80,11 +80,11 @@ test("saveArtifactFromBase64 appends content-type extensions to extensionless fi
   assert.match(artifact.filePath, /brief\.pdf$/);
 });
 
-test("getArtifact presents legacy generic ChatGPT image names without renaming files", async () => {
+for (const legacyName of ["content", "G某T-图片-abcdef.png"]) test(`getArtifact restores readable names without renaming legacy files: ${legacyName}`, async () => {
   const storeRoot = await tempStore();
   const artifactId = "artifact_20260627T000000_abcdef";
   const directory = path.join(storeRoot, "artifacts", artifactId);
-  const filePath = path.join(directory, "content");
+  const filePath = path.join(directory, legacyName);
   await mkdir(directory, { recursive: true });
   await writeFile(filePath, "legacy image bytes", "utf8");
   await writeFile(
@@ -95,7 +95,7 @@ test("getArtifact presents legacy generic ChatGPT image names without renaming f
         syncJobId: "sync_legacy",
         conversationId: "conv_legacy",
         sourceMessageId: "roommsg_legacy",
-        filename: "content",
+        filename: legacyName,
         contentType: "image/png",
         sizeBytes: 18,
         originalUrl: null,
@@ -110,8 +110,25 @@ test("getArtifact presents legacy generic ChatGPT image names without renaming f
 
   const artifact = await getArtifact(storeRoot, artifactId);
 
-  assert.equal(artifact.filename, "chatgpt-image-abcdef.png");
+  assert.equal(artifact.filename, "GPT-图片-abcdef.png");
   assert.equal(artifact.filePath, filePath);
+  assert.equal(await readFile(filePath, "utf8"), "legacy image bytes");
+});
+
+test("artifact filenames preserve existing ChatGPT and GPT names at the storage boundary", async () => {
+  const storeRoot = await tempStore();
+
+  const artifact = await saveArtifactFromBase64(storeRoot, {
+    syncJobId: "sync_branded_name",
+    conversationId: "conv_branded_name",
+    sourceMessageId: "roommsg_branded_name",
+    filename: "ChatGPT-GPT-poster.png",
+    contentType: "image/png",
+    base64Data: Buffer.from("fake branded image", "utf8").toString("base64")
+  });
+
+  assert.equal(artifact.filename, "ChatGPT-GPT-poster.png");
+  assert.match(artifact.filePath, /ChatGPT-GPT-poster\.png$/);
 });
 
 test("saveArtifactFromLocalFile imports a completed browser download as an artifact", async () => {

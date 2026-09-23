@@ -19,14 +19,34 @@ test("Router-aware delegation instructions require both explicit scope ids", () 
   const instructions = buildCodexDelegationInstructions({
     projectId: "project-router-scope",
     conversationId: "conversation-router-scope",
+    currentCodexThreadId: "thread-router-scope",
     chatgptProjectUrl: "https://chatgpt.com/c/router-scope",
     targetRepo: "F:/game_code/router-scope"
   });
 
   assert.match(instructions, /projectId: "project-router-scope"/);
   assert.match(instructions, /conversationId: "conversation-router-scope"/);
-  assert.match(instructions, /both.*projectId.*conversationId/i);
+  assert.match(instructions, /currentCodexThreadId: "thread-router-scope"/);
+  assert.match(instructions, /projectId.*conversationId.*currentCodexThreadId/i);
+  assert.match(instructions, /routingProposal/);
+  assert.match(instructions, /same Codex inference/i);
+  assert.match(instructions, /Do not call a second model/i);
   assert.doesNotMatch(instructions, /required `conversationId` or `projectId`/i);
+});
+
+test("Router-aware delegation instructions recover existing runs and isolate result revisions", () => {
+  const instructions = buildCodexDelegationInstructions({
+    projectId: "project-result-revision",
+    conversationId: "conversation-result-revision",
+    chatgptProjectUrl: "https://chatgpt.com/c/result-revision",
+    targetRepo: "F:/game_code/result-revision"
+  });
+
+  assert.match(instructions, /get_router_run_status/);
+  assert.match(instructions, /existing_result_revision/);
+  assert.match(instructions, /mechanical edit.*codex_only/i);
+  assert.match(instructions, /substantial rewrite.*gpt_only/i);
+  assert.match(instructions, /do not restart.*earlier.*stage/i);
 });
 
 test("workspace binding creates the project BRIDGE routing rules once", async () => {
@@ -261,6 +281,7 @@ test("Codex delegation bootstrap refreshes a same-version block missing project 
       buildCodexDelegationInstructions({
         chatgptProjectUrl: "https://chatgpt.com/c/project-refresh",
         conversationId: "conversation-project-refresh",
+        currentCodexThreadId: "thread-project-refresh",
         targetRepo: projectRoot
       }),
       ""
@@ -272,6 +293,7 @@ test("Codex delegation bootstrap refreshes a same-version block missing project 
     projectId: "project-refresh",
     chatgptProjectUrl: "https://chatgpt.com/c/project-refresh",
     conversationId: "conversation-project-refresh",
+    currentCodexThreadId: "thread-project-refresh",
     targetRepo: projectRoot
   });
   const agents = await readFile(agentsPath, "utf8");
@@ -279,6 +301,7 @@ test("Codex delegation bootstrap refreshes a same-version block missing project 
   assert.equal(result.updated, true);
   assert.match(agents, /Bridge project: project-refresh/);
   assert.match(agents, /projectId: "project-refresh"/);
+  assert.match(agents, /currentCodexThreadId: "thread-project-refresh"/);
 });
 
 test("Codex delegation bootstrap refreshes same-version stale Router wording", async () => {
@@ -288,10 +311,11 @@ test("Codex delegation bootstrap refreshes same-version stale Router wording", a
     projectId: "project-wording-refresh",
     chatgptProjectUrl: "https://chatgpt.com/c/wording-refresh",
     conversationId: "conversation-wording-refresh",
+    currentCodexThreadId: "thread-wording-refresh",
     targetRepo: projectRoot
   };
   const staleBlock = buildCodexDelegationInstructions(exactInput)
-    .replaceAll("both the exact `projectId` and `conversationId`", "the required `conversationId` or `projectId`")
+    .replaceAll("the exact `projectId`, `conversationId`, and `currentCodexThreadId`", "the required `conversationId` or `projectId`")
     .replaceAll("`continue_router_run`", "`delegate_current_request`");
   await writeFile(agentsPath, `# Existing Agent Notes\n\n${staleBlock}\n`, "utf8");
 
@@ -299,7 +323,7 @@ test("Codex delegation bootstrap refreshes same-version stale Router wording", a
   const agents = await readFile(agentsPath, "utf8");
 
   assert.equal(result.updated, true);
-  assert.match(agents, /both the exact `projectId` and `conversationId`/);
+  assert.match(agents, /the exact `projectId`, `conversationId`, and `currentCodexThreadId`/);
   assert.match(agents, /continue_router_run/);
   assert.doesNotMatch(agents, /required `conversationId` or `projectId`/);
 });
