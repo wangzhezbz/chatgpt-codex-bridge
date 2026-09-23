@@ -11,7 +11,7 @@ test("workbench can manage projects and conversations without page-length drift"
   assert.match(html, /styles\.css\?v=20260729-safe-send-lifecycle/);
   assert.match(html, /id="clearMessagesButton"/);
   assert.match(js, /async function deleteProject/);
-  assert.match(js, /\/api\/projects\/current-session/);
+  assert.match(js, /createNewProjectForScope/);
   assert.match(js, /\/api\/projects\/\$\{encodeURIComponent\(projectId\)\}/);
   assert.match(js, /method: "DELETE"/);
   assert.match(js, /async function deleteRoomMessage/);
@@ -66,8 +66,7 @@ test("project binding form works both inside and outside a scoped Codex task", a
   assert.match(html, /placeholder="请选择或粘贴本地项目目录"/);
   assert.match(js, /api\("\/api\/config"\)/);
   assert.match(js, /currentCodexThreadId/);
-  assert.match(js, /state\.currentCodexThreadId\s*\?\s*"\/api\/projects\/current-session"\s*:\s*"\/api\/projects"/);
-  assert.match(js, /\/api\/projects\/\$\{encodeURIComponent\(project\.id\)\}\/select/);
+  assert.match(js, /createNewProjectForScope/);
   assert.match(js, /selectProjectForScope/);
   assert.match(js, /saveProjectBindingForScope/);
   assert.match(js, /els\.bindingForm\.addEventListener\("submit", async \(event\) => \{[\s\S]*try\s*\{[\s\S]*catch \(error\)[\s\S]*showToast\(error\.message\)/);

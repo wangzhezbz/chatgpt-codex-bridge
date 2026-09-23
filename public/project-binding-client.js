@@ -90,6 +90,23 @@ export async function selectProjectForScope({ api, projectId, currentCodexThread
   });
 }
 
+export async function createNewProjectForScope({ api, input }) {
+  const callApi = requireApi(api);
+  // Creation must never use current-session, which intentionally updates an
+  // existing binding for the service's calling thread.
+  const created = await callApi("/api/projects", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      chatgptProjectUrl: input.chatgptProjectUrl,
+      targetRepo: input.targetRepo
+    })
+  });
+  return callApi(`/api/projects/${encodeURIComponent(created.project.id)}/select`, {
+    method: "POST", body: JSON.stringify({})
+  });
+}
+
 export async function saveProjectBindingForScope({
   api,
   currentCodexThreadId,

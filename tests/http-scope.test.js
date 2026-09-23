@@ -5,6 +5,35 @@ import path from "node:path";
 import test from "node:test";
 
 import { createHttpServer } from "../src/http-server.js";
+import * as bindingClient from "../public/project-binding-client.js";
+
+test("new-project form creates a separate conversation instead of replacing the process thread project", async () => {
+  await withServer(async (baseUrl) => {
+    const api = async (route, options = {}) => {
+      const response = await fetch(baseUrl + route, {
+        ...options, headers: { "Content-Type": "application/json" }
+      });
+      const result = await response.json();
+      assert.ok(response.ok, JSON.stringify(result));
+      return result;
+    };
+    const old = await api("/api/projects/current-session", {
+      method: "POST", body: JSON.stringify({ name: "Existing", chatgptProjectUrl: "https://chatgpt.com/c/existing" })
+    });
+    const before = (await api("/api/projects")).projects.find(p => p.id === old.project.id);
+    assert.equal(typeof bindingClient.createNewProjectForScope, "function");
+    const added = await bindingClient.createNewProjectForScope({
+      api, input: { name: "Novel", chatgptProjectUrl: "https://chatgpt.com/c/novel" }
+    });
+    assert.notEqual(added.project.id, old.project.id);
+    assert.notEqual(added.project.conversationId, old.project.conversationId);
+    const listed = await api("/api/projects");
+    assert.equal(listed.projects.length, 2);
+    assert.deepEqual(listed.projects.find(p => p.id === old.project.id), before);
+    const messages = await api(`/api/room/messages?projectId=${added.project.id}`);
+    assert.deepEqual(messages.messages, []);
+  });
+});
 
 async function withServer(fn) {
   const storeRoot = await mkdtemp(path.join(tmpdir(), "bridge-http-scope-"));

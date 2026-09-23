@@ -1,4 +1,5 @@
 import {
+  createNewProjectForScope,
   createProjectRefreshCoordinator,
   displayProjectConversationUrl,
   projectIdFromPageUrl,
@@ -3870,22 +3871,15 @@ els.newProjectForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   els.newProjectSubmitButton.disabled = true;
   try {
-    const projectPath = state.currentCodexThreadId ? "/api/projects/current-session" : "/api/projects";
-    const created = await api(projectPath, {
-      method: "POST",
-      body: JSON.stringify({
+    const created = await createNewProjectForScope({
+      api,
+      input: {
         name: els.projectNameInput.value,
         chatgptProjectUrl: restoreProjectConversationUrl(els.projectUrlInput.value),
         targetRepo: els.targetRepoInput.value
-      })
+      }
     });
     const project = created.project;
-    const bound = state.currentCodexThreadId
-      ? created
-      : await api(`/api/projects/${encodeURIComponent(project.id)}/select`, {
-          method: "POST",
-          body: JSON.stringify({})
-        });
     els.newProjectForm.reset();
     state.activeProjectId = created.activeProjectId || project.id;
     state.activeProject = project;
@@ -3894,7 +3888,7 @@ els.newProjectForm.addEventListener("submit", async (event) => {
     state.activeProject = project;
     showChat();
     await refreshWorkspaceSurface({ scrollToBottom: true });
-    showToast(state.currentCodexThreadId ? "已绑定当前会话" : "项目已创建");
+    showToast("独立项目已创建");
   } catch (error) {
     showToast(error.message);
   } finally {
